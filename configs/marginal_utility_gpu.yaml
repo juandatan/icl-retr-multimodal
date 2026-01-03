@@ -1,0 +1,69 @@
+# GPU-Optimized Marginal Utility Computation Configuration
+# Use this config when running on GPU (CUDA) for much faster inference
+
+# Experiment metadata
+experiment:
+  name: "marginal_utility_stanford_cars_gpu"
+  description: "GPU-optimized marginal utility computation"
+  tags: ["icl", "marginal_utility", "stanford_cars", "gpu"]
+  seed: 42
+
+# Dataset configuration
+dataset:
+  name: "stanford_cars"
+  split: "train"
+  class_split_seed: 42
+  cache_dir: "data/stanford_cars"
+
+# Retrieval configuration
+retrieval:
+  method: "clip_similarity"
+  clip_model: "ViT-B/32"
+  top_k: 20  # Number of candidates per query
+  exclude_same_class: false
+  use_train_as_pool: true
+
+# Model configuration
+model:
+  name: "llava-hf/llava-1.5-7b-hf"
+  load_in_8bit: false  # Set to true if GPU memory < 16GB
+  load_in_4bit: false  # Set to true if GPU memory < 12GB
+  device_map: "auto"
+  torch_dtype: "float16"  # Use fp16 for GPU efficiency
+
+# Computation configuration - GPU OPTIMIZED
+computation:
+  batch_size: 20  # Process all 20 candidates in one batch (GPU can handle this)
+  baseline_batch_size: 32  # Larger batch for baseline computation
+  num_workers: 0
+  cache_baselines: true
+  baseline_cache_path: "data/stanford_cars/baseline_probs_{split}.pkl"
+
+# Checkpoint configuration
+checkpoint:
+  enabled: true
+  save_dir: "outputs/marginal_utilities"
+  save_interval: 100
+  resume_from: null
+
+# Output configuration
+output:
+  save_dir: "outputs/marginal_utilities"
+  save_format: "pickle"
+  save_individual_results: false
+  log_interval: 10
+
+# Logging configuration
+logging:
+  use_wandb: false  # Disable for faster iteration
+  wandb_project: "icl-retrieval-multimodal"
+  wandb_entity: null
+  wandb_mode: "offline"
+  log_frequency: 10
+  save_artifacts: false
+
+# Resource limits
+limits:
+  max_queries: null  # Process all queries
+  timeout_per_query: 300
+  memory_limit_gb: null
