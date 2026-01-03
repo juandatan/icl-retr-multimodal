@@ -1,0 +1,78 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data directories (large datasets)
+# Exclude HuggingFace cache (6.6GB - will auto-download)
+data/*/hf_cache/
+data/*/raw/
+data/*/*.tar
+data/*/*.zip
+
+# Optionally include small preprocessed files (uncomment if you want to commit them)
+# These will auto-generate on first run if missing, but including them saves time
+# !data/stanford_cars/clip_embeddings_*.pkl
+# !data/stanford_cars/baseline_probs_*.pkl
+# !data/stanford_cars/class_splits.json
+
+# Model checkpoints and outputs (experiment results)
+outputs/*/checkpoints/
+outputs/*/wandb/
+*.pth
+*.pt
+*.ckpt
+
+# Keep output config and result files
+!outputs/*/*.pkl
+!outputs/*/*.yaml
+!outputs/*/*.json
+
+# Logs
+logs/
+*.log
+wandb/
+
+# Jupyter
+.ipynb_checkpoints/
+# Uncomment to ignore notebooks (but you might want Colab notebooks in git)
+# *.ipynb
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# macOS
+.DS_Store
+
+# Temporary visualization files
+*.png
+*.jpg
+!docs/*.png
+!docs/*.jpg
+
+# Hydra
+outputs/
+multirun/
+.hydra/

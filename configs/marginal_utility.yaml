@@ -1,0 +1,70 @@
+# Marginal Utility Computation Configuration
+# This config defines parameters for computing marginal utility scores
+# for <input, retrieved example> pairs in few-shot learning
+
+# Experiment metadata
+experiment:
+  name: "marginal_utility_stanford_cars"
+  description: "Compute marginal utility scores for retrieved examples"
+  tags: ["icl", "marginal_utility", "stanford_cars"]
+  seed: 42
+
+# Dataset configuration
+dataset:
+  name: "stanford_cars"
+  split: "train"  # Which split to compute utilities for
+  class_split_seed: 42  # Seed for reproducible class splits
+  cache_dir: "data/stanford_cars"
+
+# Retrieval configuration
+retrieval:
+  method: "clip_similarity"  # Method for retrieving candidate examples
+  clip_model: "ViT-B/32"  # CLIP model used for embeddings
+  top_k: 20  # Number of candidates to retrieve per query (20 = good balance, 5-10 = fast, 50-100 = comprehensive)
+  exclude_same_class: false  # Whether to exclude same-class examples
+  use_train_as_pool: true  # Use training set as retrieval pool
+
+# Model configuration
+model:
+  name: "llava-hf/llava-1.5-7b-hf"
+  load_in_8bit: false  # Use 8-bit quantization (requires CUDA)
+  load_in_4bit: false  # Use 4-bit quantization (requires CUDA)
+  device_map: "auto"  # Automatic device placement
+  torch_dtype: "float16"  # Use fp16 for efficiency (falls back to fp32 on CPU)
+
+# Computation configuration
+computation:
+  batch_size: 1  # Batch size for LLaVA inference (1 for CPU, 4-8 for GPU)
+  baseline_batch_size: 1  # Batch size for baseline computation (1 for CPU, 8+ for GPU)
+  num_workers: 0  # Number of data loading workers
+  cache_baselines: true  # Cache baseline probabilities to disk
+  baseline_cache_path: "data/stanford_cars/baseline_probs_{split}.pkl"
+
+# Checkpoint configuration
+checkpoint:
+  enabled: true  # Enable checkpointing for resumption
+  save_dir: "outputs/marginal_utilities"
+  save_interval: 100  # Save checkpoint every N queries
+  resume_from: null  # Path to checkpoint to resume from (null = start fresh)
+
+# Output configuration
+output:
+  save_dir: "outputs/marginal_utilities"
+  save_format: "pickle"  # Format: pickle, json, or hdf5
+  save_individual_results: false  # Save per-query results or only final aggregation
+  log_interval: 10  # Log progress every N queries
+
+# Logging configuration
+logging:
+  use_wandb: true  # Enable Weights & Biases logging
+  wandb_project: "icl-retrieval-multimodal"
+  wandb_entity: null  # Your WandB username/team (null = default)
+  wandb_mode: "online"  # online, offline, or disabled
+  log_frequency: 10  # Log metrics every N batches
+  save_artifacts: true  # Save outputs as WandB artifacts
+
+# Resource limits (optional)
+limits:
+  max_queries: null  # Limit number of queries to process (null = all)
+  timeout_per_query: 300  # Timeout in seconds per query (null = no limit)
+  memory_limit_gb: null  # Memory limit in GB (null = no limit)
