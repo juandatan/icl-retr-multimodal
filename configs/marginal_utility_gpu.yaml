@@ -3,7 +3,7 @@
 
 # Experiment metadata
 experiment:
-  name: "marginal_utility_stanford_cars_gpu"
+  name: "marginal_utility_stanford_cars"  # Changed from _gpu to match existing checkpoints
   description: "GPU-optimized marginal utility computation"
   tags: ["icl", "marginal_utility", "stanford_cars", "gpu"]
   seed: 42
@@ -33,8 +33,8 @@ model:
 
 # Computation configuration - GPU OPTIMIZED
 computation:
-  batch_size: 20  # Process all 20 candidates in one batch (GPU can handle this)
-  baseline_batch_size: 32  # Larger batch for baseline computation
+  batch_size: 4  # Reduced from 20 to avoid CUDA OOM with 8-bit quantization
+  baseline_batch_size: 8  # Reduced from 32 to be conservative
   num_workers: 0
   cache_baselines: true
   baseline_cache_path: "data/stanford_cars/baseline_probs_{split}.pkl"

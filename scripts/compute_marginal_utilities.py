@@ -11,13 +11,20 @@ Usage:
     python scripts/compute_marginal_utilities.py
     python scripts/compute_marginal_utilities.py --config-name marginal_utility
     python scripts/compute_marginal_utilities.py checkpoint.resume_from=path/to/checkpoint.pkl
+
+Kaggle Usage:
+    Set environment variable: KAGGLE_CHECKPOINT_DATASET=username/dataset-name
+    The script will automatically download existing checkpoints and upload new ones
 """
 
 import sys
+import os
 from pathlib import Path
 import pickle
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
+import subprocess
+import json
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -30,6 +37,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from data.stanford_cars import StanfordCarsDataset
 from models.llava_wrapper import LLaVAWrapper
+from utils.kaggle_utils import (
+    is_kaggle_environment,
+    get_kaggle_checkpoint_dataset,
+    kaggle_download_checkpoints,
+    kaggle_upload_checkpoints
+)
 
 
 @dataclass
@@ -273,6 +286,9 @@ def load_checkpoint(cfg: DictConfig) -> Tuple[List[MarginalUtilityResult], int]:
     """
     Load existing checkpoint if available.
 
+    If running in Kaggle and KAGGLE_CHECKPOINT_DATASET is set,
+    downloads checkpoints from Kaggle dataset first.
+
     Returns:
         (existing_results, last_completed_query_idx)
     """
@@ -280,6 +296,12 @@ def load_checkpoint(cfg: DictConfig) -> Tuple[List[MarginalUtilityResult], int]:
         return [], -1
 
     checkpoint_dir = Path(cfg.checkpoint.save_dir) / cfg.experiment.name / "checkpoints"
+
+    # Download checkpoints from Kaggle if configured
+    if is_kaggle_environment():
+        kaggle_dataset = get_kaggle_checkpoint_dataset()
+        if kaggle_dataset:
+            kaggle_download_checkpoints(checkpoint_dir, kaggle_dataset)
 
     if not checkpoint_dir.exists():
         return [], -1
@@ -307,8 +329,16 @@ def load_checkpoint(cfg: DictConfig) -> Tuple[List[MarginalUtilityResult], int]:
     return results, last_query
 
 
-def save_checkpoint(results: List[MarginalUtilityResult], query_idx: int, cfg: DictConfig):
-    """Save checkpoint with current results."""
+def save_checkpoint(results: List[MarginalUtilityResult], query_idx: int, cfg: DictConfig, upload_to_kaggle: bool = True):
+    """
+    Save checkpoint with current results.
+
+    Args:
+        results: List of marginal utility results
+        query_idx: Current query index
+        cfg: Configuration
+        upload_to_kaggle: Whether to upload to Kaggle (only done on save_interval)
+    """
     if not cfg.checkpoint.enabled:
         return
 
@@ -325,6 +355,12 @@ def save_checkpoint(results: List[MarginalUtilityResult], query_idx: int, cfg: D
             'num_queries': len(set(r.query_idx for r in results)),
             'num_pairs': len(results)
         }, f)
+
+    # Upload to Kaggle if configured and requested
+    if upload_to_kaggle and is_kaggle_environment():
+        kaggle_dataset = get_kaggle_checkpoint_dataset()
+        if kaggle_dataset:
+            kaggle_upload_checkpoints(checkpoint_dir, kaggle_dataset, cfg.experiment.name)
 
 
 def run_experiment(model, dataset, baseline_probs: Dict[int, float], cfg: DictConfig) -> List[MarginalUtilityResult]:
@@ -392,6 +428,10 @@ def run_experiment(model, dataset, baseline_probs: Dict[int, float], cfg: DictCo
         if results_added < expected_pairs_per_query:
             skipped_queries.append((query_idx, expected_pairs_per_query - results_added))
 
+        # Clear GPU cache periodically to prevent memory fragmentation
+        if torch.cuda.is_available() and (query_idx + 1) % 50 == 0:
+            torch.cuda.empty_cache()
+
         # Save checkpoint periodically
         if cfg.checkpoint.enabled and (query_idx + 1) % cfg.checkpoint.save_interval == 0:
             save_checkpoint(all_results, query_idx, cfg)
@@ -414,7 +454,7 @@ def run_experiment(model, dataset, baseline_probs: Dict[int, float], cfg: DictCo
 
 
 def save_results(results: List[MarginalUtilityResult], cfg: DictConfig):
-    """Save results to disk."""
+    """Save results to disk and upload final checkpoint to Kaggle."""
     output_dir = Path(cfg.output.save_dir) / cfg.experiment.name
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -434,6 +474,14 @@ def save_results(results: List[MarginalUtilityResult], cfg: DictConfig):
     print(f"  Queries processed: {len(set(r.query_idx for r in results))}")
     print(f"  Total pairs: {len(results)}")
     print(f"{'='*70}\n")
+
+    # Upload final checkpoint to Kaggle
+    if is_kaggle_environment():
+        kaggle_dataset = get_kaggle_checkpoint_dataset()
+        if kaggle_dataset:
+            checkpoint_dir = Path(cfg.checkpoint.save_dir) / cfg.experiment.name / "checkpoints"
+            print("\n📤 Uploading final results to Kaggle...")
+            kaggle_upload_checkpoints(checkpoint_dir, kaggle_dataset, cfg.experiment.name)
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="marginal_utility")

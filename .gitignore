@@ -36,7 +36,7 @@ data/*/*.zip
 # !data/stanford_cars/class_splits.json
 
 # Model checkpoints and outputs (experiment results)
-# outputs/*/checkpoints/
+outputs/*/checkpoints/
 outputs/*/wandb/
 *.pth
 *.pt
@@ -73,7 +73,7 @@ htmlcov/
 !docs/*.jpg
 
 # Hydra
-# outputs/  # Commented out to allow specific output files
+outputs/  # Commented out to allow specific output files
 outputs/*/checkpoints/
 outputs/*/wandb/
 multirun/
