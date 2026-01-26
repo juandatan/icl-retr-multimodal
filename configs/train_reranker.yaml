@@ -1,0 +1,59 @@
+# Reranker Training Configuration
+# Train an MLP to predict marginal utility from CLIP embeddings
+
+# Experiment metadata
+experiment:
+  name: "reranker_clip_mlp"
+  description: "Train MLP reranker on CLIP embeddings to predict marginal utility"
+  seed: 42
+
+# Data configuration
+data:
+  # Local paths (used when running locally)
+  results_path: "outputs/marginal_utilities/marginal_utility_stanford_cars/marginal_utilities_train.pkl"
+  embeddings_path: "data/stanford_cars/clip_embeddings_train.pkl"
+
+  # Kaggle paths (used when running in Kaggle notebooks)
+  # Add these datasets to your notebook inputs:
+  #   1. juandatan/marginal-utility-training-data
+  #   2. juandatan/stanford-cars-clip
+  kaggle_results_path: "/kaggle/input/d/juandatan/marginal-utility-training-data/marginal_utilities_train.pkl"
+  kaggle_embeddings_path: "/kaggle/input/d/juandatan/stanford-cars-clip/clip_embeddings_train.pkl"
+
+  # Split ratios (handled by MarginalUtilityDataset)
+  train_ratio: 0.8  # Split by queries, not pairs
+  val_ratio: 0.1
+  test_ratio: 0.1
+
+# Model configuration
+model:
+  embedding_dim: 512  # CLIP ViT-B/32 embedding dimension
+  hidden_dims: [512, 256, 128]  # Hidden layer dimensions
+  dropout: 0.1  # Dropout for regularization
+
+# Training configuration
+training:
+  batch_size: 256  # Batch size for training
+  num_epochs: 100  # Maximum number of epochs
+  learning_rate: 1e-4  # Initial learning rate
+  weight_decay: 1e-5  # L2 regularization
+  gradient_clip: 1.0  # Gradient clipping threshold
+  early_stopping_patience: 10  # Stop if no improvement for N epochs
+  huber_delta: 1.0  # Delta parameter for Huber loss
+
+# Checkpoint configuration
+checkpoint:
+  enabled: true
+  save_dir: "outputs/reranker_checkpoints"
+  save_best_only: false  # Also save periodic checkpoints
+  save_interval: 10  # Save checkpoint every N epochs
+
+# Logging configuration
+logging:
+  use_wandb: false  # Enable Weights & Biases logging
+  wandb_project: "icl-retrieval-multimodal"
+  wandb_entity: null  # Your WandB username/team
+  log_interval: 10  # Log metrics every N batches
+
+# Device configuration
+use_mps: true  # Use Apple Metal Performance Shaders if available

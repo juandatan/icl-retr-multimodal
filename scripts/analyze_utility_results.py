@@ -11,9 +11,9 @@ import pickle
 from pathlib import Path
 import numpy as np
 
-# Add parent directory to path to enable importing from scripts module
+# Add parent directory to path to enable importing from src module
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from scripts.compute_marginal_utilities import MarginalUtilityResult
+from src.data.dataclasses import MarginalUtilityResult
 
 
 def analyze_results(result_path: str):

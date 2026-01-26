@@ -291,3 +291,50 @@ def setup_kaggle_credentials(kaggle_json_path: Optional[str] = None):
     elif not (Path.home() / '.kaggle' / 'kaggle.json').exists():
         print("⚠️  Kaggle credentials not found. Please set up kaggle.json")
         print("   See: https://github.com/Kaggle/kaggle-api#api-credentials")
+
+
+def resolve_data_paths(
+    local_path: str,
+    kaggle_path: Optional[str] = None,
+    dataset_name: Optional[str] = None,
+    required: bool = True
+) -> str:
+    """
+    Resolve data paths for both local and Kaggle environments.
+
+    Args:
+        local_path: Path to use in local environment
+        kaggle_path: Path to use in Kaggle environment (e.g., /kaggle/input/dataset/file.pkl)
+        dataset_name: Name of Kaggle dataset for error messages
+        required: If True, raise error if file not found
+
+    Returns:
+        Resolved path to use
+
+    Raises:
+        FileNotFoundError: If required=True and file not found
+    """
+    if is_kaggle_environment():
+        # Use Kaggle path
+        path = kaggle_path if kaggle_path else local_path
+
+        if required and not Path(path).exists():
+            error_msg = f"File not found at {path}."
+            if dataset_name:
+                error_msg += f"\n\nPlease add the '{dataset_name}' dataset to your Kaggle notebook inputs."
+                error_msg += "\n\nTo add a dataset:"
+                error_msg += "\n  1. Click 'Add Input' in the right sidebar"
+                error_msg += "\n  2. Search for the dataset"
+                error_msg += "\n  3. Click 'Add' to attach it to your notebook"
+            raise FileNotFoundError(error_msg)
+
+        return path
+    else:
+        # Use local path
+        if required and not Path(local_path).exists():
+            raise FileNotFoundError(
+                f"File not found at {local_path}.\n"
+                f"Please ensure the file exists or generate it first."
+            )
+
+        return local_path

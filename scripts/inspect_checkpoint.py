@@ -12,7 +12,7 @@ import pickle
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from scripts.compute_marginal_utilities import MarginalUtilityResult
+from src.data.dataclasses import MarginalUtilityResult
 
 
 def inspect_checkpoint(checkpoint_path: str):

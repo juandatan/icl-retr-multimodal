@@ -22,7 +22,6 @@ import os
 from pathlib import Path
 import pickle
 from typing import Dict, List, Tuple
-from dataclasses import dataclass
 import subprocess
 import json
 
@@ -35,6 +34,7 @@ from tqdm import tqdm
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+from data.dataclasses import MarginalUtilityResult
 from data.stanford_cars import StanfordCarsDataset
 from models.llava_wrapper import LLaVAWrapper
 from utils.kaggle_utils import (
@@ -43,20 +43,6 @@ from utils.kaggle_utils import (
     kaggle_download_checkpoints,
     kaggle_upload_checkpoints
 )
-
-
-@dataclass
-class MarginalUtilityResult:
-    """Results for a single query-example pair."""
-    query_idx: int
-    example_idx: int
-    query_label: str
-    example_label: str
-    baseline_log_prob: float
-    oneshot_log_prob: float
-    marginal_utility: float
-    similarity_score: float
-    same_class: bool
 
 
 def load_dataset(cfg: DictConfig):
