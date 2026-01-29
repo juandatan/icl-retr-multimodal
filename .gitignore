@@ -43,7 +43,6 @@ outputs/*/wandb/
 *.ckpt
 
 # Keep output config and result files
-!outputs/*/*.pkl
 !outputs/*/*.yaml
 !outputs/*/*.json
 
@@ -51,6 +50,9 @@ outputs/*/wandb/
 logs/
 *.log
 wandb/
+
+# Documentation
+docs/
 
 # Jupyter
 .ipynb_checkpoints/
