@@ -162,7 +162,11 @@ def retrieve_candidates(dataset, query_idx: int, top_k: int, cfg: DictConfig) ->
     Returns:
         (candidate_indices, similarity_scores)
     """
-    # Get top-k similar examples
+    # Check if stratified sampling is enabled
+    if cfg.retrieval.get('use_stratified_sampling', False):
+        return retrieve_candidates_stratified(dataset, query_idx, top_k, cfg)
+
+    # Default: Get top-k similar examples
     # exclude_query=True will automatically filter out the query itself
     similar_indices, similarities = dataset.get_top_k_similar(
         query_idx=query_idx,
@@ -172,6 +176,119 @@ def retrieve_candidates(dataset, query_idx: int, top_k: int, cfg: DictConfig) ->
     )
 
     return similar_indices, similarities
+
+
+def retrieve_candidates_stratified(
+    dataset,
+    query_idx: int,
+    top_k: int,
+    cfg: DictConfig
+) -> Tuple[List[int], np.ndarray]:
+    """
+    Retrieve candidates using stratified sampling by similarity ranges.
+
+    This ensures diverse similarity coverage, which helps the reranker model
+    learn patterns across the full similarity spectrum rather than just
+    high-similarity examples.
+
+    Args:
+        dataset: Dataset with CLIP embeddings
+        query_idx: Index of query example
+        top_k: Number of candidates to retrieve total
+        cfg: Configuration with retrieval settings
+
+    Returns:
+        (candidate_indices, similarity_scores)
+    """
+    # Get stratification config
+    strat_cfg = cfg.retrieval.stratification
+    pool_size = cfg.retrieval.get('pool_size', 100)
+
+    # Get larger pool of candidates to sample from
+    all_indices, all_similarities = dataset.get_top_k_similar(
+        query_idx=query_idx,
+        k=pool_size,
+        exclude_query=True,
+        exclude_same_class=cfg.retrieval.exclude_same_class
+    )
+
+    if len(all_indices) == 0:
+        print(f"Warning: No valid candidates for query {query_idx}")
+        return [], np.array([])
+
+    # Define similarity ranges based on percentiles and sample ratios
+    ranges = []
+    for range_cfg in strat_cfg:
+        percentile_low = range_cfg['percentile'][0]
+        percentile_high = range_cfg['percentile'][1]
+        sample_ratio = range_cfg['sample_ratio']
+        ranges.append((percentile_low, percentile_high, sample_ratio))
+
+    # Sample from each range
+    selected_indices = []
+    selected_similarities = []
+
+    for percentile_low, percentile_high, sample_ratio in ranges:
+        # Calculate how many samples from this range based on ratio
+        n_samples = int(top_k * sample_ratio)
+
+        # Calculate index range (percentiles map to positions in sorted list)
+        idx_low = int(len(all_indices) * percentile_low / 100)
+        idx_high = int(len(all_indices) * percentile_high / 100)
+        idx_high = max(idx_high, idx_low + 1)  # Ensure at least 1 element
+
+        # Get candidates in this range
+        range_indices = all_indices[idx_low:idx_high]
+        range_similarities = all_similarities[idx_low:idx_high]
+
+        if len(range_indices) == 0:
+            continue
+
+        # Sample n_samples from this range
+        n_to_sample = min(n_samples, len(range_indices))
+        if n_to_sample == 0:
+            continue
+
+        sampled_positions = np.random.choice(
+            len(range_indices),
+            size=n_to_sample,
+            replace=False
+        )
+
+        selected_indices.extend([range_indices[i] for i in sampled_positions])
+        selected_similarities.extend([range_similarities[i] for i in sampled_positions])
+
+    # Convert to arrays
+    selected_indices = np.array(selected_indices)
+    selected_similarities = np.array(selected_similarities)
+
+    # If we somehow got more than top_k (due to rounding), randomly sample down
+    if len(selected_indices) > top_k:
+        sampled_positions = np.random.choice(
+            len(selected_indices),
+            size=top_k,
+            replace=False
+        )
+        selected_indices = selected_indices[sampled_positions]
+        selected_similarities = selected_similarities[sampled_positions]
+
+    # If we got fewer (due to rounding), add more from the pool
+    elif len(selected_indices) < top_k:
+        n_needed = top_k - len(selected_indices)
+        # Get remaining candidates not already selected
+        all_indices_set = set(all_indices)
+        selected_set = set(selected_indices)
+        remaining = list(all_indices_set - selected_set)
+
+        if len(remaining) >= n_needed:
+            additional = np.random.choice(remaining, size=n_needed, replace=False)
+            additional_sims = np.array([
+                all_similarities[list(all_indices).index(idx)] for idx in additional
+            ])
+            selected_indices = np.concatenate([selected_indices, additional])
+            selected_similarities = np.concatenate([selected_similarities, additional_sims])
+
+    return selected_indices.tolist(), selected_similarities
 
 
 def compute_utilities_for_query(
@@ -424,6 +541,11 @@ def run_experiment(model, dataset, baseline_probs: Dict[int, float], cfg: DictCo
             print(f"\n✓ Checkpoint saved at query {query_idx}")
             if skipped_queries:
                 print(f"⚠️  Skipped {len(skipped_queries)} queries so far due to errors")
+
+    # Save final checkpoint to capture any remaining queries
+    if cfg.checkpoint.enabled and len(all_results) > 0:
+        save_checkpoint(all_results, query_idx, cfg, upload_to_kaggle=True)
+        print(f"\n✓ Final checkpoint saved at query {query_idx}")
 
     # Report skipped queries
     if skipped_queries:
