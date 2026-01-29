@@ -75,8 +75,8 @@ htmlcov/
 !docs/*.jpg
 
 # Hydra
-outputs/  # Commented out to allow specific output files
-outputs/*/checkpoints/
-outputs/*/wandb/
+# outputs/  # Commented out to allow specific output files
+outputs/**/checkpoints/
+outputs/**/wandb/
 multirun/
 .hydra/
