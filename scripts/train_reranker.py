@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import hydra
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -171,6 +172,133 @@ def save_checkpoint(
     torch.save(checkpoint, filepath)
 
 
+def plot_training_curves(
+    train_losses: list,
+    val_losses: list,
+    val_mses: list,
+    val_maes: list,
+    val_r2s: list,
+    val_spearmans: list,
+    learning_rates: list,
+    save_dir: Path,
+    cfg: DictConfig
+):
+    """Plot and save training curves with config annotations."""
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+    # Create title with experiment info
+    title = f"Training Curves: {cfg.experiment.name}"
+    fig.suptitle(title, fontsize=16, fontweight='bold')
+
+    # Add config details as subtitle
+    config_text = (
+        f"Architecture: {cfg.model.hidden_dims} | "
+        f"Dropout: {cfg.model.dropout} | "
+        f"LR: {cfg.training.learning_rate} | "
+        f"Batch: {cfg.training.batch_size} | "
+        f"Seed: {cfg.experiment.seed}"
+    )
+    fig.text(0.5, 0.96, config_text, ha='center', fontsize=10, style='italic', color='gray')
+
+    epochs = list(range(1, len(train_losses) + 1))
+
+    # Plot 1: Training and Validation Loss
+    axes[0, 0].plot(epochs, train_losses, label='Train Loss', marker='o', markersize=3)
+    axes[0, 0].plot(epochs, val_losses, label='Val Loss', marker='s', markersize=3)
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].set_title('Training and Validation Loss')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+
+    # Plot 2: Validation MSE
+    axes[0, 1].plot(epochs, val_mses, label='Val MSE', color='tab:orange', marker='o', markersize=3)
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('MSE')
+    axes[0, 1].set_title('Validation MSE')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    best_epoch = np.argmin(val_mses) + 1
+    axes[0, 1].axvline(x=best_epoch, color='red', linestyle='--', alpha=0.5, label=f'Best: Epoch {best_epoch}')
+    axes[0, 1].legend()
+
+    # Plot 3: Validation MAE
+    axes[0, 2].plot(epochs, val_maes, label='Val MAE', color='tab:green', marker='o', markersize=3)
+    axes[0, 2].set_xlabel('Epoch')
+    axes[0, 2].set_ylabel('MAE')
+    axes[0, 2].set_title('Validation MAE')
+    axes[0, 2].legend()
+    axes[0, 2].grid(True, alpha=0.3)
+
+    # Plot 4: Validation R²
+    axes[1, 0].plot(epochs, val_r2s, label='Val R²', color='tab:purple', marker='o', markersize=3)
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('R² Score')
+    axes[1, 0].set_title('Validation R² Score')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+    axes[1, 0].axhline(y=0, color='gray', linestyle='--', alpha=0.3)
+
+    # Plot 5: Validation Spearman Correlation
+    axes[1, 1].plot(epochs, val_spearmans, label='Val Spearman', color='tab:red', marker='o', markersize=3)
+    axes[1, 1].set_xlabel('Epoch')
+    axes[1, 1].set_ylabel('Spearman Correlation')
+    axes[1, 1].set_title('Validation Spearman Correlation')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+
+    # Plot 6: Learning Rate Schedule
+    axes[1, 2].plot(epochs, learning_rates, label='Learning Rate', color='tab:brown', marker='o', markersize=3)
+    axes[1, 2].set_xlabel('Epoch')
+    axes[1, 2].set_ylabel('Learning Rate')
+    axes[1, 2].set_title('Learning Rate Schedule')
+    axes[1, 2].set_yscale('log')
+    axes[1, 2].legend()
+    axes[1, 2].grid(True, alpha=0.3)
+
+    # Add detailed config info as text annotation
+    best_epoch = np.argmin(val_mses) + 1
+    best_mse = min(val_mses)
+    best_r2 = val_r2s[best_epoch - 1]
+    best_spearman = val_spearmans[best_epoch - 1]
+
+    config_info = (
+        f"Configuration:\n"
+        f"  Architecture: {cfg.model.hidden_dims}\n"
+        f"  Dropout: {cfg.model.dropout}\n"
+        f"  Learning Rate: {cfg.training.learning_rate}\n"
+        f"  Weight Decay: {cfg.training.weight_decay}\n"
+        f"  Batch Size: {cfg.training.batch_size}\n"
+        f"  Seed: {cfg.experiment.seed}\n\n"
+        f"Best Results (Epoch {best_epoch}):\n"
+        f"  Val MSE: {best_mse:.4f}\n"
+        f"  Val R²: {best_r2:.4f}\n"
+        f"  Val Spearman: {best_spearman:.4f}\n"
+        f"  Total Epochs: {len(epochs)}"
+    )
+
+    fig.text(0.99, 0.01, config_info,
+             fontsize=8, family='monospace',
+             verticalalignment='bottom', horizontalalignment='right',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+
+    plt.tight_layout(rect=(0, 0.03, 1, 0.98))
+
+    # Save plot
+    plot_path = save_dir / 'training_curves.png'
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    print(f"\n✓ Training curves saved to: {plot_path}")
+
+    # Also save as PDF for publications
+    pdf_path = save_dir / 'training_curves.pdf'
+    plt.savefig(pdf_path, bbox_inches='tight')
+
+    plt.close()
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="train_reranker")
 def main(cfg: DictConfig):
     """Main training function."""
@@ -282,6 +410,15 @@ def main(cfg: DictConfig):
     best_val_mse = float('inf')
     patience_counter = 0
 
+    # Track metrics for plotting
+    train_losses = []
+    val_losses = []
+    val_mses = []
+    val_maes = []
+    val_r2s = []
+    val_spearmans = []
+    learning_rates = []
+
     for epoch in range(cfg.training.num_epochs):
         print(f"\nEpoch {epoch + 1}/{cfg.training.num_epochs}")
 
@@ -296,6 +433,15 @@ def main(cfg: DictConfig):
 
         # Update scheduler
         scheduler.step()
+
+        # Track metrics for plotting
+        train_losses.append(train_loss)
+        val_losses.append(val_metrics['loss'])
+        val_mses.append(val_metrics['mse'])
+        val_maes.append(val_metrics['mae'])
+        val_r2s.append(val_metrics['r2'])
+        val_spearmans.append(val_metrics['spearman'])
+        learning_rates.append(optimizer.param_groups[0]['lr'])
 
         # Print metrics
         print(f"  Train Loss: {train_loss:.4f}")
@@ -335,6 +481,21 @@ def main(cfg: DictConfig):
     print(f"Baseline MSE: {baseline_mse_val:.4f}")
     print(f"Improvement: {(1 - best_val_mse / baseline_mse_val) * 100:.1f}%")
     print("=" * 70)
+
+    # Plot training curves
+    if cfg.checkpoint.enabled:
+        plot_dir = Path(cfg.checkpoint.save_dir) / cfg.experiment.name
+        plot_training_curves(
+            train_losses=train_losses,
+            val_losses=val_losses,
+            val_mses=val_mses,
+            val_maes=val_maes,
+            val_r2s=val_r2s,
+            val_spearmans=val_spearmans,
+            learning_rates=learning_rates,
+            save_dir=plot_dir,
+            cfg=cfg
+        )
 
 
 if __name__ == "__main__":
