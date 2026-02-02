@@ -169,7 +169,7 @@ def main(cfg: DictConfig):
 
     # Load checkpoint
     device = get_device()
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     print(f"  Epoch: {checkpoint['epoch']}")
     print(f"  Device: {device}")
 
