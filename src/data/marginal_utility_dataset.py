@@ -81,8 +81,17 @@ class MarginalUtilityDataset(Dataset):
         else:
             raise ValueError(f"Invalid split: {split}. Must be 'train', 'val', or 'test'")
 
+        query_indices = [self._get_attr(r, 'query_idx') for r in self.results]
         print(f"✓ {split.upper()} split: {len(self.results)} pairs from "
-              f"{len(set(r.query_idx for r in self.results))} queries")
+              f"{len(set(query_indices))} queries")
+
+    @staticmethod
+    def _get_attr(obj, key):
+        """Get attribute from object or dictionary."""
+        if isinstance(obj, dict):
+            return obj[key]
+        else:
+            return getattr(obj, key)
 
     @staticmethod
     def split_by_query(
@@ -95,7 +104,7 @@ class MarginalUtilityDataset(Dataset):
         Split results by query (not by pairs) for proper generalization testing.
 
         Args:
-            results: List of MarginalUtilityResult objects
+            results: List of MarginalUtilityResult objects or dictionaries
             train_ratio: Proportion for training
             val_ratio: Proportion for validation
             seed: Random seed
@@ -103,10 +112,11 @@ class MarginalUtilityDataset(Dataset):
         Returns:
             (train_results, val_results, test_results)
         """
-        # Group by query
+        # Group by query (handle both dataclass and dict)
         query_groups = defaultdict(list)
         for result in results:
-            query_groups[result.query_idx].append(result)
+            query_idx = result['query_idx'] if isinstance(result, dict) else result.query_idx
+            query_groups[query_idx].append(result)
 
         # Split query IDs
         query_ids = sorted(query_groups.keys())
@@ -156,19 +166,21 @@ class MarginalUtilityDataset(Dataset):
         """
         result = self.results[idx]
 
-        # Get embeddings
-        query_emb = self.embeddings[result.query_idx]  # shape: (512,)
-        example_emb = self.embeddings[result.example_idx]  # shape: (512,)
+        # Get attributes (handle both dataclass and dict)
+        query_idx = self._get_attr(result, 'query_idx')
+        example_idx = self._get_attr(result, 'example_idx')
+        similarity_score = self._get_attr(result, 'similarity_score')
+        marginal_utility = self._get_attr(result, 'marginal_utility')
 
-        # Get features
-        similarity = result.similarity_score  # scalar in [0, 1]
-        utility = result.marginal_utility  # scalar, typically in [-1, 1]
+        # Get embeddings
+        query_emb = self.embeddings[query_idx]  # shape: (512,)
+        example_emb = self.embeddings[example_idx]  # shape: (512,)
 
         # Convert to tensors
         query_emb = torch.from_numpy(query_emb).float()
         example_emb = torch.from_numpy(example_emb).float()
-        similarity = torch.tensor([similarity], dtype=torch.float32)
-        utility = torch.tensor([utility], dtype=torch.float32)
+        similarity = torch.tensor([similarity_score], dtype=torch.float32)
+        utility = torch.tensor([marginal_utility], dtype=torch.float32)
 
         return query_emb, example_emb, similarity, utility
 
@@ -183,7 +195,8 @@ class MarginalUtilityDataset(Dataset):
         """
         query_groups = defaultdict(list)
         for idx, result in enumerate(self.results):
-            query_groups[result.query_idx].append(idx)
+            query_idx = self._get_attr(result, 'query_idx')
+            query_groups[query_idx].append(idx)
         return dict(query_groups)
 
     def compute_baseline_mse(self) -> float:
@@ -195,8 +208,8 @@ class MarginalUtilityDataset(Dataset):
         Returns:
             Baseline MSE
         """
-        utilities = np.array([r.marginal_utility for r in self.results])
-        similarities = np.array([r.similarity_score for r in self.results])
+        utilities = np.array([self._get_attr(r, 'marginal_utility') for r in self.results])
+        similarities = np.array([self._get_attr(r, 'similarity_score') for r in self.results])
 
         # Naive prediction: utility = 2 * similarity - 1 (map [0,1] to [-1,1])
         # Or simpler: directly use similarity as prediction
