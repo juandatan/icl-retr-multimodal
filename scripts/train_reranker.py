@@ -25,7 +25,7 @@ from tqdm import tqdm
 # Add project root to path to enable src.* imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.data.marginal_utility_dataset import MarginalUtilityDataset
+from src.data.marginal_utility_dataset import InteractionFeaturesConfig, MarginalUtilityDataset
 from src.models.reranker import CLIPReranker
 from src.utils.kaggle_utils import is_kaggle_environment, resolve_data_paths
 
@@ -54,6 +54,7 @@ def train_epoch(
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: str,
+    interaction_features: InteractionFeaturesConfig,
     grad_clip: float = 1.0
 ) -> float:
     """Train for one epoch."""
@@ -61,15 +62,39 @@ def train_epoch(
     total_loss = 0.0
     num_batches = 0
 
-    for query_emb, example_emb, similarity, utility in tqdm(dataloader, desc="Training", leave=False):
+    for batch_idx, batch in enumerate(tqdm(dataloader, desc="Training", leave=False)):
+        # Unpack batch (handles variable length due to interaction features)
+        # Always: query_emb, example_emb, similarity, ..., utility (last)
+        *features, utility = batch
+
         # Move to device
-        query_emb = query_emb.to(device)
-        example_emb = example_emb.to(device)
-        similarity = similarity.to(device)
+        features = [f.to(device) for f in features]
         utility = utility.to(device)
 
-        # Forward pass
-        pred_utility = model(query_emb, example_emb, similarity)
+        # Unpack features (at least 3: query_emb, example_emb, similarity)
+        query_emb, example_emb, similarity = features[:3]
+        interaction_feats = features[3:] if len(features) > 3 else []
+
+        # Map interaction features to correct keyword arguments
+        # Order must match dataset output order: product, difference, l2_distance
+        product = None
+        difference = None
+        l2_distance = None
+
+        feat_idx = 0
+        if interaction_features.use_product and feat_idx < len(interaction_feats):
+            product = interaction_feats[feat_idx]
+            feat_idx += 1
+        if interaction_features.use_difference and feat_idx < len(interaction_feats):
+            difference = interaction_feats[feat_idx]
+            feat_idx += 1
+        if interaction_features.use_l2_distance and feat_idx < len(interaction_feats):
+            l2_distance = interaction_feats[feat_idx]
+            feat_idx += 1
+
+        # Forward pass with properly mapped keyword arguments
+        pred_utility = model(query_emb, example_emb, similarity,
+                            product=product, difference=difference, l2_distance=l2_distance)
 
         # Compute loss
         loss = criterion(pred_utility, utility)
@@ -95,7 +120,8 @@ def evaluate(
     model: nn.Module,
     dataloader: DataLoader,
     criterion: nn.Module,
-    device: str
+    device: str,
+    interaction_features: InteractionFeaturesConfig
 ) -> dict:
     """Evaluate model on validation/test set."""
     model.eval()
@@ -105,15 +131,37 @@ def evaluate(
     all_predictions = []
     all_targets = []
 
-    for query_emb, example_emb, similarity, utility in tqdm(dataloader, desc="Evaluating", leave=False):
+    for batch in tqdm(dataloader, desc="Evaluating", leave=False):
+        # Unpack batch (handles variable length due to interaction features)
+        *features, utility = batch
+
         # Move to device
-        query_emb = query_emb.to(device)
-        example_emb = example_emb.to(device)
-        similarity = similarity.to(device)
+        features = [f.to(device) for f in features]
         utility = utility.to(device)
 
-        # Forward pass
-        pred_utility = model(query_emb, example_emb, similarity)
+        # Unpack features
+        query_emb, example_emb, similarity = features[:3]
+        interaction_feats = features[3:] if len(features) > 3 else []
+
+        # Map interaction features to correct keyword arguments
+        product = None
+        difference = None
+        l2_distance = None
+
+        feat_idx = 0
+        if interaction_features.use_product and feat_idx < len(interaction_feats):
+            product = interaction_feats[feat_idx]
+            feat_idx += 1
+        if interaction_features.use_difference and feat_idx < len(interaction_feats):
+            difference = interaction_feats[feat_idx]
+            feat_idx += 1
+        if interaction_features.use_l2_distance and feat_idx < len(interaction_feats):
+            l2_distance = interaction_feats[feat_idx]
+            feat_idx += 1
+
+        # Forward pass with properly mapped keyword arguments
+        pred_utility = model(query_emb, example_emb, similarity,
+                            product=product, difference=difference, l2_distance=l2_distance)
 
         # Compute loss
         loss = criterion(pred_utility, utility)
@@ -336,20 +384,36 @@ def main(cfg: DictConfig):
     print(f"  Results: {results_path}")
     print(f"  Embeddings: {embeddings_path}")
 
+    # Create interaction features config from model config
+    print(f"\nReading interaction features from config...")
+    print(f"  use_product: {cfg.model.get('use_product', False)}")
+    print(f"  use_difference: {cfg.model.get('use_difference', False)}")
+    print(f"  use_l2_distance: {cfg.model.get('use_l2_distance', False)}")
+
+    interaction_features = InteractionFeaturesConfig(
+        use_product=cfg.model.get('use_product', False),
+        use_difference=cfg.model.get('use_difference', False),
+        use_l2_distance=cfg.model.get('use_l2_distance', False)
+    )
+    print(f"Interaction features config: {interaction_features}")
+    print(f"Additional features: {interaction_features.num_features}")
+
     # Load datasets
     print(f"\nLoading datasets...")
     train_dataset = MarginalUtilityDataset(
         results_path=results_path,
         embeddings_path=embeddings_path,
         split='train',
-        seed=cfg.experiment.seed
+        seed=cfg.experiment.seed,
+        interaction_features=interaction_features
     )
 
     val_dataset = MarginalUtilityDataset(
         results_path=results_path,
         embeddings_path=embeddings_path,
         split='val',
-        seed=cfg.experiment.seed
+        seed=cfg.experiment.seed,
+        interaction_features=interaction_features
     )
 
     # Compute baseline
@@ -381,10 +445,12 @@ def main(cfg: DictConfig):
     model = CLIPReranker(
         embedding_dim=cfg.model.embedding_dim,
         hidden_dims=cfg.model.hidden_dims,
-        dropout=cfg.model.dropout
+        dropout=cfg.model.dropout,
+        interaction_features=interaction_features
     )
     model = model.to(device)
     print(f"  Parameters: {model.get_num_parameters():,}")
+    print(f"  Input dimension: {2 * cfg.model.embedding_dim + 1 + interaction_features.num_features}")
 
     # Loss function
     criterion = nn.HuberLoss(delta=cfg.training.get("huber_delta", 1.0))
@@ -425,11 +491,12 @@ def main(cfg: DictConfig):
         # Train
         train_loss = train_epoch(
             model, train_loader, criterion, optimizer, device,
+            interaction_features=interaction_features,
             grad_clip=cfg.training.gradient_clip
         )
 
         # Validate
-        val_metrics = evaluate(model, val_loader, criterion, device)
+        val_metrics = evaluate(model, val_loader, criterion, device, interaction_features)
 
         # Update scheduler
         scheduler.step()

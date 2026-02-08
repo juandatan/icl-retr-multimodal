@@ -9,8 +9,9 @@ import pickle
 import random
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -18,6 +19,42 @@ from torch.utils.data import Dataset
 
 # Import MarginalUtilityResult for pickle deserialization
 from .dataclasses import MarginalUtilityResult
+
+
+@dataclass
+class InteractionFeaturesConfig:
+    """Configuration for which interaction features to compute."""
+    use_product: bool = False  # Element-wise product of embeddings
+    use_difference: bool = False  # Element-wise difference of embeddings
+    use_l2_distance: bool = False  # L2 distance between embeddings
+
+    @property
+    def num_features(self) -> int:
+        """Return total number of additional features."""
+        count = 0
+        if self.use_product:
+            count += 512  # embedding_dim
+        if self.use_difference:
+            count += 512  # embedding_dim
+        if self.use_l2_distance:
+            count += 1  # scalar
+        return count
+
+    @property
+    def enabled(self) -> bool:
+        """Return True if any interaction features are enabled."""
+        return self.use_product or self.use_difference or self.use_l2_distance
+
+    def __repr__(self) -> str:
+        """Pretty string representation."""
+        features = []
+        if self.use_product:
+            features.append("product")
+        if self.use_difference:
+            features.append("difference")
+        if self.use_l2_distance:
+            features.append("l2_dist")
+        return f"InteractionFeaturesConfig({', '.join(features) if features else 'none'})"
 
 
 class MarginalUtilityDataset(Dataset):
@@ -35,7 +72,8 @@ class MarginalUtilityDataset(Dataset):
         results_path: str,
         embeddings_path: str,
         split: str = 'train',
-        seed: int = 42
+        seed: int = 42,
+        interaction_features: Optional[InteractionFeaturesConfig] = None
     ):
         """
         Initialize dataset.
@@ -45,11 +83,13 @@ class MarginalUtilityDataset(Dataset):
             embeddings_path: Path to clip_embeddings_train.pkl file
             split: One of 'train', 'val', 'test'
             seed: Random seed for reproducible splitting
+            interaction_features: Configuration for interaction features to compute
         """
         self.results_path = results_path
         self.embeddings_path = embeddings_path
         self.split = split
         self.seed = seed
+        self.interaction_features = interaction_features or InteractionFeaturesConfig()
 
         # Load data
         print(f"Loading marginal utility results from {results_path}...")
@@ -153,7 +193,7 @@ class MarginalUtilityDataset(Dataset):
         """Return number of training pairs."""
         return len(self.results)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
         """
         Get a training example.
 
@@ -161,8 +201,14 @@ class MarginalUtilityDataset(Dataset):
             idx: Index of result pair
 
         Returns:
-            (query_embedding, example_embedding, similarity, utility)
-            All as torch tensors with dtype=float32
+            Base: (query_embedding, example_embedding, similarity, utility)
+            With interaction features, additional tensors are appended in order:
+                - product (if use_product=True)
+                - difference (if use_difference=True)
+                - l2_distance (if use_l2_distance=True)
+            Then utility is always last.
+
+            All tensors have dtype=float32
         """
         result = self.results[idx]
 
@@ -177,12 +223,35 @@ class MarginalUtilityDataset(Dataset):
         example_emb = self.embeddings[example_idx]  # shape: (512,)
 
         # Convert to tensors
-        query_emb = torch.from_numpy(query_emb).float()
-        example_emb = torch.from_numpy(example_emb).float()
+        query_emb_tensor = torch.from_numpy(query_emb).float()
+        example_emb_tensor = torch.from_numpy(example_emb).float()
         similarity = torch.tensor([similarity_score], dtype=torch.float32)
         utility = torch.tensor([marginal_utility], dtype=torch.float32)
 
-        return query_emb, example_emb, similarity, utility
+        # Build output tuple dynamically based on enabled features
+        output = [query_emb_tensor, example_emb_tensor, similarity]
+
+        if self.interaction_features.enabled:
+            # Compute interaction features as needed
+            if self.interaction_features.use_product:
+                # Element-wise product (captures feature co-activation)
+                product = query_emb_tensor * example_emb_tensor  # (512,)
+                output.append(product)
+
+            if self.interaction_features.use_difference:
+                # Element-wise difference (captures feature differences)
+                difference = query_emb_tensor - example_emb_tensor  # (512,)
+                output.append(difference)
+
+            if self.interaction_features.use_l2_distance:
+                # L2 distance (single scalar)
+                l2_distance = torch.norm(query_emb_tensor - example_emb_tensor, p=2).unsqueeze(0)  # (1,)
+                output.append(l2_distance)
+
+        # Utility is always last
+        output.append(utility)
+
+        return tuple(output)
 
     def get_query_groups(self) -> Dict[int, List[int]]:
         """

@@ -3,8 +3,8 @@
 
 # Experiment metadata
 experiment:
-  name: "reranker_clip_mlp_deep"
-  description: "Train deeper MLP reranker (6 hidden layers) on CLIP embeddings to predict marginal utility"
+  name: "reranker_clip_mlp"
+  description: "MLP reranker to predict marginal utility from CLIP embeddings"
   seed: 42
 
 # Data configuration
@@ -28,8 +28,13 @@ data:
 # Model configuration
 model:
   embedding_dim: 512  # CLIP ViT-B/32 embedding dimension
-  hidden_dims: [1024, 512, 512, 256, 256, 128]  # Deeper network with 6 hidden layers
-  dropout: 0.2  # Increased dropout for deeper network regularization
+  hidden_dims: [512, 256, 128]  # Original 3-layer architecture
+  dropout: 0.1  # Dropout for regularization
+
+  # Interaction features - set to true to enable
+  use_product: false  # Element-wise product of embeddings
+  use_difference: false  # Element-wise difference of embeddings
+  use_l2_distance: false  # L2 distance between embeddings
 
 # Training configuration
 training:

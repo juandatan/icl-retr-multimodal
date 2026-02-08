@@ -5,10 +5,16 @@ Simple MLP that takes query and example CLIP embeddings (+ similarity)
 and predicts the marginal utility score.
 """
 
+import sys
+from pathlib import Path
 from typing import List, Optional
 
 import torch
 import torch.nn as nn
+
+# Add parent to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from data.marginal_utility_dataset import InteractionFeaturesConfig
 
 
 class CLIPReranker(nn.Module):
@@ -27,7 +33,8 @@ class CLIPReranker(nn.Module):
         self,
         embedding_dim: int = 512,
         hidden_dims: List[int] = [512, 256, 128],
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        interaction_features: Optional[InteractionFeaturesConfig] = None
     ):
         """
         Initialize reranker model.
@@ -36,15 +43,21 @@ class CLIPReranker(nn.Module):
             embedding_dim: Dimension of CLIP embeddings (default: 512 for ViT-B/32)
             hidden_dims: List of hidden layer dimensions
             dropout: Dropout probability for regularization
+            interaction_features: Configuration for interaction features
         """
         super().__init__()
 
         self.embedding_dim = embedding_dim
         self.hidden_dims = hidden_dims
         self.dropout = dropout
+        self.interaction_features = interaction_features or InteractionFeaturesConfig()
 
-        # Input: query_emb (512) + example_emb (512) + similarity (1) = 1025
+        # Calculate input dimension based on enabled features
+        # Base: query_emb (512) + example_emb (512) + similarity (1) = 1025
         input_dim = 2 * embedding_dim + 1
+
+        # Add interaction features
+        input_dim += self.interaction_features.num_features
 
         # Build MLP layers
         layers = []
@@ -67,7 +80,10 @@ class CLIPReranker(nn.Module):
         self,
         query_emb: torch.Tensor,
         example_emb: torch.Tensor,
-        similarity: torch.Tensor
+        similarity: torch.Tensor,
+        product: Optional[torch.Tensor] = None,
+        difference: Optional[torch.Tensor] = None,
+        l2_distance: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Forward pass.
@@ -76,12 +92,26 @@ class CLIPReranker(nn.Module):
             query_emb: Query CLIP embeddings, shape (batch_size, embedding_dim)
             example_emb: Example CLIP embeddings, shape (batch_size, embedding_dim)
             similarity: CLIP similarity scores, shape (batch_size, 1)
+            product: Element-wise product (optional), shape (batch_size, embedding_dim)
+            difference: Element-wise difference (optional), shape (batch_size, embedding_dim)
+            l2_distance: L2 distance (optional), shape (batch_size, 1)
 
         Returns:
             Predicted utilities, shape (batch_size, 1)
         """
-        # Concatenate inputs
-        x = torch.cat([query_emb, example_emb, similarity], dim=1)  # (batch, 1025)
+        # Build input tensor dynamically
+        inputs = [query_emb, example_emb, similarity]
+
+        # Add interaction features in the same order as InteractionFeaturesConfig
+        if self.interaction_features.use_product and product is not None:
+            inputs.append(product)
+        if self.interaction_features.use_difference and difference is not None:
+            inputs.append(difference)
+        if self.interaction_features.use_l2_distance and l2_distance is not None:
+            inputs.append(l2_distance)
+
+        # Concatenate all inputs
+        x = torch.cat(inputs, dim=1)
 
         # Pass through MLP
         utility = self.mlp(x)  # (batch, 1)
