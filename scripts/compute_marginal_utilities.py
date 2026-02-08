@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from data.dataclasses import MarginalUtilityResult
 from data.stanford_cars import StanfordCarsDataset
+from data.mini_imagenet import MiniImageNetDataset
 from models.llava_wrapper import LLaVAWrapper
 from utils.kaggle_utils import (
     is_kaggle_environment,
@@ -51,6 +52,12 @@ def load_dataset(cfg: DictConfig):
 
     if cfg.dataset.name == "stanford_cars":
         dataset = StanfordCarsDataset(
+            split=cfg.dataset.split,
+            data_dir=cfg.dataset.cache_dir,
+            class_split_seed=cfg.dataset.class_split_seed
+        )
+    elif cfg.dataset.name == "mini_imagenet":
+        dataset = MiniImageNetDataset(
             split=cfg.dataset.split,
             data_dir=cfg.dataset.cache_dir,
             class_split_seed=cfg.dataset.class_split_seed

@@ -1,14 +1,14 @@
 """
-Script to build and cache CLIP embeddings for Stanford Cars dataset.
+Script to build and cache CLIP embeddings for datasets.
 
 This script pre-computes CLIP embeddings for all images in the dataset,
 enabling fast semantic similarity-based candidate retrieval during utility
 computation and training.
 
 Usage:
-    python scripts/build_clip_embeddings.py --splits train val test
-    python scripts/build_clip_embeddings.py --splits train  # Just train split
-    python scripts/build_clip_embeddings.py --model ViT-L/14  # Use larger CLIP model
+    python scripts/build_clip_embeddings.py --dataset stanford_cars --splits train val test
+    python scripts/build_clip_embeddings.py --dataset mini_imagenet --splits train
+    python scripts/build_clip_embeddings.py --dataset stanford_cars --model ViT-L/14
 """
 
 import argparse
@@ -22,17 +22,25 @@ import clip
 sys.path.append(str(Path(__file__).parent.parent))
 
 from src.data.stanford_cars import StanfordCarsDataset
+from src.data.mini_imagenet import MiniImageNetDataset
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Build CLIP embeddings for Stanford Cars dataset"
+        description="Build CLIP embeddings for datasets"
+    )
+    parser.add_argument(
+        '--dataset',
+        type=str,
+        default='stanford_cars',
+        choices=['stanford_cars', 'mini_imagenet'],
+        help='Dataset to process (default: stanford_cars)'
     )
     parser.add_argument(
         '--data_dir',
         type=str,
-        default='./data/stanford_cars',
-        help='Directory containing the dataset'
+        default=None,
+        help='Directory containing the dataset (default: ./data/{dataset_name})'
     )
     parser.add_argument(
         '--splits',
@@ -71,6 +79,20 @@ def main():
 
     args = parser.parse_args()
 
+    # Set default data_dir if not provided
+    if args.data_dir is None:
+        args.data_dir = f'./data/{args.dataset}'
+
+    # Select dataset class
+    if args.dataset == 'stanford_cars':
+        DatasetClass = StanfordCarsDataset
+        dataset_display_name = "Stanford Cars"
+    elif args.dataset == 'mini_imagenet':
+        DatasetClass = MiniImageNetDataset
+        dataset_display_name = "Mini-ImageNet"
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
+
     # Determine device
     if args.device:
         device = args.device
@@ -83,9 +105,10 @@ def main():
             device = 'cpu'
 
     print(f"\n{'='*70}")
-    print(f"CLIP Embedding Generation for Stanford Cars")
+    print(f"CLIP Embedding Generation for {dataset_display_name}")
     print(f"{'='*70}\n")
     print(f"Configuration:")
+    print(f"  Dataset: {dataset_display_name}")
     print(f"  CLIP Model: {args.model}")
     print(f"  Device: {device}")
     print(f"  Batch Size: {args.batch_size}")
@@ -106,7 +129,7 @@ def main():
         print(f"{'='*70}\n")
 
         # Load dataset
-        dataset = StanfordCarsDataset(
+        dataset = DatasetClass(
             split=split,
             data_dir=args.data_dir,
             class_split_seed=args.class_split_seed,
@@ -154,7 +177,7 @@ def main():
     print(f"{'='*70}\n")
 
     # Use train split to save class split info
-    train_dataset = StanfordCarsDataset(
+    train_dataset = DatasetClass(
         split='train',
         data_dir=args.data_dir,
         class_split_seed=args.class_split_seed,
