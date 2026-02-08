@@ -288,6 +288,153 @@ class MarginalUtilityDataset(Dataset):
         return float(mse)
 
 
+class PairwiseMarginalUtilityDataset(MarginalUtilityDataset):
+    """
+    Dataset for pairwise ranking loss training.
+
+    Returns pairs of examples (better, worse) for the same query,
+    enabling margin ranking loss optimization.
+    """
+
+    def __init__(
+        self,
+        results_path: str,
+        embeddings_path: str,
+        split: str = 'train',
+        seed: int = 42,
+        interaction_features: Optional[InteractionFeaturesConfig] = None,
+        pairs_per_query: int = 10
+    ):
+        """
+        Initialize pairwise dataset.
+
+        Args:
+            results_path: Path to marginal_utilities_train.pkl file
+            embeddings_path: Path to clip_embeddings_train.pkl file
+            split: One of 'train', 'val', 'test'
+            seed: Random seed for reproducible splitting
+            interaction_features: Configuration for interaction features to compute
+            pairs_per_query: Number of pairs to sample per query
+        """
+        super().__init__(results_path, embeddings_path, split, seed, interaction_features)
+
+        self.pairs_per_query = pairs_per_query
+        self.rng = random.Random(seed)
+
+        # Build pairs: for each query, sample pairs of (better, worse) examples
+        print(f"Building pairwise examples (pairs_per_query={pairs_per_query})...")
+        self.pairs = self._build_pairs()
+        print(f"✓ Created {len(self.pairs)} pairs")
+
+    def _build_pairs(self) -> List[Tuple[int, int]]:
+        """
+        Build pairs of (better_idx, worse_idx) for training.
+
+        For each query, sample pairs_per_query pairs where utility_better > utility_worse.
+
+        Returns:
+            List of (better_result_idx, worse_result_idx) tuples
+        """
+        query_groups = self.get_query_groups()
+        pairs = []
+
+        for result_indices in query_groups.values():
+            # Sample pairs where utility_better > utility_worse
+            for _ in range(self.pairs_per_query):
+                # Randomly sample two different examples
+                if len(result_indices) < 2:
+                    continue
+
+                idx1, idx2 = self.rng.sample(result_indices, 2)
+                util1 = self._get_attr(self.results[idx1], 'marginal_utility')
+                util2 = self._get_attr(self.results[idx2], 'marginal_utility')
+
+                # Order by utility (higher utility = better)
+                if util1 > util2:
+                    pairs.append((idx1, idx2))  # (better, worse)
+                elif util2 > util1:
+                    pairs.append((idx2, idx1))  # (better, worse)
+                # Skip if utilities are equal
+
+        return pairs
+
+    def __len__(self) -> int:
+        """Return number of pairs."""
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
+        """
+        Get a pair of examples (better, worse).
+
+        Returns:
+            Tuple containing:
+            - query_emb_better: Query embedding for better example
+            - example_emb_better: Better example embedding
+            - similarity_better: Similarity for better example
+            - [interaction features for better example]
+            - query_emb_worse: Query embedding for worse example
+            - example_emb_worse: Worse example embedding
+            - similarity_worse: Similarity for worse example
+            - [interaction features for worse example]
+        """
+        better_idx, worse_idx = self.pairs[idx]
+
+        # Get better example data
+        better_result = self.results[better_idx]
+        better_query_idx = self._get_attr(better_result, 'query_idx')
+        better_example_idx = self._get_attr(better_result, 'example_idx')
+        better_similarity = self._get_attr(better_result, 'similarity_score')
+
+        # Get worse example data
+        worse_result = self.results[worse_idx]
+        worse_example_idx = self._get_attr(worse_result, 'example_idx')
+        worse_similarity = self._get_attr(worse_result, 'similarity_score')
+
+        # Get embeddings
+        query_emb = self.embeddings[better_query_idx]  # Same query for both
+        better_emb = self.embeddings[better_example_idx]
+        worse_emb = self.embeddings[worse_example_idx]
+
+        # Convert to tensors
+        query_emb_tensor = torch.from_numpy(query_emb).float()
+        better_emb_tensor = torch.from_numpy(better_emb).float()
+        worse_emb_tensor = torch.from_numpy(worse_emb).float()
+        better_sim = torch.tensor([better_similarity], dtype=torch.float32)
+        worse_sim = torch.tensor([worse_similarity], dtype=torch.float32)
+
+        # Build output tuple
+        output = [query_emb_tensor, better_emb_tensor, better_sim]
+
+        # Add interaction features for better example
+        if self.interaction_features.enabled:
+            if self.interaction_features.use_product:
+                product = query_emb_tensor * better_emb_tensor
+                output.append(product)
+            if self.interaction_features.use_difference:
+                difference = query_emb_tensor - better_emb_tensor
+                output.append(difference)
+            if self.interaction_features.use_l2_distance:
+                l2_distance = torch.norm(query_emb_tensor - better_emb_tensor, p=2).unsqueeze(0)
+                output.append(l2_distance)
+
+        # Add worse example features
+        output.extend([query_emb_tensor, worse_emb_tensor, worse_sim])
+
+        # Add interaction features for worse example
+        if self.interaction_features.enabled:
+            if self.interaction_features.use_product:
+                product = query_emb_tensor * worse_emb_tensor
+                output.append(product)
+            if self.interaction_features.use_difference:
+                difference = query_emb_tensor - worse_emb_tensor
+                output.append(difference)
+            if self.interaction_features.use_l2_distance:
+                l2_distance = torch.norm(query_emb_tensor - worse_emb_tensor, p=2).unsqueeze(0)
+                output.append(l2_distance)
+
+        return tuple(output)
+
+
 if __name__ == "__main__":
     # Quick test
     import sys

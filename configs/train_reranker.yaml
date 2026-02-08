@@ -44,7 +44,12 @@ training:
   weight_decay: 1e-5  # L2 regularization
   gradient_clip: 1.0  # Gradient clipping threshold
   early_stopping_patience: 10  # Stop if no improvement for N epochs
-  huber_delta: 1.0  # Delta parameter for Huber loss
+
+  # Loss function configuration
+  loss_type: "huber"  # Options: "mse", "huber", "ranking"
+  huber_delta: 1.0  # Delta parameter for Huber loss (only used if loss_type="huber")
+  ranking_margin: 0.1  # Margin for ranking loss (only used if loss_type="ranking")
+  pairs_per_query: 10  # Number of pairs per query for ranking loss
 
 # Checkpoint configuration
 checkpoint:
