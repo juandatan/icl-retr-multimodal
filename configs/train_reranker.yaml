@@ -31,6 +31,10 @@ model:
   hidden_dims: [512, 256, 128]  # Original 3-layer architecture
   dropout: 0.1  # Dropout for regularization
 
+  # Output activation
+  use_sigmoid: false  # If true, apply sigmoid to output (bounds predictions to [0,1])
+                      # Automatically enabled when loss_type="bce"
+
   # Interaction features - set to true to enable
   use_product: false  # Element-wise product of embeddings
   use_difference: false  # Element-wise difference of embeddings
@@ -46,10 +50,19 @@ training:
   early_stopping_patience: 10  # Stop if no improvement for N epochs
 
   # Loss function configuration
-  loss_type: "huber"  # Options: "mse", "huber", "ranking"
+  loss_type: "huber"  # Options: "mse", "huber", "ranking", "bce"
   huber_delta: 1.0  # Delta parameter for Huber loss (only used if loss_type="huber")
   ranking_margin: 0.1  # Margin for ranking loss (only used if loss_type="ranking")
   pairs_per_query: 10  # Number of pairs per query for ranking loss
+
+  # Utility normalization
+  normalize_utilities: false  # If true, normalize utilities to [0,1] via min-max scaling
+                              # Automatically enabled when loss_type="bce"
+                              # Recommended for: BCE loss (required), ranking loss (optional)
+
+  # Note on BCE loss (mimics reference paper methodology):
+  # When loss_type="bce", both normalize_utilities and use_sigmoid are auto-enabled
+  # The loss becomes: -u*log(M) - (1-u)*log(1-M) where u,M ∈ [0,1]
 
 # Checkpoint configuration
 checkpoint:

@@ -12,6 +12,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from unittest import result
 
 import numpy as np
 import torch
@@ -73,7 +74,8 @@ class MarginalUtilityDataset(Dataset):
         embeddings_path: str,
         split: str = 'train',
         seed: int = 42,
-        interaction_features: Optional[InteractionFeaturesConfig] = None
+        interaction_features: Optional[InteractionFeaturesConfig] = None,
+        normalize_utilities: bool = False
     ):
         """
         Initialize dataset.
@@ -84,12 +86,14 @@ class MarginalUtilityDataset(Dataset):
             split: One of 'train', 'val', 'test'
             seed: Random seed for reproducible splitting
             interaction_features: Configuration for interaction features to compute
+            normalize_utilities: If True, normalize utilities to [0, 1] range using min-max scaling
         """
         self.results_path = results_path
         self.embeddings_path = embeddings_path
         self.split = split
         self.seed = seed
         self.interaction_features = interaction_features or InteractionFeaturesConfig()
+        self.normalize_utilities = normalize_utilities
 
         # Load data
         print(f"Loading marginal utility results from {results_path}...")
@@ -97,6 +101,18 @@ class MarginalUtilityDataset(Dataset):
             data = pickle.load(f)
         all_results = data['results']
         print(f"✓ Loaded {len(all_results)} result pairs")
+
+        # Compute normalization statistics from ALL data (before splitting)
+        if self.normalize_utilities:
+            all_utilities = np.array([self._get_attr(r, 'marginal_utility') for r in all_results])
+            self.utility_min = float(np.min(all_utilities))
+            self.utility_max = float(np.max(all_utilities))
+            self.utility_range = self.utility_max - self.utility_min
+            print(f"✓ Utility normalization enabled: min={self.utility_min:.4f}, max={self.utility_max:.4f}")
+        else:
+            self.utility_min = None
+            self.utility_max = None
+            self.utility_range = None
 
         # Load CLIP embeddings
         print(f"Loading CLIP embeddings from {embeddings_path}...")
@@ -132,6 +148,24 @@ class MarginalUtilityDataset(Dataset):
             return obj[key]
         else:
             return getattr(obj, key)
+
+    def _normalize_utility(self, utility: float) -> float:
+        """
+        Normalize utility to [0, 1] range using min-max scaling.
+
+        Args:
+            utility: Raw utility value
+
+        Returns:
+            Normalized utility in [0, 1]
+        """
+        if not self.normalize_utilities:
+            return utility
+
+        if self.utility_range == 0:
+            return 0.5  # All utilities are the same
+
+        return (utility - self.utility_min) / self.utility_range
 
     @staticmethod
     def split_by_query(
@@ -222,11 +256,14 @@ class MarginalUtilityDataset(Dataset):
         query_emb = self.embeddings[query_idx]  # shape: (512,)
         example_emb = self.embeddings[example_idx]  # shape: (512,)
 
+        # Normalize utility if enabled
+        normalized_utility = self._normalize_utility(marginal_utility)
+
         # Convert to tensors
         query_emb_tensor = torch.from_numpy(query_emb).float()
         example_emb_tensor = torch.from_numpy(example_emb).float()
         similarity = torch.tensor([similarity_score], dtype=torch.float32)
-        utility = torch.tensor([marginal_utility], dtype=torch.float32)
+        utility = torch.tensor([normalized_utility], dtype=torch.float32)
 
         # Build output tuple dynamically based on enabled features
         output = [query_emb_tensor, example_emb_tensor, similarity]
@@ -287,6 +324,23 @@ class MarginalUtilityDataset(Dataset):
         mse = np.mean((utilities - predictions) ** 2)
         return float(mse)
 
+    def compute_baseline_spearman(self) -> float:
+        """
+        Compute baseline Spearman correlation using CLIP similarity as predictor.
+
+        This measures how well CLIP similarity alone ranks examples by utility.
+
+        Returns:
+            Baseline Spearman correlation
+        """
+        from scipy.stats import spearmanr
+
+        utilities = np.array([self._get_attr(r, 'marginal_utility') for r in self.results])
+        similarities = np.array([self._get_attr(r, 'similarity_score') for r in self.results])
+
+        spearman_corr, _ = spearmanr(similarities, utilities)
+        return float(spearman_corr)
+
 
 class PairwiseMarginalUtilityDataset(MarginalUtilityDataset):
     """
@@ -303,7 +357,8 @@ class PairwiseMarginalUtilityDataset(MarginalUtilityDataset):
         split: str = 'train',
         seed: int = 42,
         interaction_features: Optional[InteractionFeaturesConfig] = None,
-        pairs_per_query: int = 10
+        pairs_per_query: int = 10,
+        normalize_utilities: bool = False
     ):
         """
         Initialize pairwise dataset.
@@ -315,8 +370,9 @@ class PairwiseMarginalUtilityDataset(MarginalUtilityDataset):
             seed: Random seed for reproducible splitting
             interaction_features: Configuration for interaction features to compute
             pairs_per_query: Number of pairs to sample per query
+            normalize_utilities: If True, normalize utilities to [0, 1] range
         """
-        super().__init__(results_path, embeddings_path, split, seed, interaction_features)
+        super().__init__(results_path, embeddings_path, split, seed, interaction_features, normalize_utilities)
 
         self.pairs_per_query = pairs_per_query
         self.rng = random.Random(seed)

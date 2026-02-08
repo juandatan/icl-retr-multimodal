@@ -190,7 +190,8 @@ def evaluate(
     dataloader: DataLoader,
     criterion: nn.Module,
     device: str,
-    interaction_features: InteractionFeaturesConfig
+    interaction_features: InteractionFeaturesConfig,
+    use_bce: bool = False
 ) -> dict:
     """Evaluate model on validation/test set."""
     model.eval()
@@ -232,7 +233,7 @@ def evaluate(
     ss_tot = np.sum((all_targets - np.mean(all_targets)) ** 2)
     r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
 
-    # Spearman correlation
+    # Spearman correlation (most important for ranking quality)
     spearman_corr, _ = spearmanr(all_predictions, all_targets)
 
     metrics = {
@@ -242,6 +243,22 @@ def evaluate(
         'r2': r2,
         'spearman': spearman_corr
     }
+
+    # Add BCE-specific metrics
+    if use_bce:
+        # Calibration: How close are predicted probabilities to true utilities?
+        # For BCE, both predictions and targets are in [0,1]
+        calibration_error = np.mean(np.abs(all_predictions - all_targets))
+
+        # Top-K agreement: Do we rank the best examples correctly?
+        # Check if top 10% of predictions overlap with top 10% of true utilities
+        k = max(1, int(0.1 * len(all_predictions)))
+        top_k_pred_indices = set(np.argsort(all_predictions)[-k:])
+        top_k_true_indices = set(np.argsort(all_targets)[-k:])
+        top_k_overlap = len(top_k_pred_indices & top_k_true_indices) / k
+
+        metrics['calibration_error'] = calibration_error  # Same as MAE but more interpretable name
+        metrics['top10_overlap'] = top_k_overlap
 
     return metrics
 
@@ -461,12 +478,17 @@ def main(cfg: DictConfig):
 
     # Load datasets
     print(f"\nLoading datasets...")
+    # Check if utilities should be normalized (can be set explicitly in config)
+    normalize_utilities = loss_type == 'bce' or cfg.training.get('normalize_utilities', False)
+    print(f"  Normalize utilities: {normalize_utilities}")
+
     train_dataset_kwargs = {
         'results_path': results_path,
         'embeddings_path': embeddings_path,
         'split': 'train',
         'seed': cfg.experiment.seed,
-        'interaction_features': interaction_features
+        'interaction_features': interaction_features,
+        'normalize_utilities': normalize_utilities
     }
 
     # Add pairs_per_query for pairwise ranking dataset
@@ -481,15 +503,21 @@ def main(cfg: DictConfig):
         embeddings_path=embeddings_path,
         split='val',
         seed=cfg.experiment.seed,
-        interaction_features=interaction_features
+        interaction_features=interaction_features,
+        normalize_utilities=normalize_utilities
     )
 
     # Compute baseline
     baseline_mse_train = train_dataset.compute_baseline_mse()
     baseline_mse_val = val_dataset.compute_baseline_mse()
-    print(f"\nBaseline MSE (CLIP similarity):")
-    print(f"  Train: {baseline_mse_train:.4f}")
-    print(f"  Val:   {baseline_mse_val:.4f}")
+    baseline_spearman_train = train_dataset.compute_baseline_spearman()
+    baseline_spearman_val = val_dataset.compute_baseline_spearman()
+
+    print(f"\nBaseline (CLIP similarity):")
+    print(f"  Train MSE:      {baseline_mse_train:.4f}")
+    print(f"  Val MSE:        {baseline_mse_val:.4f}")
+    print(f"  Train Spearman: {baseline_spearman_train:.4f}")
+    print(f"  Val Spearman:   {baseline_spearman_val:.4f}")
 
     # Create data loaders
     train_loader = DataLoader(
@@ -510,15 +538,19 @@ def main(cfg: DictConfig):
 
     # Create model
     print(f"\nInitializing model...")
+    # Check if sigmoid should be used (can be set explicitly in config)
+    use_sigmoid = loss_type == 'bce' or cfg.model.get('use_sigmoid', False)
     model = CLIPReranker(
         embedding_dim=cfg.model.embedding_dim,
         hidden_dims=cfg.model.hidden_dims,
         dropout=cfg.model.dropout,
-        interaction_features=interaction_features
+        interaction_features=interaction_features,
+        use_sigmoid=use_sigmoid
     )
     model = model.to(device)
     print(f"  Parameters: {model.get_num_parameters():,}")
     print(f"  Input dimension: {2 * cfg.model.embedding_dim + 1 + interaction_features.num_features}")
+    print(f"  Use sigmoid output: {use_sigmoid}")
 
     # Loss function
     if loss_type == 'mse':
@@ -527,6 +559,8 @@ def main(cfg: DictConfig):
         criterion = nn.HuberLoss(delta=cfg.training.get("huber_delta", 1.0))
     elif loss_type == 'ranking':
         criterion = nn.MarginRankingLoss(margin=cfg.training.get("ranking_margin", 0.1))
+    elif loss_type == 'bce':
+        criterion = nn.BCELoss()
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
 
@@ -548,7 +582,20 @@ def main(cfg: DictConfig):
     print(f"\nStarting training for {cfg.training.num_epochs} epochs...")
     print("=" * 70)
 
-    best_val_mse = float('inf')
+    # Choose early stopping metric based on loss type
+    if loss_type == 'bce':
+        # For BCE: use Spearman correlation (higher is better)
+        best_val_metric = float('-inf')
+        metric_name = 'spearman'
+        metric_mode = 'max'
+        print(f"Early stopping based on: Spearman correlation (maximize)\n")
+    else:
+        # For regression losses: use MSE (lower is better)
+        best_val_metric = float('inf')
+        metric_name = 'mse'
+        metric_mode = 'min'
+        print(f"Early stopping based on: MSE (minimize)\n")
+
     patience_counter = 0
 
     # Track metrics for plotting
@@ -559,6 +606,8 @@ def main(cfg: DictConfig):
     val_r2s = []
     val_spearmans = []
     learning_rates = []
+    val_calibration_errors = []
+    val_top10_overlaps = []
 
     for epoch in range(cfg.training.num_epochs):
         print(f"\nEpoch {epoch + 1}/{cfg.training.num_epochs}")
@@ -578,7 +627,7 @@ def main(cfg: DictConfig):
             )
 
         # Validate
-        val_metrics = evaluate(model, val_loader, criterion, device, interaction_features)
+        val_metrics = evaluate(model, val_loader, criterion, device, interaction_features, use_bce=(loss_type == 'bce'))
 
         # Update scheduler
         scheduler.step()
@@ -592,24 +641,47 @@ def main(cfg: DictConfig):
         val_spearmans.append(val_metrics['spearman'])
         learning_rates.append(optimizer.param_groups[0]['lr'])
 
+        # Track BCE-specific metrics if available
+        if 'calibration_error' in val_metrics:
+            val_calibration_errors.append(val_metrics['calibration_error'])
+        if 'top10_overlap' in val_metrics:
+            val_top10_overlaps.append(val_metrics['top10_overlap'])
+
         # Print metrics
         print(f"  Train Loss: {train_loss:.4f}")
         print(f"  Val Loss:   {val_metrics['loss']:.4f}")
-        print(f"  Val MSE:    {val_metrics['mse']:.4f}")
-        print(f"  Val MAE:    {val_metrics['mae']:.4f}")
-        print(f"  Val R²:     {val_metrics['r2']:.4f}")
-        print(f"  Val Spearman: {val_metrics['spearman']:.4f}")
+
+        # Show different metrics based on loss type
+        if loss_type == 'bce':
+            # For BCE: focus on ranking and calibration
+            print(f"  Val Spearman:    {val_metrics['spearman']:.4f}  (ranking quality)")
+            print(f"  Val Calibration: {val_metrics['calibration_error']:.4f}  (prediction accuracy)")
+            print(f"  Val Top-10% Hit: {val_metrics['top10_overlap']:.2%}  (best examples ranked correctly)")
+            print(f"  Val MSE:         {val_metrics['mse']:.4f}  (on [0,1] scale)")
+        else:
+            # For regression losses: show traditional metrics
+            print(f"  Val MSE:    {val_metrics['mse']:.4f}")
+            print(f"  Val MAE:    {val_metrics['mae']:.4f}")
+            print(f"  Val R²:     {val_metrics['r2']:.4f}")
+            print(f"  Val Spearman: {val_metrics['spearman']:.4f}")
+
         print(f"  LR:         {optimizer.param_groups[0]['lr']:.6f}")
 
-        # Save best model
-        if val_metrics['mse'] < best_val_mse:
-            best_val_mse = val_metrics['mse']
+        # Save best model based on appropriate metric
+        current_metric = val_metrics[metric_name]
+        is_improvement = (
+            (metric_mode == 'min' and current_metric < best_val_metric) or
+            (metric_mode == 'max' and current_metric > best_val_metric)
+        )
+
+        if is_improvement:
+            best_val_metric = current_metric
             patience_counter = 0
 
             if cfg.checkpoint.enabled:
                 checkpoint_path = Path(cfg.checkpoint.save_dir) / cfg.experiment.name / "best_model.pt"
                 save_checkpoint(model, optimizer, epoch, val_metrics, cfg, checkpoint_path)
-                print(f"  ✓ Saved best model (MSE: {best_val_mse:.4f})")
+                print(f"  ✓ Saved best model ({metric_name}: {best_val_metric:.4f})")
         else:
             patience_counter += 1
 
@@ -626,9 +698,13 @@ def main(cfg: DictConfig):
     # Final evaluation
     print("\n" + "=" * 70)
     print("Training complete!")
-    print(f"Best validation MSE: {best_val_mse:.4f}")
-    print(f"Baseline MSE: {baseline_mse_val:.4f}")
-    print(f"Improvement: {(1 - best_val_mse / baseline_mse_val) * 100:.1f}%")
+    if metric_mode == 'min':
+        print(f"Best validation {metric_name}: {best_val_metric:.4f}")
+        if metric_name == 'mse':
+            print(f"Baseline MSE: {baseline_mse_val:.4f}")
+            print(f"Improvement: {(1 - best_val_metric / baseline_mse_val) * 100:.1f}%")
+    else:
+        print(f"Best validation {metric_name}: {best_val_metric:.4f}")
     print("=" * 70)
 
     # Plot training curves

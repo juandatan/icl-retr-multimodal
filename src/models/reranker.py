@@ -34,7 +34,8 @@ class CLIPReranker(nn.Module):
         embedding_dim: int = 512,
         hidden_dims: List[int] = [512, 256, 128],
         dropout: float = 0.1,
-        interaction_features: Optional[InteractionFeaturesConfig] = None
+        interaction_features: Optional[InteractionFeaturesConfig] = None,
+        use_sigmoid: bool = False
     ):
         """
         Initialize reranker model.
@@ -44,6 +45,7 @@ class CLIPReranker(nn.Module):
             hidden_dims: List of hidden layer dimensions
             dropout: Dropout probability for regularization
             interaction_features: Configuration for interaction features
+            use_sigmoid: If True, apply sigmoid activation to output (for BCE loss)
         """
         super().__init__()
 
@@ -51,6 +53,7 @@ class CLIPReranker(nn.Module):
         self.hidden_dims = hidden_dims
         self.dropout = dropout
         self.interaction_features = interaction_features or InteractionFeaturesConfig()
+        self.use_sigmoid = use_sigmoid
 
         # Calculate input dimension based on enabled features
         # Base: query_emb (512) + example_emb (512) + similarity (1) = 1025
@@ -115,6 +118,10 @@ class CLIPReranker(nn.Module):
 
         # Pass through MLP
         utility = self.mlp(x)  # (batch, 1)
+
+        # Apply sigmoid if enabled (for BCE loss with normalized utilities)
+        if self.use_sigmoid:
+            utility = torch.sigmoid(utility)
 
         return utility
 
