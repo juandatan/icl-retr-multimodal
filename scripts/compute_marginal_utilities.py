@@ -141,8 +141,17 @@ def compute_or_load_baselines(model, dataset, cfg: DictConfig) -> Dict[int, floa
         print(f"Loading cached baseline probabilities from {cache_path}")
         with open(cache_path, 'rb') as f:
             baseline_probs = pickle.load(f)
-        print(f"✓ Loaded {len(baseline_probs)} cached baseline probabilities\n")
-        return baseline_probs
+        print(f"✓ Loaded {len(baseline_probs)} cached baseline probabilities")
+
+        # Verify cache is complete for the current dataset
+        expected_size = len(dataset)
+        if len(baseline_probs) < expected_size:
+            print(f"⚠️  WARNING: Cached baselines incomplete ({len(baseline_probs)}/{expected_size})")
+            print(f"  Removing incomplete cache and recomputing...\n")
+            cache_path.unlink()
+        else:
+            print()
+            return baseline_probs
 
     # Compute baselines
     print("Computing baseline probabilities (this may take a while)...")

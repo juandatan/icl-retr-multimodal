@@ -99,12 +99,22 @@ class MiniImageNetDataset(BaseUtilityDataset):
 
         # Check if dataset is already saved locally
         local_dataset_path = self.data_dir / "hf_cache" / "mini_imagenet_train"
+        need_download = True
 
         if local_dataset_path.exists():
-            print(f"Loading cached dataset from {local_dataset_path}...")
-            self.hf_dataset = load_from_disk(str(local_dataset_path))
-            print("✓ Loaded from cache")
-        else:
+            try:
+                print(f"Loading cached dataset from {local_dataset_path}...")
+                self.hf_dataset = load_from_disk(str(local_dataset_path))
+                print("✓ Loaded from cache")
+                need_download = False
+            except Exception as e:
+                print(f"  Warning: Failed to load cached dataset: {e}")
+                print(f"  Removing corrupted cache and re-downloading...")
+                import shutil
+                shutil.rmtree(local_dataset_path, ignore_errors=True)
+                need_download = True
+
+        if need_download:
             print("Downloading Mini-ImageNet from HuggingFace (this may take a few minutes)...")
             # Using timm/mini-imagenet - verified working dataset
             self.hf_dataset = load_dataset(
