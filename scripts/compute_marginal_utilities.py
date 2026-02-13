@@ -104,11 +104,17 @@ def initialize_model(cfg: DictConfig):
     print(f"  Using device: {device}\n")
 
     try:
+        # Check if vision caching should be disabled (for memory-constrained environments)
+        enable_vision_cache = cfg.model.get('cache_vision_embeddings', False)  # Default to False for safety
+
         model = LLaVAWrapper(
             model_name=cfg.model.name,
             device=device,
             load_in_8bit=cfg.model.load_in_8bit,
-            load_in_4bit=cfg.model.load_in_4bit
+            load_in_4bit=cfg.model.load_in_4bit,
+            use_cache=True,
+            cache_vision_embeddings=enable_vision_cache,
+            max_vision_cache_size=5000,
         )
         return model
     except Exception as e:

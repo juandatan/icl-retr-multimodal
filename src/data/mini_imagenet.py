@@ -44,6 +44,7 @@ class MiniImageNetDataset(BaseUtilityDataset):
         clip_preprocess=None,
         embedding_batch_size: int = 32,
         device: str = 'cpu',
+        cache_dataset_locally: bool = True,
     ):
         """
         Args:
@@ -57,9 +58,11 @@ class MiniImageNetDataset(BaseUtilityDataset):
             clip_preprocess: CLIP preprocessing (required if build_embeddings=True)
             embedding_batch_size: Batch size for embedding computation
             device: Device for embedding computation
+            cache_dataset_locally: Whether to save dataset to disk (disable if disk space limited)
         """
         # Store HF dataset reference
         self.hf_dataset: Any = None
+        self.cache_dataset_locally = cache_dataset_locally
 
         # Call parent init (which calls load_data())
         super().__init__(
@@ -124,10 +127,18 @@ class MiniImageNetDataset(BaseUtilityDataset):
             )
             print("✓ Successfully downloaded")
 
-            # Save to disk for future use
-            print(f"Saving dataset to {local_dataset_path}...")
-            self.hf_dataset.save_to_disk(str(local_dataset_path))
-            print("✓ Dataset cached locally")
+            # Save to disk for future use (optional - can be disabled if disk space limited)
+            if self.cache_dataset_locally:
+                try:
+                    print(f"Saving dataset to {local_dataset_path}...")
+                    local_dataset_path.parent.mkdir(parents=True, exist_ok=True)
+                    self.hf_dataset.save_to_disk(str(local_dataset_path))
+                    print("✓ Dataset cached locally")
+                except OSError as e:
+                    print(f"⚠️  Warning: Could not save dataset to disk: {e}")
+                    print(f"   Continuing without local cache (will use HuggingFace cache)")
+            else:
+                print("Skipping local cache (using HuggingFace cache only)")
 
         # Set class information
         self.num_classes = 100

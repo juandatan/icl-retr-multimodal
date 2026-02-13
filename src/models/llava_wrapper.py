@@ -12,6 +12,7 @@ import numpy as np
 from typing import List, Optional, Tuple, Dict
 from PIL import Image
 from transformers import AutoTokenizer, AutoProcessor, LlavaForConditionalGeneration
+from torch.cuda.amp import autocast
 class LLaVAWrapper:
     """
     Wrapper for LLaVA-1.5-7B model to compute classification probabilities.
@@ -35,6 +36,9 @@ class LLaVAWrapper:
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         load_in_8bit: bool = False,
         load_in_4bit: bool = False,
+        use_cache: bool = True,
+        cache_vision_embeddings: bool = True,
+        max_vision_cache_size: int = 5000,
     ):
         """
         Initialize LLaVA model.
@@ -44,11 +48,20 @@ class LLaVAWrapper:
             device: Device to load model on
             load_in_8bit: Whether to use 8-bit quantization
             load_in_4bit: Whether to use 4-bit quantization
+            use_cache: Whether to use KV cache for generation
+            cache_vision_embeddings: Whether to cache vision encoder outputs
+            max_vision_cache_size: Maximum number of images to cache (0 = unlimited)
         """
         self.model_name = model_name
         self.device = device
         self.load_in_8bit = load_in_8bit
         self.load_in_4bit = load_in_4bit
+        self.use_cache = use_cache
+        self.cache_vision_embeddings = cache_vision_embeddings
+        self.max_vision_cache_size = max_vision_cache_size
+
+        # Vision embedding cache: maps image hash -> vision embeddings
+        self._vision_cache = {} if cache_vision_embeddings else None
 
         print(f"Loading LLaVA model: {model_name}")
         print(f"Device: {device}")
@@ -63,18 +76,30 @@ class LLaVAWrapper:
         model_kwargs = {}
         if load_in_8bit:
             model_kwargs['load_in_8bit'] = True
+            # For multi-GPU, we need to specify the device for quantized models
+            if device.startswith("cuda:"):
+                model_kwargs['device_map'] = {"": device}
+            else:
+                model_kwargs['device_map'] = "auto"
         elif load_in_4bit:
             model_kwargs['load_in_4bit'] = True
+            # For multi-GPU, we need to specify the device for quantized models
+            if device.startswith("cuda:"):
+                model_kwargs['device_map'] = {"": device}
+            else:
+                model_kwargs['device_map'] = "auto"
         else:
-            model_kwargs['torch_dtype'] = torch.float16 if device == "cuda" else torch.float32
+            model_kwargs['torch_dtype'] = torch.float16 if device.startswith("cuda") else torch.float32
+            if device.startswith("cuda"):
+                model_kwargs['device_map'] = "auto"
 
         self.model = LlavaForConditionalGeneration.from_pretrained(
             model_name,
-            **model_kwargs,
-            device_map="auto" if device == "cuda" else None
+            **model_kwargs
         )
 
-        if device != "cuda" and not (load_in_8bit or load_in_4bit):
+        # Only move to device if not using quantization and not already on a CUDA device
+        if not (load_in_8bit or load_in_4bit) and not device.startswith("cuda"):
             self.model = self.model.to(device)
 
         self.model.eval()
@@ -205,13 +230,24 @@ class LLaVAWrapper:
         full_input_ids = torch.stack(full_input_ids)
         full_attention_mask = torch.stack(full_attention_mask)
 
-        # Single forward pass for entire batch
+        # Single forward pass for entire batch with mixed precision
         with torch.no_grad():
-            outputs = self.model(
-                input_ids=full_input_ids,
-                attention_mask=full_attention_mask,
-                pixel_values=prompt_inputs.get('pixel_values'),
-            )
+            # Use autocast for CUDA devices to speed up computation
+            if self.device.startswith("cuda"):
+                with autocast(dtype=torch.float16):
+                    outputs = self.model(
+                        input_ids=full_input_ids,
+                        attention_mask=full_attention_mask,
+                        pixel_values=prompt_inputs.get('pixel_values'),
+                        use_cache=self.use_cache,
+                    )
+            else:
+                outputs = self.model(
+                    input_ids=full_input_ids,
+                    attention_mask=full_attention_mask,
+                    pixel_values=prompt_inputs.get('pixel_values'),
+                    use_cache=self.use_cache,
+                )
 
         # Extract log probabilities for each sample
         logits = outputs.logits  # [batch_size, seq_len, vocab_size]
@@ -294,6 +330,87 @@ class LLaVAWrapper:
 
         return baseline_probs
 
+    def _get_image_hash(self, image: Image.Image) -> str:
+        """
+        Get a hash for an image to use as cache key.
+
+        Args:
+            image: PIL Image
+
+        Returns:
+            Hash string
+        """
+        import hashlib
+        # Convert image to bytes and hash
+        img_bytes = image.tobytes()
+        return hashlib.md5(img_bytes).hexdigest()
+
+    def _encode_vision_features(self, images: List[Image.Image]) -> torch.Tensor:
+        """
+        Encode images using vision encoder with caching.
+
+        Args:
+            images: List of PIL Images
+
+        Returns:
+            Vision embeddings tensor
+        """
+        if not self.cache_vision_embeddings or self._vision_cache is None:
+            # No caching, process normally
+            inputs = self.processor(images=images, return_tensors="pt")
+            pixel_values = inputs['pixel_values'].to(self.device)
+
+            with torch.no_grad():
+                if self.device.startswith("cuda"):
+                    with autocast(dtype=torch.float16):
+                        vision_outputs = self.model.vision_tower(pixel_values)
+                else:
+                    vision_outputs = self.model.vision_tower(pixel_values)
+
+            return vision_outputs
+
+        # With caching
+        batch_embeddings = []
+        images_to_encode = []
+        image_indices = []
+
+        for idx, img in enumerate(images):
+            img_hash = self._get_image_hash(img)
+
+            if img_hash in self._vision_cache:
+                # Use cached embedding
+                batch_embeddings.append((idx, self._vision_cache[img_hash]))
+            else:
+                # Need to encode
+                images_to_encode.append(img)
+                image_indices.append((idx, img_hash))
+
+        # Encode uncached images
+        if images_to_encode:
+            inputs = self.processor(images=images_to_encode, return_tensors="pt")
+            pixel_values = inputs['pixel_values'].to(self.device)
+
+            with torch.no_grad():
+                if self.device.startswith("cuda"):
+                    with autocast(dtype=torch.float16):
+                        vision_outputs = self.model.vision_tower(pixel_values)
+                else:
+                    vision_outputs = self.model.vision_tower(pixel_values)
+
+            # Cache the results (with size limit)
+            for i, (idx, img_hash) in enumerate(image_indices):
+                embedding = vision_outputs[i:i+1]  # Keep batch dimension
+
+                # Check cache size limit
+                if self.max_vision_cache_size == 0 or len(self._vision_cache) < self.max_vision_cache_size:
+                    self._vision_cache[img_hash] = embedding
+
+                batch_embeddings.append((idx, embedding))
+
+        # Sort by original index and concatenate
+        batch_embeddings.sort(key=lambda x: x[0])
+        return torch.cat([emb for _, emb in batch_embeddings], dim=0)
+
     def compute_marginal_utilities_batch(
         self,
         query_images: List[Image.Image],
@@ -349,3 +466,25 @@ class LLaVAWrapper:
             utilities.append(utility)
 
         return utilities
+
+    def get_cache_stats(self) -> Dict[str, int]:
+        """
+        Get statistics about the vision embedding cache.
+
+        Returns:
+            Dictionary with cache statistics
+        """
+        if self._vision_cache is None:
+            return {"cache_enabled": False, "cache_size": 0}
+
+        return {
+            "cache_enabled": True,
+            "cache_size": len(self._vision_cache),
+        }
+
+    def clear_vision_cache(self):
+        """Clear the vision embedding cache to free memory."""
+        if self._vision_cache is not None:
+            cache_size = len(self._vision_cache)
+            self._vision_cache.clear()
+            print(f"✓ Cleared vision cache ({cache_size} cached images)")
