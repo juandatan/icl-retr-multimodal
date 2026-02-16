@@ -71,14 +71,13 @@ def kaggle_download_checkpoints(checkpoint_dir: Path, dataset_name: str) -> int:
                 downloaded_checkpoints = sorted(temp_path.glob("**/checkpoint_*.pkl"))
 
                 if downloaded_checkpoints:
-                    # Copy only the latest checkpoint
-                    latest = downloaded_checkpoints[-1]
-                    target = checkpoint_dir / latest.name
-                    shutil.copy(latest, target)
+                    # Copy all checkpoints to the checkpoint directory
+                    for ckpt in downloaded_checkpoints:
+                        target = checkpoint_dir / ckpt.name
+                        shutil.copy(ckpt, target)
 
-                    print(f"✓ Downloaded latest checkpoint: {latest.name}")
-                    print(f"  (Ignoring {len(downloaded_checkpoints) - 1} older checkpoints for efficiency)")
-                    return 1
+                    print(f"✓ Downloaded {len(downloaded_checkpoints)} checkpoint(s)")
+                    return len(downloaded_checkpoints)
                 else:
                     print("ℹ️  No checkpoints found in dataset. Starting fresh.")
                     return 0
@@ -103,7 +102,7 @@ def kaggle_download_checkpoints(checkpoint_dir: Path, dataset_name: str) -> int:
         return 0
 
 
-def kaggle_upload_checkpoints(checkpoint_dir: Path, dataset_name: str, experiment_name: str, latest_only: bool = True) -> bool:
+def kaggle_upload_checkpoints(checkpoint_dir: Path, dataset_name: str, experiment_name: str, latest_only: bool = True, latest_per_range: bool = False, num_ranges: int = 1) -> bool:
     """
     Upload checkpoints to Kaggle dataset.
 
@@ -111,7 +110,9 @@ def kaggle_upload_checkpoints(checkpoint_dir: Path, dataset_name: str, experimen
         checkpoint_dir: Local directory containing checkpoints
         dataset_name: Kaggle dataset name (format: username/dataset-name)
         experiment_name: Name of the experiment (for dataset title)
-        latest_only: If True, only upload the latest checkpoint (default: True for efficiency)
+        latest_only: If True, only upload the latest checkpoint (default: True for single-GPU)
+        latest_per_range: If True, upload latest checkpoint per query range (for multi-GPU)
+        num_ranges: Number of query ranges (for multi-GPU, typically number of GPUs)
 
     Returns:
         True if upload successful, False otherwise
@@ -121,92 +122,42 @@ def kaggle_upload_checkpoints(checkpoint_dir: Path, dataset_name: str, experimen
 
     try:
         # Find checkpoints to upload
-        if latest_only:
-            # Upload latest checkpoint while preserving existing ones
-            checkpoints = sorted(checkpoint_dir.glob("checkpoint_*.pkl"))
-            if not checkpoints:
-                print("⚠️  No checkpoints found to upload")
-                return False
+        all_checkpoints = sorted(checkpoint_dir.glob("checkpoint_*.pkl"))
+        if not all_checkpoints:
+            print("⚠️  No checkpoints found to upload")
+            return False
 
-            latest_checkpoint = checkpoints[-1]
-            print(f"\n📤 Uploading latest checkpoint to Kaggle: {latest_checkpoint.name}")
+        # Select which checkpoints to upload
+        if latest_per_range and num_ranges > 1:
+            # For multi-GPU: upload latest checkpoint from each query range
+            # Group checkpoints by query range
+            checkpoints_by_range = [[] for _ in range(num_ranges)]
 
-            # Create a temporary directory with all checkpoints
-            import tempfile
-            import shutil
+            # Estimate query range size from total queries
+            # Assume checkpoints are evenly distributed
+            max_query_idx = max(int(ckpt.stem.split('_')[1]) for ckpt in all_checkpoints)
+            range_size = (max_query_idx + 1) // num_ranges
 
-            with tempfile.TemporaryDirectory() as temp_dir:
-                temp_path = Path(temp_dir)
-                temp_checkpoint_dir = temp_path / "checkpoints"
-                temp_checkpoint_dir.mkdir()
+            for ckpt in all_checkpoints:
+                query_idx = int(ckpt.stem.split('_')[1])
+                range_id = min(query_idx // range_size, num_ranges - 1)
+                checkpoints_by_range[range_id].append(ckpt)
 
-                # Check if dataset exists
-                result = subprocess.run(
-                    ['kaggle', 'datasets', 'status', dataset_name],
-                    capture_output=True,
-                    text=True
-                )
-                dataset_exists = result.returncode == 0
-
-                if dataset_exists:
-                    # Download existing checkpoints first to preserve them
-                    print(f"  Downloading existing checkpoints to merge...")
-                    download_result = subprocess.run(
-                        ['kaggle', 'datasets', 'download', '-d', dataset_name, '-p', str(temp_checkpoint_dir), '--unzip'],
-                        capture_output=True,
-                        text=True,
-                        timeout=300
-                    )
-
-                    if download_result.returncode != 0:
-                        print(f"  ⚠️  Warning: Could not download existing checkpoints: {download_result.stderr}")
-                        print(f"  Continuing with upload (may overwrite existing data)...")
-
-                # Copy the latest checkpoint (will add to existing or create new)
-                shutil.copy(latest_checkpoint, temp_checkpoint_dir / latest_checkpoint.name)
-
-                # Count total checkpoints
-                total_checkpoints = len(list(temp_checkpoint_dir.glob("checkpoint_*.pkl")))
-                print(f"  Total checkpoints in dataset: {total_checkpoints}")
-
-                # Create metadata
-                username, dataset_slug = dataset_name.split('/')
-                metadata = {
-                    "title": f"{experiment_name} Checkpoints",
-                    "id": f"{username}/{dataset_slug}",
-                    "licenses": [{"name": "CC0-1.0"}]
-                }
-
-                metadata_path = temp_path / "dataset-metadata.json"
-                with open(metadata_path, 'w') as f:
-                    json.dump(metadata, f, indent=2)
-
-                # Upload
-                if dataset_exists:
-                    result = subprocess.run(
-                        ['kaggle', 'datasets', 'version', '-p', str(temp_path), '-m', f'Checkpoint {latest_checkpoint.stem}', '--dir-mode', 'zip'],
-                        capture_output=True,
-                        text=True,
-                        timeout=300
-                    )
-                else:
-                    result = subprocess.run(
-                        ['kaggle', 'datasets', 'create', '-p', str(temp_path), '--dir-mode', 'zip'],
-                        capture_output=True,
-                        text=True,
-                        timeout=300
-                    )
-
-                if result.returncode == 0:
-                    print(f"✓ Uploaded {latest_checkpoint.name} to Kaggle successfully")
-                    return True
-                else:
-                    print(f"⚠️  Failed to upload: {result.stderr}")
-                    return False
-
+            # Select latest from each range
+            checkpoints = []
+            for range_id, range_ckpts in enumerate(checkpoints_by_range):
+                if range_ckpts:
+                    checkpoints.append(sorted(range_ckpts)[-1])
+        elif latest_only:
+            checkpoints = [all_checkpoints[-1]]  # Only latest
         else:
-            # Upload all checkpoints (original behavior)
-            print(f"\n📤 Uploading all checkpoints to Kaggle dataset: {dataset_name}")
+            checkpoints = all_checkpoints  # All checkpoints
+
+        import tempfile
+        import shutil
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
 
             # Check if dataset exists
             result = subprocess.run(
@@ -216,7 +167,11 @@ def kaggle_upload_checkpoints(checkpoint_dir: Path, dataset_name: str, experimen
             )
             dataset_exists = result.returncode == 0
 
-            # Create dataset metadata
+            # Copy selected checkpoints to temp directory
+            for ckpt in checkpoints:
+                shutil.copy(ckpt, temp_path / ckpt.name)
+
+            # Create metadata
             username, dataset_slug = dataset_name.split('/')
             metadata = {
                 "title": f"{experiment_name} Checkpoints",
@@ -224,37 +179,43 @@ def kaggle_upload_checkpoints(checkpoint_dir: Path, dataset_name: str, experimen
                 "licenses": [{"name": "CC0-1.0"}]
             }
 
-            metadata_path = checkpoint_dir.parent / "dataset-metadata.json"
+            metadata_path = temp_path / "dataset-metadata.json"
             with open(metadata_path, 'w') as f:
                 json.dump(metadata, f, indent=2)
 
+            # Upload
+            if len(checkpoints) == 1:
+                checkpoint_name = checkpoints[0].name
+                message = f'Update: {checkpoint_name}'
+            else:
+                checkpoint_names = [ckpt.name for ckpt in checkpoints]
+                message = f'Update: {len(checkpoints)} checkpoints'
+
             if dataset_exists:
-                # Update existing dataset
                 result = subprocess.run(
-                    ['kaggle', 'datasets', 'version', '-p', str(checkpoint_dir.parent), '-m', 'Updated checkpoints', '--dir-mode', 'zip'],
+                    ['kaggle', 'datasets', 'version', '-p', str(temp_path), '-m', message, '--dir-mode', 'zip'],
                     capture_output=True,
                     text=True,
-                    timeout=600
+                    timeout=300
                 )
             else:
-                # Create new dataset
                 result = subprocess.run(
-                    ['kaggle', 'datasets', 'create', '-p', str(checkpoint_dir.parent), '--dir-mode', 'zip'],
+                    ['kaggle', 'datasets', 'create', '-p', str(temp_path), '--dir-mode', 'zip'],
                     capture_output=True,
                     text=True,
-                    timeout=600
+                    timeout=300
                 )
 
-            # Clean up metadata file
-            if metadata_path.exists():
-                metadata_path.unlink()
-
             if result.returncode == 0:
-                print(f"✓ Uploaded checkpoints to Kaggle successfully")
+                if len(checkpoints) == 1:
+                    print(f"✓ Uploaded {checkpoint_name} to Kaggle")
+                else:
+                    print(f"✓ Uploaded {len(checkpoints)} checkpoints to Kaggle")
                 return True
             else:
                 print(f"⚠️  Failed to upload: {result.stderr}")
                 return False
+
 
     except subprocess.TimeoutExpired:
         print(f"⚠️  Upload timed out")

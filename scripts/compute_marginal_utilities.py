@@ -560,14 +560,15 @@ def run_experiment(model, dataset, baseline_probs: Dict[int, float], cfg: DictCo
         # Save checkpoint periodically
         if cfg.checkpoint.enabled and (query_idx + 1) % cfg.checkpoint.save_interval == 0:
             save_checkpoint(all_results, query_idx, cfg)
-            print(f"\n✓ Checkpoint saved at query {query_idx}")
+            msg = f"✓ Checkpoint saved: query {query_idx}"
             if skipped_queries:
-                print(f"⚠️  Skipped {len(skipped_queries)} queries so far due to errors")
+                msg += f" ({len(skipped_queries)} queries skipped)"
+            print(f"\n{msg}")
 
     # Save final checkpoint to capture any remaining queries
     if cfg.checkpoint.enabled and len(all_results) > 0:
         save_checkpoint(all_results, query_idx, cfg, upload_to_kaggle=True)
-        print(f"\n✓ Final checkpoint saved at query {query_idx}")
+        print(f"\n✓ Final checkpoint saved: query {query_idx}")
 
     # Report skipped queries
     if skipped_queries:
@@ -610,7 +611,6 @@ def save_results(results: List[MarginalUtilityResult], cfg: DictConfig):
         kaggle_dataset = get_kaggle_checkpoint_dataset()
         if kaggle_dataset:
             checkpoint_dir = Path(cfg.checkpoint.save_dir) / cfg.experiment.name / "checkpoints"
-            print("\n📤 Uploading final results to Kaggle...")
             kaggle_upload_checkpoints(checkpoint_dir, kaggle_dataset, cfg.experiment.name)
 
 

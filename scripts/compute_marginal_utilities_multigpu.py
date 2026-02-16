@@ -243,7 +243,8 @@ def save_gpu_checkpoint(
     query_idx: int,
     cfg: DictConfig,
     upload_to_kaggle: bool = False,
-    checkpoint_lock = None
+    checkpoint_lock = None,
+    num_gpus: int = 1
 ):
     """
     Save checkpoint for a specific GPU.
@@ -255,6 +256,7 @@ def save_gpu_checkpoint(
         cfg: Configuration
         upload_to_kaggle: Whether to upload to Kaggle (only done periodically)
         checkpoint_lock: Optional multiprocessing lock to prevent concurrent uploads
+        num_gpus: Total number of GPUs being used (for multi-GPU uploads)
     """
     if not cfg.checkpoint.enabled:
         return
@@ -282,11 +284,24 @@ def save_gpu_checkpoint(
         if kaggle_dataset:
             if checkpoint_lock:
                 with checkpoint_lock:
-                    print(f"[GPU {gpu_id}] Uploading checkpoints to Kaggle...")
-                    kaggle_upload_checkpoints(checkpoint_dir, kaggle_dataset, cfg.experiment.name, latest_only=False)
+                    # Upload latest checkpoint per GPU range to avoid excessive storage
+                    kaggle_upload_checkpoints(
+                        checkpoint_dir,
+                        kaggle_dataset,
+                        cfg.experiment.name,
+                        latest_only=False,
+                        latest_per_range=True,
+                        num_ranges=num_gpus
+                    )
             else:
-                print(f"[GPU {gpu_id}] Uploading checkpoints to Kaggle...")
-                kaggle_upload_checkpoints(checkpoint_dir, kaggle_dataset, cfg.experiment.name, latest_only=False)
+                kaggle_upload_checkpoints(
+                    checkpoint_dir,
+                    kaggle_dataset,
+                    cfg.experiment.name,
+                    latest_only=False,
+                    latest_per_range=True,
+                    num_ranges=num_gpus
+                )
 
 
 def load_gpu_checkpoint(gpu_id: int, cfg: DictConfig, query_start: int, query_end: int, checkpoint_lock=None) -> Tuple[List[MarginalUtilityResult], int]:
@@ -372,6 +387,7 @@ def process_query_range(
     cfg: DictConfig,
     return_dict: dict,
     checkpoint_lock=None,
+    num_gpus: int = 1,
 ) -> None:
     """
     Process a range of queries on a specific GPU.
@@ -382,6 +398,8 @@ def process_query_range(
         query_end: Ending query index (exclusive)
         cfg: Configuration
         return_dict: Shared dictionary to store results
+        checkpoint_lock: Lock for coordinating checkpoint uploads
+        num_gpus: Total number of GPUs being used
     """
     try:
         # Set CUDA device for this process
@@ -463,12 +481,12 @@ def process_query_range(
             # Save checkpoint periodically (each GPU saves independently)
             if cfg.checkpoint.enabled and (query_idx + 1) % cfg.checkpoint.save_interval == 0:
                 # Upload to Kaggle every checkpoint save (every save_interval queries, default 100)
-                save_gpu_checkpoint(gpu_id, all_results, query_idx, cfg, upload_to_kaggle=True, checkpoint_lock=checkpoint_lock)
-                print(f"\n[GPU {gpu_id}] ✓ Checkpoint saved at query {query_idx}")
+                save_gpu_checkpoint(gpu_id, all_results, query_idx, cfg, upload_to_kaggle=True, checkpoint_lock=checkpoint_lock, num_gpus=num_gpus)
+                print(f"\n[GPU {gpu_id}] ✓ Checkpoint saved: query {query_idx}")
 
         # Save final checkpoint for this GPU and upload to Kaggle
         if cfg.checkpoint.enabled and len(all_results) > 0:
-            save_gpu_checkpoint(gpu_id, all_results, query_end - 1, cfg, upload_to_kaggle=True, checkpoint_lock=checkpoint_lock)
+            save_gpu_checkpoint(gpu_id, all_results, query_end - 1, cfg, upload_to_kaggle=True, checkpoint_lock=checkpoint_lock, num_gpus=num_gpus)
             print(f"\n[GPU {gpu_id}] ✓ Final checkpoint saved")
 
         # Store results in shared dictionary
@@ -559,7 +577,7 @@ def main(cfg: DictConfig):
     for gpu_id, start, end in query_ranges:
         p = mp.Process(
             target=process_query_range,
-            args=(gpu_id, start, end, cfg, return_dict, checkpoint_lock)
+            args=(gpu_id, start, end, cfg, return_dict, checkpoint_lock, len(gpu_ids))
         )
         p.start()
         processes.append(p)
