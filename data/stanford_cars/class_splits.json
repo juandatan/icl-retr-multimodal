@@ -202,7 +202,7 @@
     179,
     102
   ],
-  "num_train_examples": 6504,
-  "num_val_examples": 0,
-  "num_test_examples": 0
+  "class_split_seed": 42,
+  "train_ratio": 0.8,
+  "val_ratio": 0.1
 }

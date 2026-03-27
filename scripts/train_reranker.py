@@ -201,6 +201,10 @@ def evaluate(
     all_predictions = []
     all_targets = []
 
+    # For ranking loss, use MSE for validation metrics
+    use_ranking_loss = isinstance(criterion, nn.MarginRankingLoss)
+    eval_criterion = nn.MSELoss() if use_ranking_loss else criterion
+
     for batch in tqdm(dataloader, desc="Evaluating", leave=False):
         # Unpack batch (handles variable length due to interaction features)
         *features, utility = batch
@@ -212,8 +216,8 @@ def evaluate(
         # Forward pass
         pred_utility = _unpack_and_forward(model, features, interaction_features)
 
-        # Compute loss
-        loss = criterion(pred_utility, utility)
+        # Compute loss (use MSE for ranking loss validation)
+        loss = eval_criterion(pred_utility, utility)
         total_loss += loss.item()
         num_batches += 1
 
@@ -583,18 +587,20 @@ def main(cfg: DictConfig):
     print("=" * 70)
 
     # Choose early stopping metric based on loss type
-    if loss_type == 'bce':
-        # For BCE: use Spearman correlation (higher is better)
-        best_val_metric = float('-inf')
+    if loss_type in ['bce', 'ranking']:
+        # For BCE and ranking: use Spearman correlation (higher is better)
+        best_val_mse = float('inf')
+        best_val_spearman = float('-inf')
         metric_name = 'spearman'
         metric_mode = 'max'
         print(f"Early stopping based on: Spearman correlation (maximize)\n")
     else:
-        # For regression losses: use MSE (lower is better)
-        best_val_metric = float('inf')
+        # For regression losses: use MSE first, then Spearman as tiebreaker
+        best_val_mse = float('inf')
+        best_val_spearman = float('-inf')
         metric_name = 'mse'
         metric_mode = 'min'
-        print(f"Early stopping based on: MSE (minimize)\n")
+        print(f"Early stopping based on: MSE (minimize), then Spearman (maximize)\n")
 
     patience_counter = 0
 
@@ -667,21 +673,36 @@ def main(cfg: DictConfig):
 
         print(f"  LR:         {optimizer.param_groups[0]['lr']:.6f}")
 
-        # Save best model based on appropriate metric
-        current_metric = val_metrics[metric_name]
-        is_improvement = (
-            (metric_mode == 'min' and current_metric < best_val_metric) or
-            (metric_mode == 'max' and current_metric > best_val_metric)
-        )
+        # Save best model based on two-stage criteria: MSE first, then Spearman
+        current_mse = val_metrics['mse']
+        current_spearman = val_metrics['spearman']
+
+        # Check if this is an improvement
+        is_improvement = False
+        if metric_mode == 'min':
+            # For regression: prioritize MSE, use Spearman as tiebreaker
+            if current_mse < best_val_mse:
+                is_improvement = True
+            elif abs(current_mse - best_val_mse) < 1e-6 and current_spearman > best_val_spearman:
+                # If MSE is essentially the same, prefer higher Spearman
+                is_improvement = True
+        else:
+            # For ranking-based losses: prioritize Spearman
+            if current_spearman > best_val_spearman:
+                is_improvement = True
+            elif abs(current_spearman - best_val_spearman) < 1e-6 and current_mse < best_val_mse:
+                # If Spearman is essentially the same, prefer lower MSE
+                is_improvement = True
 
         if is_improvement:
-            best_val_metric = current_metric
+            best_val_mse = current_mse
+            best_val_spearman = current_spearman
             patience_counter = 0
 
             if cfg.checkpoint.enabled:
                 checkpoint_path = Path(cfg.checkpoint.save_dir) / cfg.experiment.name / "best_model.pt"
                 save_checkpoint(model, optimizer, epoch, val_metrics, cfg, checkpoint_path)
-                print(f"  ✓ Saved best model ({metric_name}: {best_val_metric:.4f})")
+                print(f"  ✓ Saved best model (MSE: {best_val_mse:.4f}, Spearman: {best_val_spearman:.4f})")
         else:
             patience_counter += 1
 
@@ -698,13 +719,13 @@ def main(cfg: DictConfig):
     # Final evaluation
     print("\n" + "=" * 70)
     print("Training complete!")
-    if metric_mode == 'min':
-        print(f"Best validation {metric_name}: {best_val_metric:.4f}")
-        if metric_name == 'mse':
-            print(f"Baseline MSE: {baseline_mse_val:.4f}")
-            print(f"Improvement: {(1 - best_val_metric / baseline_mse_val) * 100:.1f}%")
-    else:
-        print(f"Best validation {metric_name}: {best_val_metric:.4f}")
+    print(f"Best validation MSE: {best_val_mse:.4f}")
+    print(f"Best validation Spearman: {best_val_spearman:.4f}")
+    if metric_name == 'mse':
+        print(f"Baseline MSE: {baseline_mse_val:.4f}")
+        print(f"MSE Improvement: {(1 - best_val_mse / baseline_mse_val) * 100:.1f}%")
+    print(f"Baseline Spearman: {baseline_spearman_val:.4f}")
+    print(f"Spearman Improvement: {(best_val_spearman - baseline_spearman_val) / baseline_spearman_val * 100:.1f}%")
     print("=" * 70)
 
     # Plot training curves
