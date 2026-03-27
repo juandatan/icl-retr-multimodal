@@ -488,3 +488,44 @@ class LLaVAWrapper:
             cache_size = len(self._vision_cache)
             self._vision_cache.clear()
             print(f"✓ Cleared vision cache ({cache_size} cached images)")
+
+    def classify_with_context(
+        self,
+        query_image: Image.Image,
+        context_examples: List[Tuple[Image.Image, str]],
+        candidate_labels: List[str]
+    ) -> str:
+        """
+        Classify an image using in-context learning.
+
+        Args:
+            query_image: Query image to classify
+            context_examples: List of (image, label_text) tuples for ICL context
+            candidate_labels: List of candidate label names to choose from
+
+        Returns:
+            Predicted label text (the candidate with highest log probability)
+        """
+        # Format prompt with context examples
+        example_labels = [label for _, label in context_examples] if context_examples else None
+        prompt = self.format_prompt(example_labels=example_labels)
+
+        # Prepare images: context images + query image
+        images = [img for img, _ in context_examples] + [query_image]
+
+        # Compute log probability for each candidate label
+        best_label = candidate_labels[0] if candidate_labels else ""
+        best_log_prob = float('-inf')
+
+        for label in candidate_labels:
+            log_prob = self._compute_label_probabilities_batch(
+                images=[images],  # Single batch element (all images for one query)
+                prompts=[prompt],
+                labels=[label]
+            )[0]
+
+            if log_prob > best_log_prob:
+                best_log_prob = log_prob
+                best_label = label
+
+        return best_label
