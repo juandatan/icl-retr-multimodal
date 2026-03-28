@@ -33,8 +33,6 @@ from typing import Dict, List, Tuple
 import pickle
 import random
 import shutil
-import multiprocessing as mp
-from functools import partial
 
 import numpy as np
 import torch
@@ -48,6 +46,7 @@ from data.mini_imagenet import MiniImageNetDataset
 from data.marginal_utility_dataset import InteractionFeaturesConfig
 from models.reranker import CLIPReranker
 from models.llava_wrapper import LLaVAWrapper
+from utils.multigpu_utils import MultiGPUManager, merge_dict_results
 
 
 def load_dataset(dataset_name: str, split: str = "test"):
@@ -440,74 +439,52 @@ def evaluate_icl_multigpu(
     """
     random.seed(seed)
 
-    # Sample and split queries across GPUs
+    # Sample queries
     query_indices = list(range(len(test_dataset)))
     total_queries = num_queries if num_queries is not None else len(test_dataset)
     if total_queries < len(test_dataset):
         query_indices = random.sample(query_indices, total_queries)
 
-    # Split queries evenly across GPUs
-    queries_per_gpu = len(query_indices) // num_gpus
-    query_splits = []
-    for i in range(num_gpus):
-        start_idx = i * queries_per_gpu
-        end_idx = start_idx + queries_per_gpu if i < num_gpus - 1 else len(query_indices)
-        query_splits.append(query_indices[start_idx:end_idx])
+    # Use MultiGPUManager to handle parallel execution
+    with MultiGPUManager(num_gpus=num_gpus, verbose=True) as mgr:
+        # Run evaluation in parallel
+        results = mgr.run_parallel(
+            worker_fn=evaluate_icl_worker,
+            work_items=query_indices,
+            worker_kwargs={
+                'dataset_name': dataset_name,
+                'reranker_checkpoint': reranker_checkpoint,
+                'kaggle_dataset': kaggle_dataset,
+                'llava_model_name': llava_model_name,
+                'load_in_8bit': load_in_8bit,
+                'k': k,
+                'seed': seed,
+                'return_predictions': return_predictions,
+                'use_reranker': use_reranker
+            }
+        )
 
-    print(f"\nUsing {num_gpus} GPUs for parallel evaluation:")
-    for i, queries in enumerate(query_splits):
-        print(f"  GPU {i}: {len(queries)} queries")
-
-    # Use multiprocessing spawn method (required for CUDA)
-    ctx = mp.get_context('spawn')
-
-    # Create worker function with fixed arguments
-    worker_fn = partial(
-        evaluate_icl_worker,
-        dataset_name=dataset_name,
-        reranker_checkpoint=reranker_checkpoint,
-        kaggle_dataset=kaggle_dataset,
-        llava_model_name=llava_model_name,
-        load_in_8bit=load_in_8bit,
-        k=k,
-        seed=seed,
-        return_predictions=return_predictions,
-        use_reranker=use_reranker
+    # Merge results using the utility function
+    merged_results = merge_dict_results(
+        results,
+        sum_keys=['correct', 'total'],
+        nested_dict_keys=['per_class_correct', 'per_class_total'],
+        concat_keys=['predictions'] if return_predictions else []
     )
 
-    # Run workers in parallel
-    with ctx.Pool(processes=num_gpus) as pool:
-        results = pool.starmap(worker_fn, [(i, queries) for i, queries in enumerate(query_splits)])
-
-    # Merge results from all GPUs
-    total_correct = sum(r['correct'] for r in results)
-    total_total = sum(r['total'] for r in results)
-
-    # Merge per-class statistics
-    merged_per_class_correct = {}
-    merged_per_class_total = {}
-    for r in results:
-        for label, count in r['per_class_correct'].items():
-            merged_per_class_correct[label] = merged_per_class_correct.get(label, 0) + count
-        for label, count in r['per_class_total'].items():
-            merged_per_class_total[label] = merged_per_class_total.get(label, 0) + count
-
-    # Merge predictions
-    all_predictions = []
-    if return_predictions:
-        for r in results:
-            all_predictions.extend(r['predictions'])
-        # Sort by query_idx to maintain order
-        all_predictions.sort(key=lambda x: x['query_idx'])
+    # Sort predictions by query_idx if present
+    if return_predictions and 'predictions' in merged_results:
+        merged_results['predictions'].sort(key=lambda x: x['query_idx'])
 
     # Compute final metrics
-    accuracy = total_correct / total_total if total_total > 0 else 0.0
+    accuracy = (merged_results['correct'] / merged_results['total']
+                if merged_results['total'] > 0 else 0.0)
 
     per_class_accuracy = {}
-    for label in merged_per_class_total:
+    for label in merged_results['per_class_total']:
         per_class_accuracy[label] = (
-            merged_per_class_correct[label] / merged_per_class_total[label]
-            if merged_per_class_total[label] > 0 else 0.0
+            merged_results['per_class_correct'][label] / merged_results['per_class_total'][label]
+            if merged_results['per_class_total'][label] > 0 else 0.0
         )
 
     mean_per_class_accuracy = np.mean(list(per_class_accuracy.values())) if per_class_accuracy else 0.0
@@ -515,13 +492,13 @@ def evaluate_icl_multigpu(
     final_results = {
         'accuracy': accuracy,
         'mean_per_class_accuracy': mean_per_class_accuracy,
-        'correct': total_correct,
-        'total': total_total,
+        'correct': merged_results['correct'],
+        'total': merged_results['total'],
         'per_class_accuracy': per_class_accuracy
     }
 
     if return_predictions:
-        final_results['predictions'] = all_predictions
+        final_results['predictions'] = merged_results['predictions']
 
     return final_results
 

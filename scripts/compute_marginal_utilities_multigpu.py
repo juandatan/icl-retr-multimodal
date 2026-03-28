@@ -20,7 +20,6 @@ from typing import Dict, List, Tuple
 import subprocess
 import json
 import multiprocessing as mp
-from functools import partial
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -43,20 +42,9 @@ from utils.kaggle_utils import (
     kaggle_download_checkpoints,
     kaggle_upload_checkpoints
 )
+from utils.multigpu_utils import get_available_gpus, split_work_across_gpus
 
 
-def get_available_gpus() -> List[int]:
-    """
-    Get list of available GPU device IDs.
-
-    Returns:
-        List of GPU device IDs
-    """
-    if not torch.cuda.is_available():
-        return []
-
-    n_gpus = torch.cuda.device_count()
-    return list(range(n_gpus))
 
 
 def load_dataset(cfg: DictConfig):
@@ -532,13 +520,14 @@ def main(cfg: DictConfig):
     print(f"{'='*70}\n")
 
     # Get available GPUs
-    gpu_ids = get_available_gpus()
+    num_gpus = get_available_gpus()
 
-    if len(gpu_ids) == 0:
+    if num_gpus == 0:
         print("❌ No GPUs available. This script requires at least one GPU.")
         return
 
-    print(f"✓ Found {len(gpu_ids)} GPU(s): {gpu_ids}\n")
+    gpu_ids = list(range(num_gpus))
+    print(f"✓ Found {num_gpus} GPU(s): {gpu_ids}\n")
 
     # Set random seeds
     np.random.seed(cfg.experiment.seed)
@@ -553,17 +542,15 @@ def main(cfg: DictConfig):
         num_queries = min(num_queries, cfg.limits.max_queries)
 
     print(f"Total queries to process: {num_queries}")
-    print(f"GPUs to use: {len(gpu_ids)}")
+    print(f"GPUs to use: {num_gpus}")
 
-    # Divide queries among GPUs
-    queries_per_gpu = num_queries // len(gpu_ids)
+    # Divide queries among GPUs using utility function
+    query_splits = split_work_across_gpus(num_queries, num_gpus)
+
     query_ranges = []
-
-    for i, gpu_id in enumerate(gpu_ids):
-        start = i * queries_per_gpu
-        end = (i + 1) * queries_per_gpu if i < len(gpu_ids) - 1 else num_queries
-        query_ranges.append((gpu_id, start, end))
-        print(f"  GPU {gpu_id}: queries {start} to {end-1} ({end-start} queries)")
+    for i, (start, end) in enumerate(query_splits):
+        query_ranges.append((i, start, end))
+        print(f"  GPU {i}: queries {start} to {end-1} ({end-start} queries)")
 
     print()
 
