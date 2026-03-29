@@ -212,19 +212,15 @@ def compute_similarity(query_emb: np.ndarray, candidate_embs: np.ndarray) -> np.
 
 
 def retrieve_by_clip(
-    query_idx: int,
+    query_emb: np.ndarray,
     train_dataset,
     k: int
 ) -> List[int]:
     """Retrieve top-K examples using CLIP similarity."""
-    query_emb = train_dataset.clip_embeddings[query_idx]
     candidate_embs = train_dataset.clip_embeddings
 
     # Compute similarities
     similarities = compute_similarity(query_emb, candidate_embs)
-
-    # Exclude self
-    similarities[query_idx] = -np.inf
 
     # Get top-K
     top_k_indices = np.argsort(similarities)[-k:][::-1]
@@ -233,7 +229,7 @@ def retrieve_by_clip(
 
 
 def retrieve_by_reranker(
-    query_idx: int,
+    query_emb: np.ndarray,
     train_dataset,
     reranker: CLIPReranker,
     interaction_features: InteractionFeaturesConfig,
@@ -241,7 +237,6 @@ def retrieve_by_reranker(
     k: int
 ) -> List[int]:
     """Retrieve top-K examples using learned reranker."""
-    query_emb = train_dataset.clip_embeddings[query_idx]
     candidate_embs = train_dataset.clip_embeddings
 
     # Compute CLIP similarities first (needed as input to reranker)
@@ -277,9 +272,6 @@ def retrieve_by_reranker(
             difference=difference,
             l2_distance=l2_distance
         ).squeeze().cpu().numpy()
-
-    # Exclude self
-    utilities[query_idx] = -np.inf
 
     # Get top-K
     top_k_indices = np.argsort(utilities)[-k:][::-1]
@@ -329,16 +321,6 @@ def evaluate_icl_worker(
         load_in_8bit=load_in_8bit
     )
 
-    # Define retrieval function
-    if use_reranker:
-        def retrieval_fn(query_idx, train_ds, k_val):
-            return retrieve_by_reranker(
-                query_idx, train_ds, reranker, interaction_features, device, k_val
-            )
-    else:
-        def retrieval_fn(query_idx, train_ds, k_val):
-            return retrieve_by_clip(query_idx, train_ds, k_val)
-
     # Evaluate on assigned queries
     correct = 0
     total = 0
@@ -353,8 +335,16 @@ def evaluate_icl_worker(
         query_example, query_image = test_dataset[query_idx]
         true_label = query_example.label
 
+        # Get query embedding from test dataset
+        query_emb = test_dataset.clip_embeddings[query_idx]
+
         # Retrieve k examples
-        example_indices = retrieval_fn(query_idx, train_dataset, k)
+        if use_reranker:
+            example_indices = retrieve_by_reranker(
+                query_emb, train_dataset, reranker, interaction_features, device, k
+            )
+        else:
+            example_indices = retrieve_by_clip(query_emb, train_dataset, k)
 
         # Build ICL prompt
         context_examples = []
@@ -520,7 +510,7 @@ def evaluate_icl(
         test_dataset: Test examples to query on
         train_dataset: Training examples to retrieve from
         llava_model: LLaVA model for classification
-        retrieval_fn: Function(query_idx, train_dataset, k) -> List[example_indices]
+        retrieval_fn: Function(query_emb, train_dataset, k) -> List[example_indices]
         k: Number of in-context examples
         num_queries: Number of test queries to evaluate (None = all)
         seed: Random seed for reproducibility
@@ -549,8 +539,11 @@ def evaluate_icl(
         query_example, query_image = test_dataset[query_idx]
         true_label = query_example.label
 
+        # Get query embedding from test dataset
+        query_emb = test_dataset.clip_embeddings[query_idx]
+
         # Retrieve k examples
-        example_indices = retrieval_fn(query_idx, train_dataset, k)
+        example_indices = retrieval_fn(query_emb, train_dataset, k)
 
         # Build ICL prompt
         context_examples = []
@@ -735,8 +728,8 @@ def main():
         print("EVALUATING: CLIP Similarity Baseline")
         print("="*70)
 
-        def clip_retrieval_fn(query_idx, train_ds, k):
-            return retrieve_by_clip(query_idx, train_ds, k)
+        def clip_retrieval_fn(query_emb, train_ds, k):
+            return retrieve_by_clip(query_emb, train_ds, k)
 
         clip_results = evaluate_icl(
             test_dataset=test_dataset,
@@ -783,9 +776,9 @@ def main():
         print("EVALUATING: Learned Reranker")
         print("="*70)
 
-        def reranker_retrieval_fn(query_idx, train_ds, k):
+        def reranker_retrieval_fn(query_emb, train_ds, k):
             return retrieve_by_reranker(
-                query_idx, train_ds, reranker, interaction_features, device, k
+                query_emb, train_ds, reranker, interaction_features, device, k
             )
 
         reranker_results = evaluate_icl(
