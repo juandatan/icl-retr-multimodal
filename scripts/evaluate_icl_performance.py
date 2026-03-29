@@ -29,7 +29,7 @@ Usage:
 import sys
 import argparse
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import pickle
 import random
 import shutil
@@ -47,6 +47,48 @@ from data.marginal_utility_dataset import InteractionFeaturesConfig
 from models.reranker import CLIPReranker
 from models.llava_wrapper import LLaVAWrapper
 from utils.multigpu_utils import MultiGPUManager, merge_dict_results
+
+
+def get_cache_path(
+    dataset_name: str,
+    method: str,
+    k: int,
+    num_queries: int,
+    seed: int,
+    reranker_checkpoint: str = None
+) -> Path:
+    """Generate cache path for evaluation results."""
+    cache_dir = Path("outputs/icl_evaluation_cache")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create a unique identifier for this evaluation configuration
+    config_id = f"{dataset_name}_{method}_k{k}_n{num_queries}_seed{seed}"
+
+    if reranker_checkpoint and method == "reranker":
+        # Add checkpoint name to cache key
+        ckpt_name = Path(reranker_checkpoint).stem
+        config_id += f"_{ckpt_name}"
+
+    return cache_dir / f"{config_id}.pkl"
+
+
+def load_cached_results(cache_path: Path) -> Optional[Dict]:
+    """Load cached evaluation results if they exist."""
+    if cache_path.exists():
+        print(f"Found cached results at {cache_path}")
+        with open(cache_path, 'rb') as f:
+            cached = pickle.load(f)
+        print(f"✓ Loaded {cached['total']} cached predictions")
+        return cached
+    return None
+
+
+def save_cached_results(cache_path: Path, results: Dict):
+    """Save evaluation results to cache."""
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, 'wb') as f:
+        pickle.dump(results, f)
+    print(f"✓ Cached results saved to {cache_path}")
 
 
 def load_dataset(dataset_name: str, split: str = "test"):
@@ -301,12 +343,16 @@ def evaluate_icl_worker(
 
     # Load datasets
     test_dataset = load_dataset(dataset_name, split="test")
-    train_dataset = load_dataset(dataset_name, split="train")
+
+    # Only load train dataset if k > 0 (needed for retrieval)
+    train_dataset = None
+    if k > 0:
+        train_dataset = load_dataset(dataset_name, split="train")
 
     # Load reranker if needed
     reranker = None
     interaction_features = None
-    if use_reranker and reranker_checkpoint:
+    if use_reranker and reranker_checkpoint and k > 0:
         reranker, interaction_features = load_reranker(
             checkpoint_path=reranker_checkpoint,
             device=device,
@@ -335,26 +381,30 @@ def evaluate_icl_worker(
         query_example, query_image = test_dataset[query_idx]
         true_label = query_example.label
 
-        # Get query embedding from test dataset
-        query_emb = test_dataset.clip_embeddings[query_idx]
-
-        # Retrieve k examples
-        if use_reranker:
-            example_indices = retrieve_by_reranker(
-                query_emb, train_dataset, reranker, interaction_features, device, k
-            )
-        else:
-            example_indices = retrieve_by_clip(query_emb, train_dataset, k)
-
-        # Build ICL prompt
+        # Retrieve k examples (only if k > 0)
         context_examples = []
-        for ex_idx in example_indices:
-            ex_example, ex_image = train_dataset[ex_idx]
-            ex_label_text = ex_example.label_name
-            context_examples.append((ex_image, ex_label_text))
+        example_indices = []
+        if k > 0:
+            # Get query embedding from test dataset
+            query_emb = test_dataset.clip_embeddings[query_idx]
 
-        # Get candidate labels for this split (class names)
-        candidate_label_names = [ex.label_name for ex in train_dataset.examples]
+            # Retrieve examples
+            if use_reranker:
+                example_indices = retrieve_by_reranker(
+                    query_emb, train_dataset, reranker, interaction_features, device, k
+                )
+            else:
+                example_indices = retrieve_by_clip(query_emb, train_dataset, k)
+
+            # Build ICL prompt with examples
+            for ex_idx in example_indices:
+                ex_example, ex_image = train_dataset[ex_idx]
+                ex_label_text = ex_example.label_name
+                context_examples.append((ex_image, ex_label_text))
+
+        # Get candidate labels for this split (class names from test dataset)
+        # Use test dataset's label space since that's what we're evaluating on
+        candidate_label_names = [ex.label_name for ex in test_dataset.examples]
         # Deduplicate while preserving order
         seen = set()
         candidate_label_names = [x for x in candidate_label_names if not (x in seen or seen.add(x))]
@@ -366,9 +416,9 @@ def evaluate_icl_worker(
             candidate_labels=candidate_label_names
         )
 
-        # Convert prediction to label index
+        # Convert prediction to label index (use test dataset for mapping)
         predicted_label = -1
-        for ex in train_dataset.examples:
+        for ex in test_dataset.examples:
             if ex.label_name == predicted_label_text:
                 predicted_label = ex.label
                 break
@@ -410,15 +460,14 @@ def evaluate_icl_worker(
 
 
 def evaluate_icl_multigpu(
-    test_dataset,
-    train_dataset,
     dataset_name: str,
-    reranker_checkpoint: str = None,
-    kaggle_dataset: str = None,
+    test_dataset_size: int,
+    reranker_checkpoint: Optional[str] = None,
+    kaggle_dataset: Optional[str] = None,
     llava_model_name: str = "llava-hf/llava-1.5-7b-hf",
     load_in_8bit: bool = False,
     k: int = 1,
-    num_queries: int = None,
+    num_queries: Optional[int] = None,
     seed: int = 42,
     return_predictions: bool = False,
     use_reranker: bool = False,
@@ -426,13 +475,15 @@ def evaluate_icl_multigpu(
 ) -> Dict:
     """
     Evaluate ICL performance using multiple GPUs in parallel.
+
+    Note: Workers load their own dataset copies to avoid memory duplication in main process.
     """
     random.seed(seed)
 
     # Sample queries
-    query_indices = list(range(len(test_dataset)))
-    total_queries = num_queries if num_queries is not None else len(test_dataset)
-    if total_queries < len(test_dataset):
+    query_indices = list(range(test_dataset_size))
+    total_queries = num_queries if num_queries is not None else test_dataset_size
+    if total_queries < test_dataset_size:
         query_indices = random.sample(query_indices, total_queries)
 
     # Use MultiGPUManager to handle parallel execution
@@ -539,21 +590,25 @@ def evaluate_icl(
         query_example, query_image = test_dataset[query_idx]
         true_label = query_example.label
 
-        # Get query embedding from test dataset
-        query_emb = test_dataset.clip_embeddings[query_idx]
-
-        # Retrieve k examples
-        example_indices = retrieval_fn(query_emb, train_dataset, k)
-
-        # Build ICL prompt
+        # Retrieve k examples (only if k > 0)
         context_examples = []
-        for ex_idx in example_indices:
-            ex_example, ex_image = train_dataset[ex_idx]
-            ex_label_text = ex_example.label_name
-            context_examples.append((ex_image, ex_label_text))
+        example_indices = []
+        if k > 0:
+            # Get query embedding from test dataset
+            query_emb = test_dataset.clip_embeddings[query_idx]
 
-        # Get candidate labels for this split (class names)
-        candidate_label_names = [ex.label_name for ex in train_dataset.examples]
+            # Retrieve examples
+            example_indices = retrieval_fn(query_emb, train_dataset, k)
+
+            # Build ICL prompt
+            for ex_idx in example_indices:
+                ex_example, ex_image = train_dataset[ex_idx]
+                ex_label_text = ex_example.label_name
+                context_examples.append((ex_image, ex_label_text))
+
+        # Get candidate labels for this split (class names from test dataset)
+        # Use test dataset's label space since that's what we're evaluating on
+        candidate_label_names = [ex.label_name for ex in test_dataset.examples]
         # Deduplicate while preserving order
         seen = set()
         candidate_label_names = [x for x in candidate_label_names if not (x in seen or seen.add(x))]
@@ -565,9 +620,9 @@ def evaluate_icl(
             candidate_labels=candidate_label_names
         )
 
-        # Convert prediction to label index by finding matching example
+        # Convert prediction to label index by finding matching example (use test dataset for mapping)
         predicted_label = -1
-        for ex in train_dataset.examples:
+        for ex in test_dataset.examples:
             if ex.label_name == predicted_label_text:
                 predicted_label = ex.label
                 break
@@ -648,6 +703,10 @@ def main():
                         help="Output path to save results")
     parser.add_argument("--num-gpus", type=int, default=None,
                         help="Number of GPUs to use (default: auto-detect all available)")
+    parser.add_argument("--use-cache", action="store_true",
+                        help="Use cached predictions if available")
+    parser.add_argument("--force-recompute", action="store_true",
+                        help="Force recompute even if cache exists")
 
     args = parser.parse_args()
 
@@ -669,78 +728,113 @@ def main():
         num_gpus = 1
         print(f"Using device: {device}")
 
-    # Load datasets (only for metadata if using multi-GPU)
-    test_dataset = load_dataset(args.dataset, split="test")
-    train_dataset = load_dataset(args.dataset, split="train")
-
     # Determine if we should use multi-GPU
     use_multi_gpu = num_gpus > 1 and device == "cuda"
 
+    # Get dataset size for num_queries calculation
+    # We need this even for multi-GPU to determine the default num_queries
+    temp_dataset = load_dataset(args.dataset, split="test")
+    test_dataset_size = len(temp_dataset)
+
+    # For multi-GPU, free the dataset immediately to save memory
+    # Workers will load their own copies
     if use_multi_gpu:
-        print(f"\n{'='*70}")
-        print(f"MULTI-GPU MODE: Using {num_gpus} GPUs in parallel")
-        print(f"{'='*70}")
-
-        # Evaluate CLIP similarity baseline
-        print("\n" + "="*70)
-        print("EVALUATING: CLIP Similarity Baseline")
-        print("="*70)
-
-        clip_results = evaluate_icl_multigpu(
-            test_dataset=test_dataset,
-            train_dataset=train_dataset,
-            dataset_name=args.dataset,
-            reranker_checkpoint=None,
-            kaggle_dataset=None,
-            llava_model_name=args.llava_model,
-            load_in_8bit=args.load_in_8bit,
-            k=args.k,
-            num_queries=args.num_queries or len(test_dataset),
-            seed=args.seed,
-            return_predictions=True,
-            use_reranker=False,
-            num_gpus=num_gpus
-        )
+        del temp_dataset
+        test_dataset = None
+        train_dataset = None
     else:
-        # Single GPU/CPU mode
-        # Load reranker if provided
-        reranker = None
-        interaction_features = None
-        if args.reranker_checkpoint:
-            reranker, interaction_features = load_reranker(
-                checkpoint_path=args.reranker_checkpoint,
-                device=device,
-                kaggle_dataset=args.kaggle_dataset,
-                force_refresh=args.force_refresh
+        # For single-GPU, keep the loaded dataset
+        test_dataset = temp_dataset
+        train_dataset = None
+        if args.k > 0:
+            train_dataset = load_dataset(args.dataset, split="train")
+
+    # Check cache for CLIP results
+    clip_cache_path = get_cache_path(
+        dataset_name=args.dataset,
+        method="clip",
+        k=args.k,
+        num_queries=args.num_queries or test_dataset_size,
+        seed=args.seed
+    )
+
+    clip_results = None
+    if args.use_cache and not args.force_recompute:
+        clip_results = load_cached_results(clip_cache_path)
+
+    if clip_results is None:
+        if use_multi_gpu:
+            print(f"\n{'='*70}")
+            print(f"MULTI-GPU MODE: Using {num_gpus} GPUs in parallel")
+            print(f"{'='*70}")
+
+            # Evaluate CLIP similarity baseline
+            print("\n" + "="*70)
+            print("EVALUATING: CLIP Similarity Baseline")
+            print("="*70)
+
+            clip_results = evaluate_icl_multigpu(
+                dataset_name=args.dataset,
+                test_dataset_size=test_dataset_size,
+                reranker_checkpoint=None,
+                kaggle_dataset=None,
+                llava_model_name=args.llava_model,
+                load_in_8bit=args.load_in_8bit,
+                k=args.k,
+                num_queries=args.num_queries or test_dataset_size,
+                seed=args.seed,
+                return_predictions=True,
+                use_reranker=False,
+                num_gpus=num_gpus
             )
 
-        # Initialize LLaVA
-        print(f"\nInitializing LLaVA model: {args.llava_model}")
-        llava_model = LLaVAWrapper(
-            model_name=args.llava_model,
-            device=device,
-            load_in_8bit=args.load_in_8bit
-        )
-        print("✓ LLaVA model loaded")
+            # Save to cache if requested
+            if args.use_cache:
+                save_cached_results(clip_cache_path, clip_results)
+        else:
+            # Single GPU/CPU mode
+            # Load reranker if provided
+            reranker = None
+            interaction_features = None
+            if args.reranker_checkpoint:
+                reranker, interaction_features = load_reranker(
+                    checkpoint_path=args.reranker_checkpoint,
+                    device=device,
+                    kaggle_dataset=args.kaggle_dataset,
+                    force_refresh=args.force_refresh
+                )
 
-        # Evaluate CLIP similarity baseline
-        print("\n" + "="*70)
-        print("EVALUATING: CLIP Similarity Baseline")
-        print("="*70)
+            # Initialize LLaVA
+            print(f"\nInitializing LLaVA model: {args.llava_model}")
+            llava_model = LLaVAWrapper(
+                model_name=args.llava_model,
+                device=device,
+                load_in_8bit=args.load_in_8bit
+            )
+            print("✓ LLaVA model loaded")
 
-        def clip_retrieval_fn(query_emb, train_ds, k):
-            return retrieve_by_clip(query_emb, train_ds, k)
+            # Evaluate CLIP similarity baseline
+            print("\n" + "="*70)
+            print("EVALUATING: CLIP Similarity Baseline")
+            print("="*70)
 
-        clip_results = evaluate_icl(
-            test_dataset=test_dataset,
-            train_dataset=train_dataset,
-            llava_model=llava_model,
-            retrieval_fn=clip_retrieval_fn,
-            k=args.k,
-            num_queries=args.num_queries,
-            seed=args.seed,
-            return_predictions=True
-        )
+            def clip_retrieval_fn(query_emb, train_ds, k):
+                return retrieve_by_clip(query_emb, train_ds, k)
+
+            clip_results = evaluate_icl(
+                test_dataset=test_dataset,
+                train_dataset=train_dataset,
+                llava_model=llava_model,
+                retrieval_fn=clip_retrieval_fn,
+                k=args.k,
+                num_queries=args.num_queries,
+                seed=args.seed,
+                return_predictions=True
+            )
+
+            # Save to cache if requested
+            if args.use_cache:
+                save_cached_results(clip_cache_path, clip_results)
 
     print(f"\nCLIP Baseline Results:")
     print(f"  Accuracy: {clip_results['accuracy']:.2%}")
@@ -749,49 +843,68 @@ def main():
 
     # Evaluate reranker if provided
     reranker_results = None
-    if use_multi_gpu and args.reranker_checkpoint:
-        # Multi-GPU mode for reranker
-        print("\n" + "="*70)
-        print("EVALUATING: Learned Reranker")
-        print("="*70)
-
-        reranker_results = evaluate_icl_multigpu(
-            test_dataset=test_dataset,
-            train_dataset=train_dataset,
+    if args.reranker_checkpoint:
+        # Check cache for reranker results
+        reranker_cache_path = get_cache_path(
             dataset_name=args.dataset,
-            reranker_checkpoint=args.reranker_checkpoint,
-            kaggle_dataset=args.kaggle_dataset,
-            llava_model_name=args.llava_model,
-            load_in_8bit=args.load_in_8bit,
+            method="reranker",
             k=args.k,
-            num_queries=args.num_queries or len(test_dataset),
+            num_queries=args.num_queries or test_dataset_size,
             seed=args.seed,
-            return_predictions=True,
-            use_reranker=True,
-            num_gpus=num_gpus
-        )
-    elif not use_multi_gpu and args.reranker_checkpoint:
-        # Single GPU mode for reranker
-        print("\n" + "="*70)
-        print("EVALUATING: Learned Reranker")
-        print("="*70)
-
-        def reranker_retrieval_fn(query_emb, train_ds, k):
-            return retrieve_by_reranker(
-                query_emb, train_ds, reranker, interaction_features, device, k
-            )
-
-        reranker_results = evaluate_icl(
-            test_dataset=test_dataset,
-            train_dataset=train_dataset,
-            llava_model=llava_model,
-            retrieval_fn=reranker_retrieval_fn,
-            k=args.k,
-            num_queries=args.num_queries,
-            seed=args.seed,
-            return_predictions=True
+            reranker_checkpoint=args.reranker_checkpoint
         )
 
+        if args.use_cache and not args.force_recompute:
+            reranker_results = load_cached_results(reranker_cache_path)
+
+        if reranker_results is None:
+            if use_multi_gpu:
+                # Multi-GPU mode for reranker
+                print("\n" + "="*70)
+                print("EVALUATING: Learned Reranker")
+                print("="*70)
+
+                reranker_results = evaluate_icl_multigpu(
+                    dataset_name=args.dataset,
+                    test_dataset_size=test_dataset_size,
+                    reranker_checkpoint=args.reranker_checkpoint,
+                    kaggle_dataset=args.kaggle_dataset,
+                    llava_model_name=args.llava_model,
+                    load_in_8bit=args.load_in_8bit,
+                    k=args.k,
+                    num_queries=args.num_queries or test_dataset_size,
+                    seed=args.seed,
+                    return_predictions=True,
+                    use_reranker=True,
+                    num_gpus=num_gpus
+                )
+            else:
+                # Single GPU mode for reranker
+                print("\n" + "="*70)
+                print("EVALUATING: Learned Reranker")
+                print("="*70)
+
+                def reranker_retrieval_fn(query_emb, train_ds, k):
+                    return retrieve_by_reranker(
+                        query_emb, train_ds, reranker, interaction_features, device, k
+                    )
+
+                reranker_results = evaluate_icl(
+                    test_dataset=test_dataset,
+                    train_dataset=train_dataset,
+                    llava_model=llava_model,
+                    retrieval_fn=reranker_retrieval_fn,
+                    k=args.k,
+                    num_queries=args.num_queries,
+                    seed=args.seed,
+                    return_predictions=True
+                )
+
+            # Save to cache if requested
+            if args.use_cache:
+                save_cached_results(reranker_cache_path, reranker_results)
+
+    if reranker_results:
         print(f"\nReranker Results:")
         print(f"  Accuracy: {reranker_results['accuracy']:.2%}")
         print(f"  Mean per-class accuracy: {reranker_results['mean_per_class_accuracy']:.2%}")
