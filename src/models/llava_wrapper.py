@@ -11,7 +11,7 @@ import torch
 import numpy as np
 from typing import List, Optional, Tuple, Dict
 from PIL import Image
-from transformers import AutoTokenizer, AutoProcessor, LlavaForConditionalGeneration
+from transformers import AutoTokenizer, AutoProcessor, LlavaForConditionalGeneration, BitsAndBytesConfig
 from torch.cuda.amp import autocast
 class LLaVAWrapper:
     """
@@ -75,14 +75,18 @@ class LLaVAWrapper:
 
         model_kwargs = {}
         if load_in_8bit:
-            model_kwargs['load_in_8bit'] = True
+            # Use BitsAndBytesConfig for quantization
+            quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+            model_kwargs['quantization_config'] = quantization_config
             # For multi-GPU, we need to specify the device for quantized models
             if device.startswith("cuda:"):
                 model_kwargs['device_map'] = {"": device}
             else:
                 model_kwargs['device_map'] = "auto"
         elif load_in_4bit:
-            model_kwargs['load_in_4bit'] = True
+            # Use BitsAndBytesConfig for quantization
+            quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+            model_kwargs['quantization_config'] = quantization_config
             # For multi-GPU, we need to specify the device for quantized models
             if device.startswith("cuda:"):
                 model_kwargs['device_map'] = {"": device}
@@ -108,6 +112,7 @@ class LLaVAWrapper:
     def format_prompt(
         self,
         example_labels: Optional[List[str]] = None,
+        candidate_labels: Optional[List[str]] = None,
     ) -> str:
         """
         Format prompt for classification task.
@@ -120,8 +125,12 @@ class LLaVAWrapper:
              <image>\nQuestion: What is this?\nAnswer: {label2}\n\n
              <image>\nQuestion: What is this?\nAnswer:"
 
+        With candidates (generative evaluation):
+            "<image>\nQuestion: What is this? Choose from: {candidate1}, {candidate2}, ...\nAnswer:"
+
         Args:
             example_labels: List of example labels for ICL
+            candidate_labels: List of candidate labels to choose from (for generative evaluation)
 
         Returns:
             Formatted prompt string with <image> tokens
@@ -132,13 +141,22 @@ class LLaVAWrapper:
         if example_labels is not None:
             for ex_label in example_labels:
                 prompt_parts.append("<image>")
-                prompt_parts.append("Question: What is this?")
+                if candidate_labels is not None:
+                    # Include candidates in each example question
+                    candidates_str = ", ".join(candidate_labels)
+                    prompt_parts.append(f"Question: What is this? Choose from: {candidates_str}")
+                else:
+                    prompt_parts.append("Question: What is this?")
                 prompt_parts.append(f"Answer: {ex_label}")
                 prompt_parts.append("")  # Blank line
 
         # Add query
         prompt_parts.append("<image>")
-        prompt_parts.append("Question: What is this?")
+        if candidate_labels is not None:
+            candidates_str = ", ".join(candidate_labels)
+            prompt_parts.append(f"Question: What is this? Choose from: {candidates_str}")
+        else:
+            prompt_parts.append("Question: What is this?")
         prompt_parts.append("Answer:")
 
         return "\n".join(prompt_parts)
@@ -529,3 +547,86 @@ class LLaVAWrapper:
                 best_label = label
 
         return best_label
+
+    def classify_with_context_generative(
+        self,
+        query_image: Image.Image,
+        context_examples: List[Tuple[Image.Image, str]],
+        candidate_labels: List[str],
+        max_new_tokens: int = 10
+    ) -> str:
+        """
+        Classify an image using generative decoding (free-form generation).
+
+        This method lets the model generate text freely, then matches the output
+        to the closest candidate label. This is closer to the evaluation methodology
+        used in the original ICL retrieval study with Flan-PaLM 2.
+
+        Args:
+            query_image: Query image to classify
+            context_examples: List of (image, label_text) tuples for ICL context
+            candidate_labels: List of candidate label names to match against
+            max_new_tokens: Maximum tokens to generate (default: 10, since most labels are 1-3 tokens)
+
+        Returns:
+            Predicted label text (matched to closest candidate)
+        """
+        # Format prompt with context examples and candidate labels
+        example_labels = [label for _, label in context_examples] if context_examples else None
+        prompt = self.format_prompt(example_labels=example_labels, candidate_labels=candidate_labels)
+
+        # Prepare images: context images + query image
+        images = [img for img, _ in context_examples] + [query_image]
+
+        # Process inputs
+        inputs = self.processor(
+            text=prompt,
+            images=images,
+            return_tensors="pt"
+        ).to(self.device)
+
+        # Generate
+        with torch.no_grad():
+            if self.device.startswith("cuda"):
+                with autocast(dtype=torch.float16):
+                    output_ids = self.model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,  # Greedy decoding for consistency
+                        pad_token_id=self.processor.tokenizer.pad_token_id,
+                        eos_token_id=self.processor.tokenizer.eos_token_id
+                    )
+            else:
+                output_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=self.processor.tokenizer.pad_token_id,
+                    eos_token_id=self.processor.tokenizer.eos_token_id
+                )
+
+        # Decode generated text
+        # Remove the input prompt tokens to get only the generated part
+        generated_ids = output_ids[0][inputs.input_ids.shape[1]:]
+        generated_text = self.processor.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+        # Match to closest candidate label
+        # Try exact match first (case-insensitive)
+        generated_lower = generated_text.lower()
+        for label in candidate_labels:
+            if label.lower() == generated_lower:
+                return label
+
+        # Try substring match (check if label appears in generated text)
+        for label in candidate_labels:
+            if label.lower() in generated_lower:
+                return label
+
+        # Try reverse substring match (check if generated text appears in label)
+        for label in candidate_labels:
+            if generated_lower in label.lower():
+                return label
+
+        # If no match found, return the first candidate as default
+        # (This could be improved with fuzzy matching, but let's start simple)
+        return candidate_labels[0] if candidate_labels else ""

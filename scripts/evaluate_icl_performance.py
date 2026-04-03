@@ -47,6 +47,7 @@ from data.marginal_utility_dataset import InteractionFeaturesConfig
 from models.reranker import CLIPReranker
 from models.llava_wrapper import LLaVAWrapper
 from utils.multigpu_utils import MultiGPUManager, merge_dict_results
+from utils.imagenet_names import get_readable_name, get_synset_id, IMAGENET_SYNSET_TO_NAME
 
 
 def get_cache_path(
@@ -55,7 +56,8 @@ def get_cache_path(
     k: int,
     num_queries: int,
     seed: int,
-    reranker_checkpoint: str = None
+    reranker_checkpoint: str = None,
+    use_generative: bool = False
 ) -> Path:
     """Generate cache path for evaluation results."""
     cache_dir = Path("outputs/icl_evaluation_cache")
@@ -68,6 +70,10 @@ def get_cache_path(
         # Add checkpoint name to cache key
         ckpt_name = Path(reranker_checkpoint).stem
         config_id += f"_{ckpt_name}"
+
+    # Add evaluation method to cache key
+    if use_generative:
+        config_id += "_generative"
 
     return cache_dir / f"{config_id}.pkl"
 
@@ -332,7 +338,8 @@ def evaluate_icl_worker(
     k: int = 1,
     seed: int = 42,
     return_predictions: bool = False,
-    use_reranker: bool = False
+    use_reranker: bool = False,
+    use_generative: bool = False
 ) -> Dict:
     """
     Worker function for multi-GPU evaluation.
@@ -400,21 +407,39 @@ def evaluate_icl_worker(
             for ex_idx in example_indices:
                 ex_example, ex_image = train_dataset[ex_idx]
                 ex_label_text = ex_example.label_name
+                # Convert to readable name for generative evaluation
+                if use_generative:
+                    ex_label_text = get_readable_name(ex_label_text)
                 context_examples.append((ex_image, ex_label_text))
 
-        # Get candidate labels for this split (class names from test dataset)
-        # Use test dataset's label space since that's what we're evaluating on
-        candidate_label_names = [ex.label_name for ex in test_dataset.examples]
-        # Deduplicate while preserving order
-        seen = set()
-        candidate_label_names = [x for x in candidate_label_names if not (x in seen or seen.add(x))]
+        # Get candidate labels
+        if use_generative:
+            # For generative evaluation, use ALL 100 Mini-ImageNet classes
+            # This makes the task harder and more realistic
+            candidate_label_names = sorted([name for name in IMAGENET_SYNSET_TO_NAME.values()])
+        else:
+            # For discriminative evaluation, use only test split classes
+            # (Computing log probs for all 100 classes would be too expensive)
+            candidate_label_names = [ex.label_name for ex in test_dataset.examples]
+            # Deduplicate while preserving order
+            seen = set()
+            candidate_label_names = [x for x in candidate_label_names if not (x in seen or seen.add(x))]
 
-        # Query LLaVA
-        predicted_label_text = llava_model.classify_with_context(
-            query_image=query_image,
-            context_examples=context_examples,
-            candidate_labels=candidate_label_names
-        )
+        # Query LLaVA (discriminative or generative)
+        if use_generative:
+            predicted_label_text = llava_model.classify_with_context_generative(
+                query_image=query_image,
+                context_examples=context_examples,
+                candidate_labels=candidate_label_names
+            )
+            # Convert back from readable name to synset ID for accuracy computation
+            predicted_label_text = get_synset_id(predicted_label_text)
+        else:
+            predicted_label_text = llava_model.classify_with_context(
+                query_image=query_image,
+                context_examples=context_examples,
+                candidate_labels=candidate_label_names
+            )
 
         # Convert prediction to label index (use test dataset for mapping)
         predicted_label = -1
@@ -471,7 +496,8 @@ def evaluate_icl_multigpu(
     seed: int = 42,
     return_predictions: bool = False,
     use_reranker: bool = False,
-    num_gpus: int = 1
+    num_gpus: int = 1,
+    use_generative: bool = False
 ) -> Dict:
     """
     Evaluate ICL performance using multiple GPUs in parallel.
@@ -501,7 +527,8 @@ def evaluate_icl_multigpu(
                 'k': k,
                 'seed': seed,
                 'return_predictions': return_predictions,
-                'use_reranker': use_reranker
+                'use_reranker': use_reranker,
+                'use_generative': use_generative
             }
         )
 
@@ -552,7 +579,8 @@ def evaluate_icl(
     k: int,
     num_queries: int = None,
     seed: int = 42,
-    return_predictions: bool = False
+    return_predictions: bool = False,
+    use_generative: bool = False
 ) -> Dict:
     """
     Evaluate ICL performance using a given retrieval method.
@@ -604,21 +632,39 @@ def evaluate_icl(
             for ex_idx in example_indices:
                 ex_example, ex_image = train_dataset[ex_idx]
                 ex_label_text = ex_example.label_name
+                # Convert to readable name for generative evaluation
+                if use_generative:
+                    ex_label_text = get_readable_name(ex_label_text)
                 context_examples.append((ex_image, ex_label_text))
 
-        # Get candidate labels for this split (class names from test dataset)
-        # Use test dataset's label space since that's what we're evaluating on
-        candidate_label_names = [ex.label_name for ex in test_dataset.examples]
-        # Deduplicate while preserving order
-        seen = set()
-        candidate_label_names = [x for x in candidate_label_names if not (x in seen or seen.add(x))]
+        # Get candidate labels
+        if use_generative:
+            # For generative evaluation, use ALL 100 Mini-ImageNet classes
+            # This makes the task harder and more realistic
+            candidate_label_names = sorted([name for name in IMAGENET_SYNSET_TO_NAME.values()])
+        else:
+            # For discriminative evaluation, use only test split classes
+            # (Computing log probs for all 100 classes would be too expensive)
+            candidate_label_names = [ex.label_name for ex in test_dataset.examples]
+            # Deduplicate while preserving order
+            seen = set()
+            candidate_label_names = [x for x in candidate_label_names if not (x in seen or seen.add(x))]
 
-        # Query LLaVA (get probabilities if possible)
-        predicted_label_text = llava_model.classify_with_context(
-            query_image=query_image,
-            context_examples=context_examples,
-            candidate_labels=candidate_label_names
-        )
+        # Query LLaVA (discriminative or generative)
+        if use_generative:
+            predicted_label_text = llava_model.classify_with_context_generative(
+                query_image=query_image,
+                context_examples=context_examples,
+                candidate_labels=candidate_label_names
+            )
+            # Convert back from readable name to synset ID for accuracy computation
+            predicted_label_text = get_synset_id(predicted_label_text)
+        else:
+            predicted_label_text = llava_model.classify_with_context(
+                query_image=query_image,
+                context_examples=context_examples,
+                candidate_labels=candidate_label_names
+            )
 
         # Convert prediction to label index by finding matching example (use test dataset for mapping)
         predicted_label = -1
@@ -707,6 +753,8 @@ def main():
                         help="Use cached predictions if available")
     parser.add_argument("--force-recompute", action="store_true",
                         help="Force recompute even if cache exists")
+    parser.add_argument("--use-generative", action="store_true",
+                        help="Use generative evaluation (free-form generation + matching) instead of discriminative (probability-based)")
 
     args = parser.parse_args()
 
@@ -730,6 +778,10 @@ def main():
 
     # Determine if we should use multi-GPU
     use_multi_gpu = num_gpus > 1 and device == "cuda"
+
+    # Print evaluation mode
+    eval_mode = "Generative" if args.use_generative else "Discriminative (probability-based)"
+    print(f"\nEvaluation mode: {eval_mode}")
 
     # Get dataset size for num_queries calculation
     # We need this even for multi-GPU to determine the default num_queries
@@ -755,7 +807,8 @@ def main():
         method="clip",
         k=args.k,
         num_queries=args.num_queries or test_dataset_size,
-        seed=args.seed
+        seed=args.seed,
+        use_generative=args.use_generative
     )
 
     clip_results = None
@@ -785,7 +838,8 @@ def main():
                 seed=args.seed,
                 return_predictions=True,
                 use_reranker=False,
-                num_gpus=num_gpus
+                num_gpus=num_gpus,
+                use_generative=args.use_generative
             )
 
             # Save to cache if requested
@@ -829,7 +883,8 @@ def main():
                 k=args.k,
                 num_queries=args.num_queries,
                 seed=args.seed,
-                return_predictions=True
+                return_predictions=True,
+                use_generative=args.use_generative
             )
 
             # Save to cache if requested
@@ -851,7 +906,8 @@ def main():
             k=args.k,
             num_queries=args.num_queries or test_dataset_size,
             seed=args.seed,
-            reranker_checkpoint=args.reranker_checkpoint
+            reranker_checkpoint=args.reranker_checkpoint,
+            use_generative=args.use_generative
         )
 
         if args.use_cache and not args.force_recompute:
@@ -876,7 +932,8 @@ def main():
                     seed=args.seed,
                     return_predictions=True,
                     use_reranker=True,
-                    num_gpus=num_gpus
+                    num_gpus=num_gpus,
+                    use_generative=args.use_generative
                 )
             else:
                 # Single GPU mode for reranker
@@ -897,7 +954,8 @@ def main():
                     k=args.k,
                     num_queries=args.num_queries,
                     seed=args.seed,
-                    return_predictions=True
+                    return_predictions=True,
+                    use_generative=args.use_generative
                 )
 
             # Save to cache if requested
