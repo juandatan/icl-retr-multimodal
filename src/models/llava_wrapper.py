@@ -118,19 +118,25 @@ class LLaVAWrapper:
         Format prompt for classification task.
 
         For 0-shot:
-            "<image>\nQuestion: What is this?\nAnswer:"
+            "Now classify this image:\n<image>\nQuestion: What is this?\nAnswer:"
 
         For n-shot:
-            "<image>\nQuestion: What is this?\nAnswer: {label1}\n\n
-             <image>\nQuestion: What is this?\nAnswer: {label2}\n\n
-             <image>\nQuestion: What is this?\nAnswer:"
+            "Example 1:\n<image>\nThis is a {label1}.\n\n
+             Example 2:\n<image>\nThis is a {label2}.\n\n
+             Now classify this image:\n<image>\nQuestion: What is this?\nAnswer:"
 
         With candidates (generative evaluation):
-            "<image>\nQuestion: What is this? Choose from: {candidate1}, {candidate2}, ...\nAnswer:"
+            Note: Candidates are only shown for the final query, not for ICL examples.
+            This allows any class to be demonstrated without constraint.
+
+            "Example 1:\n<image>\nThis is a {label1}.\n\n
+             Now classify this image:\n<image>\n
+             Question: What is this? Choose from: {candidate1}, {candidate2}, ...\nAnswer:"
 
         Args:
             example_labels: List of example labels for ICL
             candidate_labels: List of candidate labels to choose from (for generative evaluation)
+                             Only shown in the final query question, not in example demonstrations.
 
         Returns:
             Formatted prompt string with <image> tokens
@@ -138,19 +144,16 @@ class LLaVAWrapper:
         prompt_parts = []
 
         # Add examples if provided
+        # Use descriptive format to clearly distinguish examples from the query
         if example_labels is not None:
-            for ex_label in example_labels:
+            for i, ex_label in enumerate(example_labels, 1):
+                prompt_parts.append(f"Example {i}:")
                 prompt_parts.append("<image>")
-                if candidate_labels is not None:
-                    # Include candidates in each example question
-                    candidates_str = ", ".join(candidate_labels)
-                    prompt_parts.append(f"Question: What is this? Choose from: {candidates_str}")
-                else:
-                    prompt_parts.append("Question: What is this?")
-                prompt_parts.append(f"Answer: {ex_label}")
+                prompt_parts.append(f"This is a {ex_label}.")
                 prompt_parts.append("")  # Blank line
 
-        # Add query
+        # Add query (only the query shows candidate list if provided)
+        prompt_parts.append("Now classify this image:")
         prompt_parts.append("<image>")
         if candidate_labels is not None:
             candidates_str = ", ".join(candidate_labels)

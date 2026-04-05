@@ -37,6 +37,7 @@ import shutil
 import numpy as np
 import torch
 from tqdm import tqdm
+import clip
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -57,7 +58,8 @@ def get_cache_path(
     num_queries: int,
     seed: int,
     reranker_checkpoint: str = None,
-    use_generative: bool = False
+    use_generative: bool = False,
+    prefilter_topk: Optional[int] = None
 ) -> Path:
     """Generate cache path for evaluation results."""
     cache_dir = Path("outputs/icl_evaluation_cache")
@@ -74,6 +76,10 @@ def get_cache_path(
     # Add evaluation method to cache key
     if use_generative:
         config_id += "_generative"
+
+    # Add prefilter setting to cache key
+    if prefilter_topk is not None:
+        config_id += f"_prefilter{prefilter_topk}"
 
     return cache_dir / f"{config_id}.pkl"
 
@@ -327,6 +333,51 @@ def retrieve_by_reranker(
     return top_k_indices.tolist()
 
 
+def get_oracle_candidates(
+    image,
+    true_class: str,
+    all_classes: List[str],
+    clip_text_features: torch.Tensor,
+    clip_model,
+    preprocess,
+    device: str,
+    top_k: int = 10
+) -> List[str]:
+    """
+    Get top-(K-1) candidates using CLIP, then append true class.
+
+    This guarantees the true class is always included without conditional logic.
+
+    Args:
+        image: PIL Image
+        true_class: True class name (readable)
+        all_classes: List of all candidate class names
+        clip_text_features: Precomputed CLIP text embeddings for all classes
+        clip_model: CLIP model
+        preprocess: CLIP preprocessing function
+        device: Device to run on
+        top_k: Number of candidates to return
+
+    Returns:
+        List of K candidates with true class always at the end
+    """
+    # Get CLIP embedding for image
+    image_input = preprocess(image).unsqueeze(0).to(device)
+    with torch.no_grad():
+        image_features = clip_model.encode_image(image_input)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+    # Compute similarities
+    similarities = (image_features @ clip_text_features.T).squeeze(0)
+
+    # Get top-(K-1) candidates
+    top_indices = similarities.topk(top_k - 1).indices.cpu().numpy()
+    top_candidates = [all_classes[i] for i in top_indices]
+
+    # Always append true class at the end
+    return top_candidates + [true_class]
+
+
 def evaluate_icl_worker(
     gpu_id: int,
     query_indices: List[int],
@@ -339,7 +390,8 @@ def evaluate_icl_worker(
     seed: int = 42,
     return_predictions: bool = False,
     use_reranker: bool = False,
-    use_generative: bool = False
+    use_generative: bool = False,
+    prefilter_topk: Optional[int] = None
 ) -> Dict:
     """
     Worker function for multi-GPU evaluation.
@@ -373,6 +425,22 @@ def evaluate_icl_worker(
         device=device,
         load_in_8bit=load_in_8bit
     )
+
+    # Initialize CLIP for oracle pre-filtering if needed
+    clip_model = None
+    clip_preprocess = None
+    clip_text_features = None
+    if prefilter_topk is not None and use_generative:
+        print(f"GPU {gpu_id}: Loading CLIP for oracle pre-filtering (top-{prefilter_topk})...")
+        clip_model, clip_preprocess = clip.load("ViT-B/32", device=device)
+        clip_model.eval()
+
+        # Precompute text embeddings for all classes
+        all_class_names = sorted([name for name in IMAGENET_SYNSET_TO_NAME.values()])
+        text_tokens = clip.tokenize(all_class_names).to(device)
+        with torch.no_grad():
+            clip_text_features = clip_model.encode_text(text_tokens)
+            clip_text_features = clip_text_features / clip_text_features.norm(dim=-1, keepdim=True)
 
     # Evaluate on assigned queries
     correct = 0
@@ -414,9 +482,27 @@ def evaluate_icl_worker(
 
         # Get candidate labels
         if use_generative:
-            # For generative evaluation, use ALL 100 Mini-ImageNet classes
-            # This makes the task harder and more realistic
-            candidate_label_names = sorted([name for name in IMAGENET_SYNSET_TO_NAME.values()])
+            # Apply pre-filtering if enabled
+            if prefilter_topk is not None:
+                # Get true label as readable name
+                true_label_readable = get_readable_name(query_example.label_name)
+                all_class_names = sorted([name for name in IMAGENET_SYNSET_TO_NAME.values()])
+
+                # Get top-(K-1) candidates + true class
+                candidate_label_names = get_oracle_candidates(
+                    image=query_image,
+                    true_class=true_label_readable,
+                    all_classes=all_class_names,
+                    clip_text_features=clip_text_features,
+                    clip_model=clip_model,
+                    preprocess=clip_preprocess,
+                    device=device,
+                    top_k=prefilter_topk
+                )
+            else:
+                # For generative evaluation without pre-filtering, use ALL 100 Mini-ImageNet classes
+                # This makes the task harder and more realistic
+                candidate_label_names = sorted([name for name in IMAGENET_SYNSET_TO_NAME.values()])
         else:
             # For discriminative evaluation, use only test split classes
             # (Computing log probs for all 100 classes would be too expensive)
@@ -497,7 +583,8 @@ def evaluate_icl_multigpu(
     return_predictions: bool = False,
     use_reranker: bool = False,
     num_gpus: int = 1,
-    use_generative: bool = False
+    use_generative: bool = False,
+    prefilter_topk: Optional[int] = None
 ) -> Dict:
     """
     Evaluate ICL performance using multiple GPUs in parallel.
@@ -528,7 +615,8 @@ def evaluate_icl_multigpu(
                 'seed': seed,
                 'return_predictions': return_predictions,
                 'use_reranker': use_reranker,
-                'use_generative': use_generative
+                'use_generative': use_generative,
+                'prefilter_topk': prefilter_topk
             }
         )
 
@@ -580,7 +668,9 @@ def evaluate_icl(
     num_queries: int = None,
     seed: int = 42,
     return_predictions: bool = False,
-    use_generative: bool = False
+    use_generative: bool = False,
+    prefilter_topk: Optional[int] = None,
+    device: str = "cuda"
 ) -> Dict:
     """
     Evaluate ICL performance using a given retrieval method.
@@ -611,6 +701,22 @@ def evaluate_icl(
     per_class_total = {}
     predictions = []
 
+    # Initialize CLIP for pre-filtering if needed
+    clip_model = None
+    clip_preprocess = None
+    clip_text_features = None
+    if prefilter_topk is not None and use_generative:
+        print(f"\nLoading CLIP for pre-filtering (top-{prefilter_topk})...")
+        clip_model, clip_preprocess = clip.load("ViT-B/32", device=device)
+        clip_model.eval()
+
+        # Precompute text embeddings for all classes
+        all_class_names = sorted([name for name in IMAGENET_SYNSET_TO_NAME.values()])
+        text_tokens = clip.tokenize(all_class_names).to(device)
+        with torch.no_grad():
+            clip_text_features = clip_model.encode_text(text_tokens)
+            clip_text_features = clip_text_features / clip_text_features.norm(dim=-1, keepdim=True)
+
     print(f"\nEvaluating on {len(query_indices)} queries with k={k}...")
 
     for query_idx in tqdm(query_indices, desc="Querying LLaVA"):
@@ -639,9 +745,27 @@ def evaluate_icl(
 
         # Get candidate labels
         if use_generative:
-            # For generative evaluation, use ALL 100 Mini-ImageNet classes
-            # This makes the task harder and more realistic
-            candidate_label_names = sorted([name for name in IMAGENET_SYNSET_TO_NAME.values()])
+            # Apply oracle pre-filtering if enabled
+            if prefilter_topk is not None:
+                # Get true label as readable name
+                true_label_readable = get_readable_name(query_example.label_name)
+                all_class_names = sorted([name for name in IMAGENET_SYNSET_TO_NAME.values()])
+
+                # Get top-(K-1) candidates + true class
+                candidate_label_names = get_oracle_candidates(
+                    image=query_image,
+                    true_class=true_label_readable,
+                    all_classes=all_class_names,
+                    clip_text_features=clip_text_features,
+                    clip_model=clip_model,
+                    preprocess=clip_preprocess,
+                    device=device,
+                    top_k=prefilter_topk
+                )
+            else:
+                # For generative evaluation without pre-filtering, use ALL 100 Mini-ImageNet classes
+                # This makes the task harder and more realistic
+                candidate_label_names = sorted([name for name in IMAGENET_SYNSET_TO_NAME.values()])
         else:
             # For discriminative evaluation, use only test split classes
             # (Computing log probs for all 100 classes would be too expensive)
@@ -755,6 +879,8 @@ def main():
                         help="Force recompute even if cache exists")
     parser.add_argument("--use-generative", action="store_true",
                         help="Use generative evaluation (free-form generation + matching) instead of discriminative (probability-based)")
+    parser.add_argument("--prefilter-topk", type=int, default=None,
+                        help="For generative evaluation: Use CLIP to pre-filter to top-K candidates (with oracle guarantee that true label is included)")
 
     args = parser.parse_args()
 
@@ -808,7 +934,8 @@ def main():
         k=args.k,
         num_queries=args.num_queries or test_dataset_size,
         seed=args.seed,
-        use_generative=args.use_generative
+        use_generative=args.use_generative,
+        prefilter_topk=args.prefilter_topk
     )
 
     clip_results = None
@@ -839,7 +966,8 @@ def main():
                 return_predictions=True,
                 use_reranker=False,
                 num_gpus=num_gpus,
-                use_generative=args.use_generative
+                use_generative=args.use_generative,
+                prefilter_topk=args.prefilter_topk
             )
 
             # Save to cache if requested
@@ -884,7 +1012,9 @@ def main():
                 num_queries=args.num_queries,
                 seed=args.seed,
                 return_predictions=True,
-                use_generative=args.use_generative
+                use_generative=args.use_generative,
+                prefilter_topk=args.prefilter_topk,
+                device=device
             )
 
             # Save to cache if requested
@@ -907,7 +1037,8 @@ def main():
             num_queries=args.num_queries or test_dataset_size,
             seed=args.seed,
             reranker_checkpoint=args.reranker_checkpoint,
-            use_generative=args.use_generative
+            use_generative=args.use_generative,
+            prefilter_topk=args.prefilter_topk
         )
 
         if args.use_cache and not args.force_recompute:
@@ -933,7 +1064,8 @@ def main():
                     return_predictions=True,
                     use_reranker=True,
                     num_gpus=num_gpus,
-                    use_generative=args.use_generative
+                    use_generative=args.use_generative,
+                    prefilter_topk=args.prefilter_topk
                 )
             else:
                 # Single GPU mode for reranker
@@ -955,7 +1087,9 @@ def main():
                     num_queries=args.num_queries,
                     seed=args.seed,
                     return_predictions=True,
-                    use_generative=args.use_generative
+                    use_generative=args.use_generative,
+                    prefilter_topk=args.prefilter_topk,
+                    device=device
                 )
 
             # Save to cache if requested
