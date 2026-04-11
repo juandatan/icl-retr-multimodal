@@ -475,9 +475,8 @@ def evaluate_icl_worker(
             for ex_idx in example_indices:
                 ex_example, ex_image = train_dataset[ex_idx]
                 ex_label_text = ex_example.label_name
-                # Convert to readable name for generative evaluation
-                if use_generative:
-                    ex_label_text = get_readable_name(ex_label_text)
+                # Convert synset IDs to readable names (for both discriminative and generative)
+                ex_label_text = get_readable_name(ex_label_text)
                 context_examples.append((ex_image, ex_label_text))
 
         # Get candidate labels
@@ -504,9 +503,9 @@ def evaluate_icl_worker(
                 # This makes the task harder and more realistic
                 candidate_label_names = sorted([name for name in IMAGENET_SYNSET_TO_NAME.values()])
         else:
-            # For discriminative evaluation, use only test split classes
+            # For discriminative evaluation, use only test split classes (as readable names)
             # (Computing log probs for all 100 classes would be too expensive)
-            candidate_label_names = [ex.label_name for ex in test_dataset.examples]
+            candidate_label_names = [get_readable_name(ex.label_name) for ex in test_dataset.examples]
             # Deduplicate while preserving order
             seen = set()
             candidate_label_names = [x for x in candidate_label_names if not (x in seen or seen.add(x))]
@@ -526,6 +525,8 @@ def evaluate_icl_worker(
                 context_examples=context_examples,
                 candidate_labels=candidate_label_names
             )
+            # Convert back from readable name to synset ID for accuracy computation
+            predicted_label_text = get_synset_id(predicted_label_text)
 
         # Convert prediction to label index (use test dataset for mapping)
         predicted_label = -1
@@ -738,9 +739,8 @@ def evaluate_icl(
             for ex_idx in example_indices:
                 ex_example, ex_image = train_dataset[ex_idx]
                 ex_label_text = ex_example.label_name
-                # Convert to readable name for generative evaluation
-                if use_generative:
-                    ex_label_text = get_readable_name(ex_label_text)
+                # Convert synset IDs to readable names (for both discriminative and generative)
+                ex_label_text = get_readable_name(ex_label_text)
                 context_examples.append((ex_image, ex_label_text))
 
         # Get candidate labels
@@ -767,9 +767,9 @@ def evaluate_icl(
                 # This makes the task harder and more realistic
                 candidate_label_names = sorted([name for name in IMAGENET_SYNSET_TO_NAME.values()])
         else:
-            # For discriminative evaluation, use only test split classes
+            # For discriminative evaluation, use only test split classes (as readable names)
             # (Computing log probs for all 100 classes would be too expensive)
-            candidate_label_names = [ex.label_name for ex in test_dataset.examples]
+            candidate_label_names = [get_readable_name(ex.label_name) for ex in test_dataset.examples]
             # Deduplicate while preserving order
             seen = set()
             candidate_label_names = [x for x in candidate_label_names if not (x in seen or seen.add(x))]
@@ -789,6 +789,8 @@ def evaluate_icl(
                 context_examples=context_examples,
                 candidate_labels=candidate_label_names
             )
+            # Convert back from readable name to synset ID for accuracy computation
+            predicted_label_text = get_synset_id(predicted_label_text)
 
         # Convert prediction to label index by finding matching example (use test dataset for mapping)
         predicted_label = -1
