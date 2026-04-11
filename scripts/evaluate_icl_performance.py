@@ -45,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from data.stanford_cars import StanfordCarsDataset
 from data.mini_imagenet import MiniImageNetDataset
 from data.marginal_utility_dataset import InteractionFeaturesConfig
+from data.base_dataset import ClassificationExample
 from models.mlp_reranker import MLPReranker
 from models.llava_wrapper import LLaVAWrapper
 from utils.multigpu_utils import MultiGPUManager, merge_dict_results
@@ -546,10 +547,52 @@ def evaluate_icl_worker(
     # Set device for this worker
     device = f"cuda:{gpu_id}"
 
-    # Load datasets
-    test_dataset = load_dataset(dataset_name, split="test")
+    # Load datasets - combine val + test for larger, more diverse evaluation
+    print(f"GPU {gpu_id}: Loading val + test splits...")
+    val_dataset = load_dataset(dataset_name, split="val")
+    test_dataset_only = load_dataset(dataset_name, split="test")
 
-    # For retrieval, use the same split as queries to ensure class overlap
+    # Combine val and test datasets
+    class CombinedDataset:
+        """Combines val + test datasets for evaluation."""
+        def __init__(self, datasets):
+            self.examples = []
+            embeddings_list = []
+            self._datasets = datasets
+            self._dataset_offsets = [0]
+
+            for ds in datasets:
+                # Reindex examples
+                for ex in ds.examples:
+                    new_ex = ClassificationExample(
+                        index=len(self.examples),
+                        image_path=ex.image_path,
+                        label=ex.label,
+                        label_name=ex.label_name,
+                        split=ex.split,
+                        _hf_index=ex._hf_index
+                    )
+                    self.examples.append(new_ex)
+                embeddings_list.append(ds.clip_embeddings)
+                self._dataset_offsets.append(len(self.examples))
+
+            self.clip_embeddings = np.vstack(embeddings_list)
+
+        def __getitem__(self, idx):
+            # Find which dataset this index belongs to
+            for i in range(len(self._datasets)):
+                if idx < self._dataset_offsets[i + 1]:
+                    local_idx = idx - self._dataset_offsets[i]
+                    return self._datasets[i][local_idx]
+            raise IndexError(f"Index {idx} out of range")
+
+        def __len__(self):
+            return len(self.examples)
+
+    test_dataset = CombinedDataset([val_dataset, test_dataset_only])
+    print(f"GPU {gpu_id}: Combined dataset has {len(test_dataset)} examples from {len(set(ex.label for ex in test_dataset.examples))} classes")
+
+    # For retrieval, use the same combined dataset
     retrieval_dataset = test_dataset
 
     # Load reranker if needed
@@ -861,20 +904,62 @@ def main():
     eval_mode = "Generative" if args.use_generative else "Discriminative (probability-based)"
     print(f"\nEvaluation mode: {eval_mode}")
 
-    # Get dataset size for num_queries calculation
+    # Get dataset size for num_queries calculation - use combined val+test
     # We need this even for multi-GPU to determine the default num_queries
-    temp_dataset = load_dataset(args.dataset, split="test")
-    test_dataset_size = len(temp_dataset)
+    print("\nLoading val + test splits for size calculation...")
+    temp_val = load_dataset(args.dataset, split="val")
+    temp_test = load_dataset(args.dataset, split="test")
+    test_dataset_size = len(temp_val) + len(temp_test)
+    print(f"Combined val+test dataset size: {test_dataset_size} examples")
 
-    # For multi-GPU, free the dataset immediately to save memory
+    # For multi-GPU, free the datasets immediately to save memory
     # Workers will load their own copies
     if use_multi_gpu:
-        del temp_dataset
+        del temp_val, temp_test
         test_dataset = None
     else:
-        # For single-GPU, keep the loaded dataset
-        test_dataset = temp_dataset
-        # For retrieval, use the same split as queries to ensure class overlap
+        # For single-GPU, combine and keep the loaded datasets
+        print("\nCombining val + test splits for single-GPU evaluation...")
+
+        class CombinedDataset:
+            """Combines val + test datasets for evaluation."""
+            def __init__(self, datasets):
+                self.examples = []
+                embeddings_list = []
+                self._datasets = datasets
+                self._dataset_offsets = [0]
+
+                for ds in datasets:
+                    # Reindex examples
+                    for ex in ds.examples:
+                        new_ex = ClassificationExample(
+                            index=len(self.examples),
+                            image_path=ex.image_path,
+                            label=ex.label,
+                            label_name=ex.label_name,
+                            split=ex.split,
+                            _hf_index=ex._hf_index
+                        )
+                        self.examples.append(new_ex)
+                    embeddings_list.append(ds.clip_embeddings)
+                    self._dataset_offsets.append(len(self.examples))
+
+                self.clip_embeddings = np.vstack(embeddings_list)
+
+            def __getitem__(self, idx):
+                # Find which dataset this index belongs to
+                for i in range(len(self._datasets)):
+                    if idx < self._dataset_offsets[i + 1]:
+                        local_idx = idx - self._dataset_offsets[i]
+                        return self._datasets[i][local_idx]
+                raise IndexError(f"Index {idx} out of range")
+
+            def __len__(self):
+                return len(self.examples)
+
+        test_dataset = CombinedDataset([temp_val, temp_test])
+        print(f"Combined dataset has {len(test_dataset)} examples from {len(set(ex.label for ex in test_dataset.examples))} classes")
+        # For retrieval, use the same combined dataset
         retrieval_dataset = test_dataset
 
     # Check cache for CLIP results
