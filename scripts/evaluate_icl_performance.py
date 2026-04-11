@@ -378,6 +378,152 @@ def get_oracle_candidates(
     return top_candidates + [true_class]
 
 
+def _evaluate_queries(
+    query_indices: List[int],
+    test_dataset,
+    retrieval_dataset,
+    llava_model: LLaVAWrapper,
+    retrieval_fn,
+    k: int,
+    use_generative: bool,
+    prefilter_topk: Optional[int],
+    clip_model,
+    clip_preprocess,
+    clip_text_features,
+    device: str,
+    return_predictions: bool = False,
+    progress_desc: str = "Evaluating"
+) -> Dict:
+    """
+    Shared evaluation logic for both single-GPU and multi-GPU modes.
+
+    Args:
+        query_indices: List of query indices to evaluate
+        test_dataset: Test dataset
+        retrieval_dataset: Dataset to retrieve ICL examples from
+        llava_model: LLaVA model for classification
+        retrieval_fn: Function(query_emb, dataset, k) -> List[indices]
+        k: Number of ICL examples
+        use_generative: Whether to use generative evaluation
+        prefilter_topk: Number of candidates for CLIP pre-filtering (or None)
+        clip_model: CLIP model for pre-filtering (or None)
+        clip_preprocess: CLIP preprocessing (or None)
+        clip_text_features: Precomputed CLIP text features (or None)
+        device: Device string
+        return_predictions: Whether to return detailed predictions
+        progress_desc: Description for progress bar
+
+    Returns:
+        Dictionary with evaluation results
+    """
+    correct = 0
+    total = 0
+    per_class_correct = {}
+    per_class_total = {}
+    predictions = []
+
+    # Build label_name -> label mapping for O(1) lookups
+    label_name_to_label = {ex.label_name: ex.label for ex in test_dataset.examples}
+
+    # Precompute candidate labels for discriminative evaluation
+    discriminative_candidate_labels = None
+    if not use_generative:
+        discriminative_candidate_labels = [get_readable_name(ex.label_name) for ex in test_dataset.examples]
+        seen = set()
+        discriminative_candidate_labels = [x for x in discriminative_candidate_labels if not (x in seen or seen.add(x))]
+
+    # Precompute all class names for generative evaluation
+    all_class_names_sorted = sorted([name for name in IMAGENET_SYNSET_TO_NAME.values()]) if use_generative else []
+
+    for query_idx in tqdm(query_indices, desc=progress_desc):
+        query_example, query_image = test_dataset[query_idx]
+        true_label = query_example.label
+
+        # Retrieve k examples (only if k > 0)
+        context_examples = []
+        example_indices = []
+        if k > 0:
+            query_emb = test_dataset.clip_embeddings[query_idx]
+            example_indices = retrieval_fn(query_emb, retrieval_dataset, k)
+
+            for ex_idx in example_indices:
+                ex_example, ex_image = retrieval_dataset[ex_idx]
+                ex_label_text = get_readable_name(ex_example.label_name)
+                context_examples.append((ex_image, ex_label_text))
+
+        # Get candidate labels
+        if use_generative:
+            if prefilter_topk is not None:
+                true_label_readable = get_readable_name(query_example.label_name)
+                candidate_label_names = get_oracle_candidates(
+                    image=query_image,
+                    true_class=true_label_readable,
+                    all_classes=all_class_names_sorted,
+                    clip_text_features=clip_text_features,
+                    clip_model=clip_model,
+                    preprocess=clip_preprocess,
+                    device=device,
+                    top_k=prefilter_topk
+                )
+            else:
+                candidate_label_names = all_class_names_sorted
+        else:
+            candidate_label_names = discriminative_candidate_labels
+
+        # Query LLaVA
+        if use_generative:
+            predicted_label_text = llava_model.classify_with_context_generative(
+                query_image=query_image,
+                context_examples=context_examples,
+                candidate_labels=candidate_label_names
+            )
+            predicted_label_text = get_synset_id(predicted_label_text)
+        else:
+            predicted_label_text = llava_model.classify_with_context(
+                query_image=query_image,
+                context_examples=context_examples,
+                candidate_labels=candidate_label_names
+            )
+            predicted_label_text = get_synset_id(predicted_label_text)
+
+        # Convert prediction to label index using O(1) dict lookup
+        predicted_label = label_name_to_label.get(predicted_label_text, -1)
+
+        # Track accuracy
+        is_correct = (predicted_label == true_label)
+        if is_correct:
+            correct += 1
+        total += 1
+
+        # Track per-class accuracy
+        if true_label not in per_class_correct:
+            per_class_correct[true_label] = 0
+            per_class_total[true_label] = 0
+
+        if is_correct:
+            per_class_correct[true_label] += 1
+        per_class_total[true_label] += 1
+
+        # Store detailed prediction info
+        if return_predictions:
+            predictions.append({
+                'query_idx': query_idx,
+                'true_label': true_label,
+                'predicted_label': predicted_label,
+                'is_correct': is_correct,
+                'example_indices': example_indices,
+                'predicted_label_text': predicted_label_text
+            })
+
+    return {
+        'correct': correct,
+        'total': total,
+        'per_class_correct': per_class_correct,
+        'per_class_total': per_class_total,
+        'predictions': predictions if return_predictions else []
+    }
+
+
 def evaluate_icl_worker(
     gpu_id: int,
     query_indices: List[int],
@@ -440,133 +586,32 @@ def evaluate_icl_worker(
             clip_text_features = clip_model.encode_text(text_tokens)
             clip_text_features = clip_text_features / clip_text_features.norm(dim=-1, keepdim=True)
 
-    # Evaluate on assigned queries
-    correct = 0
-    total = 0
-    per_class_correct = {}
-    per_class_total = {}
-    predictions = []
+    # Create retrieval function
+    def retrieval_fn(query_emb, dataset, k_examples):
+        if use_reranker:
+            return retrieve_by_reranker(query_emb, dataset, reranker, interaction_features, device, k_examples)
+        else:
+            return retrieve_by_clip(query_emb, dataset, k_examples)
 
     print(f"GPU {gpu_id}: Evaluating {len(query_indices)} queries...")
 
-    for query_idx in tqdm(query_indices, desc=f"GPU {gpu_id}", position=gpu_id):
-        # Get query example and image
-        query_example, query_image = test_dataset[query_idx]
-        true_label = query_example.label
-
-        # Retrieve k examples (only if k > 0)
-        context_examples = []
-        example_indices = []
-        if k > 0:
-            # Get query embedding from test dataset
-            query_emb = test_dataset.clip_embeddings[query_idx]
-
-            # Retrieve examples
-            if use_reranker:
-                example_indices = retrieve_by_reranker(
-                    query_emb, retrieval_dataset, reranker, interaction_features, device, k
-                )
-            else:
-                example_indices = retrieve_by_clip(query_emb, retrieval_dataset, k)
-
-            # Build ICL prompt with examples
-            for ex_idx in example_indices:
-                ex_example, ex_image = retrieval_dataset[ex_idx]
-                ex_label_text = ex_example.label_name
-                # Convert synset IDs to readable names (for both discriminative and generative)
-                ex_label_text = get_readable_name(ex_label_text)
-                context_examples.append((ex_image, ex_label_text))
-
-        # Get candidate labels
-        if use_generative:
-            # Apply pre-filtering if enabled
-            if prefilter_topk is not None:
-                # Get true label as readable name
-                true_label_readable = get_readable_name(query_example.label_name)
-                all_class_names = sorted([name for name in IMAGENET_SYNSET_TO_NAME.values()])
-
-                # Get top-(K-1) candidates + true class
-                candidate_label_names = get_oracle_candidates(
-                    image=query_image,
-                    true_class=true_label_readable,
-                    all_classes=all_class_names,
-                    clip_text_features=clip_text_features,
-                    clip_model=clip_model,
-                    preprocess=clip_preprocess,
-                    device=device,
-                    top_k=prefilter_topk
-                )
-            else:
-                # For generative evaluation without pre-filtering, use ALL 100 Mini-ImageNet classes
-                # This makes the task harder and more realistic
-                candidate_label_names = sorted([name for name in IMAGENET_SYNSET_TO_NAME.values()])
-        else:
-            # For discriminative evaluation, use only test split classes (as readable names)
-            # (Computing log probs for all 100 classes would be too expensive)
-            candidate_label_names = [get_readable_name(ex.label_name) for ex in test_dataset.examples]
-            # Deduplicate while preserving order
-            seen = set()
-            candidate_label_names = [x for x in candidate_label_names if not (x in seen or seen.add(x))]
-
-        # Query LLaVA (discriminative or generative)
-        if use_generative:
-            predicted_label_text = llava_model.classify_with_context_generative(
-                query_image=query_image,
-                context_examples=context_examples,
-                candidate_labels=candidate_label_names
-            )
-            # Convert back from readable name to synset ID for accuracy computation
-            predicted_label_text = get_synset_id(predicted_label_text)
-        else:
-            predicted_label_text = llava_model.classify_with_context(
-                query_image=query_image,
-                context_examples=context_examples,
-                candidate_labels=candidate_label_names
-            )
-            # Convert back from readable name to synset ID for accuracy computation
-            predicted_label_text = get_synset_id(predicted_label_text)
-
-        # Convert prediction to label index (use test dataset for mapping)
-        predicted_label = -1
-        for ex in test_dataset.examples:
-            if ex.label_name == predicted_label_text:
-                predicted_label = ex.label
-                break
-
-        # Track accuracy
-        is_correct = (predicted_label == true_label)
-        if is_correct:
-            correct += 1
-        total += 1
-
-        # Track per-class accuracy
-        if true_label not in per_class_correct:
-            per_class_correct[true_label] = 0
-            per_class_total[true_label] = 0
-
-        if is_correct:
-            per_class_correct[true_label] += 1
-        per_class_total[true_label] += 1
-
-        # Store detailed prediction info
-        if return_predictions:
-            predictions.append({
-                'query_idx': query_idx,
-                'true_label': true_label,
-                'predicted_label': predicted_label,
-                'is_correct': is_correct,
-                'example_indices': example_indices,
-                'predicted_label_text': predicted_label_text
-            })
-
-    # Return results
-    return {
-        'correct': correct,
-        'total': total,
-        'per_class_correct': per_class_correct,
-        'per_class_total': per_class_total,
-        'predictions': predictions if return_predictions else []
-    }
+    # Use shared evaluation logic
+    return _evaluate_queries(
+        query_indices=query_indices,
+        test_dataset=test_dataset,
+        retrieval_dataset=retrieval_dataset,
+        llava_model=llava_model,
+        retrieval_fn=retrieval_fn,
+        k=k,
+        use_generative=use_generative,
+        prefilter_topk=prefilter_topk,
+        clip_model=clip_model,
+        clip_preprocess=clip_preprocess,
+        clip_text_features=clip_text_features,
+        device=device,
+        return_predictions=return_predictions,
+        progress_desc=f"GPU {gpu_id}"
+    )
 
 
 def evaluate_icl_multigpu(
@@ -694,12 +739,6 @@ def evaluate_icl(
     if num_queries is not None:
         query_indices = random.sample(query_indices, min(num_queries, len(test_dataset)))
 
-    correct = 0
-    total = 0
-    per_class_correct = {}
-    per_class_total = {}
-    predictions = []
-
     # Initialize CLIP for pre-filtering if needed
     clip_model = None
     clip_preprocess = None
@@ -718,133 +757,46 @@ def evaluate_icl(
 
     print(f"\nEvaluating on {len(query_indices)} queries with k={k}...")
 
-    for query_idx in tqdm(query_indices, desc="Querying LLaVA"):
-        # Get query example and image
-        query_example, query_image = test_dataset[query_idx]
-        true_label = query_example.label
+    # Use shared evaluation logic
+    eval_results = _evaluate_queries(
+        query_indices=query_indices,
+        test_dataset=test_dataset,
+        retrieval_dataset=retrieval_dataset,
+        llava_model=llava_model,
+        retrieval_fn=retrieval_fn,
+        k=k,
+        use_generative=use_generative,
+        prefilter_topk=prefilter_topk,
+        clip_model=clip_model,
+        clip_preprocess=clip_preprocess,
+        clip_text_features=clip_text_features,
+        device=device,
+        return_predictions=return_predictions,
+        progress_desc="Querying LLaVA"
+    )
 
-        # Retrieve k examples (only if k > 0)
-        context_examples = []
-        example_indices = []
-        if k > 0:
-            # Get query embedding from test dataset
-            query_emb = test_dataset.clip_embeddings[query_idx]
-
-            # Retrieve examples
-            example_indices = retrieval_fn(query_emb, retrieval_dataset, k)
-
-            # Build ICL prompt
-            for ex_idx in example_indices:
-                ex_example, ex_image = retrieval_dataset[ex_idx]
-                ex_label_text = ex_example.label_name
-                # Convert synset IDs to readable names (for both discriminative and generative)
-                ex_label_text = get_readable_name(ex_label_text)
-                context_examples.append((ex_image, ex_label_text))
-
-        # Get candidate labels
-        if use_generative:
-            # Apply oracle pre-filtering if enabled
-            if prefilter_topk is not None:
-                # Get true label as readable name
-                true_label_readable = get_readable_name(query_example.label_name)
-                all_class_names = sorted([name for name in IMAGENET_SYNSET_TO_NAME.values()])
-
-                # Get top-(K-1) candidates + true class
-                candidate_label_names = get_oracle_candidates(
-                    image=query_image,
-                    true_class=true_label_readable,
-                    all_classes=all_class_names,
-                    clip_text_features=clip_text_features,
-                    clip_model=clip_model,
-                    preprocess=clip_preprocess,
-                    device=device,
-                    top_k=prefilter_topk
-                )
-            else:
-                # For generative evaluation without pre-filtering, use ALL 100 Mini-ImageNet classes
-                # This makes the task harder and more realistic
-                candidate_label_names = sorted([name for name in IMAGENET_SYNSET_TO_NAME.values()])
-        else:
-            # For discriminative evaluation, use only test split classes (as readable names)
-            # (Computing log probs for all 100 classes would be too expensive)
-            candidate_label_names = [get_readable_name(ex.label_name) for ex in test_dataset.examples]
-            # Deduplicate while preserving order
-            seen = set()
-            candidate_label_names = [x for x in candidate_label_names if not (x in seen or seen.add(x))]
-
-        # Query LLaVA (discriminative or generative)
-        if use_generative:
-            predicted_label_text = llava_model.classify_with_context_generative(
-                query_image=query_image,
-                context_examples=context_examples,
-                candidate_labels=candidate_label_names
-            )
-            # Convert back from readable name to synset ID for accuracy computation
-            predicted_label_text = get_synset_id(predicted_label_text)
-        else:
-            predicted_label_text = llava_model.classify_with_context(
-                query_image=query_image,
-                context_examples=context_examples,
-                candidate_labels=candidate_label_names
-            )
-            # Convert back from readable name to synset ID for accuracy computation
-            predicted_label_text = get_synset_id(predicted_label_text)
-
-        # Convert prediction to label index by finding matching example (use test dataset for mapping)
-        predicted_label = -1
-        for ex in test_dataset.examples:
-            if ex.label_name == predicted_label_text:
-                predicted_label = ex.label
-                break
-
-        # Track accuracy
-        is_correct = (predicted_label == true_label)
-        if is_correct:
-            correct += 1
-        total += 1
-
-        # Track per-class accuracy
-        if true_label not in per_class_correct:
-            per_class_correct[true_label] = 0
-            per_class_total[true_label] = 0
-
-        if is_correct:
-            per_class_correct[true_label] += 1
-        per_class_total[true_label] += 1
-
-        # Store detailed prediction info
-        if return_predictions:
-            predictions.append({
-                'query_idx': query_idx,
-                'true_label': true_label,
-                'predicted_label': predicted_label,
-                'is_correct': is_correct,
-                'example_indices': example_indices,
-                'predicted_label_text': predicted_label_text
-            })
-
-    # Compute metrics
-    accuracy = correct / total if total > 0 else 0.0
+    # Compute final metrics
+    accuracy = eval_results['correct'] / eval_results['total'] if eval_results['total'] > 0 else 0.0
 
     per_class_accuracy = {}
-    for label in per_class_total:
+    for label in eval_results['per_class_total']:
         per_class_accuracy[label] = (
-            per_class_correct[label] / per_class_total[label]
-            if per_class_total[label] > 0 else 0.0
+            eval_results['per_class_correct'][label] / eval_results['per_class_total'][label]
+            if eval_results['per_class_total'][label] > 0 else 0.0
         )
 
-    mean_per_class_accuracy = np.mean(list(per_class_accuracy.values()))
+    mean_per_class_accuracy = np.mean(list(per_class_accuracy.values())) if per_class_accuracy else 0.0
 
     results = {
         'accuracy': accuracy,
         'mean_per_class_accuracy': mean_per_class_accuracy,
-        'correct': correct,
-        'total': total,
+        'correct': eval_results['correct'],
+        'total': eval_results['total'],
         'per_class_accuracy': per_class_accuracy
     }
 
     if return_predictions:
-        results['predictions'] = predictions
+        results['predictions'] = eval_results['predictions']
 
     return results
 

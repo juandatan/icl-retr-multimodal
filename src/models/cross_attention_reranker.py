@@ -41,7 +41,7 @@ class CrossAttentionReranker(nn.Module):
         hidden_dim: int = 256,
         num_attention_heads: int = 8,
         num_layers: int = 2,
-        feedforward_dims: List[int] = [256, 128],
+        feedforward_dims: Optional[List[int]] = None,
         dropout: float = 0.1,
         use_sigmoid: bool = False
     ):
@@ -63,6 +63,7 @@ class CrossAttentionReranker(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_attention_heads = num_attention_heads
         self.num_layers = num_layers
+        feedforward_dims = feedforward_dims if feedforward_dims is not None else [256, 128]
         self.dropout = dropout
         self.use_sigmoid = use_sigmoid
 

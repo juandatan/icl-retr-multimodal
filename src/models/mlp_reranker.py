@@ -32,7 +32,7 @@ class MLPReranker(nn.Module):
     def __init__(
         self,
         embedding_dim: int = 512,
-        hidden_dims: List[int] = [512, 256, 128],
+        hidden_dims: Optional[List[int]] = None,
         dropout: float = 0.1,
         interaction_features: Optional[InteractionFeaturesConfig] = None,
         use_sigmoid: bool = False
@@ -50,7 +50,7 @@ class MLPReranker(nn.Module):
         super().__init__()
 
         self.embedding_dim = embedding_dim
-        self.hidden_dims = hidden_dims
+        self.hidden_dims = hidden_dims if hidden_dims is not None else [512, 256, 128]
         self.dropout = dropout
         self.interaction_features = interaction_features or InteractionFeaturesConfig()
         self.use_sigmoid = use_sigmoid
@@ -66,7 +66,7 @@ class MLPReranker(nn.Module):
         layers = []
         prev_dim = input_dim
 
-        for hidden_dim in hidden_dims:
+        for hidden_dim in self.hidden_dims:
             layers.extend([
                 nn.Linear(prev_dim, hidden_dim),
                 nn.ReLU(),
