@@ -118,20 +118,24 @@ class LLaVAWrapper:
         Format prompt for classification task.
 
         For 0-shot:
-            "Now classify this image:\n<image>\nQuestion: What is this?\nAnswer:"
+            "You are an expert image classifier. Classify the following image as granularly as possible.\n\n
+             Image: <image>\nOutput:"
 
         For n-shot:
-            "Example 1:\n<image>\nThis is a {label1}.\n\n
-             Example 2:\n<image>\nThis is a {label2}.\n\n
-             Now classify this image:\n<image>\nQuestion: What is this?\nAnswer:"
+            "You are an expert image classifier. Use the following examples to inform your answer.\n\n
+             Image: <image>\nOutput: {label1}\n\n
+             Image: <image>\nOutput: {label2}\n\n
+             Classify the following image as granularly as possible:\n
+             Image: <image>\nOutput:"
 
         With candidates (generative evaluation):
             Note: Candidates are only shown for the final query, not for ICL examples.
             This allows any class to be demonstrated without constraint.
 
-            "Example 1:\n<image>\nThis is a {label1}.\n\n
-             Now classify this image:\n<image>\n
-             Question: What is this? Choose from: {candidate1}, {candidate2}, ...\nAnswer:"
+            "You are an expert image classifier. Use the following examples to inform your answer.\n\n
+             Image: <image>\nOutput: {label1}\n\n
+             Classify the following image as granularly as possible. Choose from: {candidate1}, {candidate2}, ...\n
+             Image: <image>\nOutput:"
 
         Args:
             example_labels: List of example labels for ICL
@@ -143,24 +147,36 @@ class LLaVAWrapper:
         """
         prompt_parts = []
 
-        # Add examples if provided
-        # Use descriptive format to clearly distinguish examples from the query
-        if example_labels is not None:
-            for i, ex_label in enumerate(example_labels, 1):
-                prompt_parts.append(f"Example {i}:")
-                prompt_parts.append("<image>")
-                prompt_parts.append(f"This is a {ex_label}.")
+        # Add system instruction and examples if provided
+        if example_labels is not None and len(example_labels) > 0:
+            prompt_parts.append("You are an expert image classifier. Use the following examples to inform your answer.")
+            prompt_parts.append("")  # Blank line
+
+            # Add examples
+            for ex_label in example_labels:
+                prompt_parts.append("Image: <image>")
+                prompt_parts.append(f"Output: {ex_label}")
                 prompt_parts.append("")  # Blank line
 
-        # Add query (only the query shows candidate list if provided)
-        prompt_parts.append("Now classify this image:")
-        prompt_parts.append("<image>")
-        if candidate_labels is not None:
-            candidates_str = ", ".join(candidate_labels)
-            prompt_parts.append(f"Question: What is this? Choose from: {candidates_str}")
+            # Add query instruction
+            if candidate_labels is not None:
+                candidates_str = ", ".join(candidate_labels)
+                prompt_parts.append(f"Classify the following image as granularly as possible. Choose from: {candidates_str}")
+            else:
+                prompt_parts.append("Classify the following image as granularly as possible:")
         else:
-            prompt_parts.append("Question: What is this?")
-        prompt_parts.append("Answer:")
+            # 0-shot: simpler instruction
+            prompt_parts.append("You are an expert image classifier. Classify the following image as granularly as possible.")
+            prompt_parts.append("")  # Blank line
+
+            if candidate_labels is not None:
+                candidates_str = ", ".join(candidate_labels)
+                prompt_parts.append(f"Choose from: {candidates_str}")
+                prompt_parts.append("")  # Blank line
+
+        # Add query
+        prompt_parts.append("Image: <image>")
+        prompt_parts.append("Output:")
 
         return "\n".join(prompt_parts)
 
