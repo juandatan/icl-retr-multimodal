@@ -30,7 +30,8 @@ from src.data.marginal_utility_dataset import (
     MarginalUtilityDataset,
     PairwiseMarginalUtilityDataset,
 )
-from src.models.reranker import CLIPReranker
+from src.models.mlp_reranker import MLPReranker
+from src.models.cross_attention_reranker import CrossAttentionReranker
 from src.utils.kaggle_utils import is_kaggle_environment, resolve_data_paths
 
 
@@ -542,18 +543,38 @@ def main(cfg: DictConfig):
 
     # Create model
     print(f"\nInitializing model...")
-    # Check if sigmoid should be used (can be set explicitly in config)
+    architecture = cfg.model.get('architecture', 'mlp')
     use_sigmoid = loss_type == 'bce' or cfg.model.get('use_sigmoid', False)
-    model = CLIPReranker(
-        embedding_dim=cfg.model.embedding_dim,
-        hidden_dims=cfg.model.hidden_dims,
-        dropout=cfg.model.dropout,
-        interaction_features=interaction_features,
-        use_sigmoid=use_sigmoid
-    )
+
+    if architecture == 'mlp':
+        print(f"  Architecture: MLP (concatenation-based)")
+        model = MLPReranker(
+            embedding_dim=cfg.model.embedding_dim,
+            hidden_dims=cfg.model.hidden_dims,
+            dropout=cfg.model.dropout,
+            interaction_features=interaction_features,
+            use_sigmoid=use_sigmoid
+        )
+        print(f"  Input dimension: {2 * cfg.model.embedding_dim + 1 + interaction_features.num_features}")
+    elif architecture == 'cross_attention':
+        print(f"  Architecture: Cross-Attention")
+        model = CrossAttentionReranker(
+            embedding_dim=cfg.model.embedding_dim,
+            hidden_dim=cfg.model.hidden_dim,
+            num_attention_heads=cfg.model.num_attention_heads,
+            num_layers=cfg.model.num_attention_layers,
+            feedforward_dims=cfg.model.feedforward_dims,
+            dropout=cfg.model.dropout,
+            use_sigmoid=use_sigmoid
+        )
+        print(f"  Hidden dimension: {cfg.model.hidden_dim}")
+        print(f"  Attention heads: {cfg.model.num_attention_heads}")
+        print(f"  Attention layers: {cfg.model.num_attention_layers}")
+    else:
+        raise ValueError(f"Unknown architecture: {architecture}. Must be 'mlp' or 'cross_attention'")
+
     model = model.to(device)
     print(f"  Parameters: {model.get_num_parameters():,}")
-    print(f"  Input dimension: {2 * cfg.model.embedding_dim + 1 + interaction_features.num_features}")
     print(f"  Use sigmoid output: {use_sigmoid}")
 
     # Loss function

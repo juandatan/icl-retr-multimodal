@@ -1,0 +1,83 @@
+# Cross-Attention Reranker Training Configuration
+# Train a cross-attention encoder to predict marginal utility from CLIP embeddings
+
+# Experiment metadata
+experiment:
+  name: "reranker_cross_attention"
+  description: "Cross-attention reranker with bidirectional attention between query and example"
+  seed: 42
+
+# Data configuration
+data:
+  # Local paths (used when running locally)
+  results_path: "outputs/marginal_utilities/marginal_utility_stanford_cars/marginal_utilities_train.pkl"
+  embeddings_path: "data/stanford_cars/clip_embeddings_train.pkl"
+
+  # Kaggle paths (used when running in Kaggle notebooks)
+  kaggle_results_path: "/kaggle/input/d/juandatan/marginal-utility-training-data/marginal_utilities_train.pkl"
+  kaggle_embeddings_path: "/kaggle/input/d/juandatan/stanford-cars-clip/clip_embeddings_train.pkl"
+
+  # Split ratios (handled by MarginalUtilityDataset)
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+
+# Model configuration
+model:
+  # Architecture type
+  architecture: "cross_attention"  # Use cross-attention encoder
+
+  embedding_dim: 512  # CLIP ViT-B/32 embedding dimension
+
+  # Cross-attention specific configuration
+  hidden_dim: 256  # Hidden dimension for attention (must be divisible by num_attention_heads)
+  num_attention_heads: 8  # Number of attention heads (8 heads × 32 dim = 256)
+  num_attention_layers: 2  # Number of cross-attention layers to stack
+  feedforward_dims: [256, 128]  # Feedforward layer dimensions after attention
+
+  # Common configuration
+  dropout: 0.1  # Dropout for regularization
+
+  # Output activation
+  use_sigmoid: false  # If true, apply sigmoid to output (bounds predictions to [0,1])
+
+  # MLP-specific configs (not used for cross-attention, but kept for compatibility)
+  hidden_dims: [512, 256, 128]
+  use_product: false
+  use_difference: false
+  use_l2_distance: false
+
+# Training configuration
+training:
+  batch_size: 256
+  num_epochs: 100
+  learning_rate: 1e-4  # May need tuning for cross-attention
+  weight_decay: 1e-5
+  gradient_clip: 1.0
+  early_stopping_patience: 10
+
+  # Loss function configuration
+  loss_type: "huber"  # Options: "mse", "huber", "ranking", "bce"
+  huber_delta: 1.0
+  ranking_margin: 0.1
+  pairs_per_query: 10
+
+  # Utility normalization
+  normalize_utilities: false
+
+# Checkpoint configuration
+checkpoint:
+  enabled: true
+  save_dir: "outputs/reranker_checkpoints"
+  save_best_only: false
+  save_interval: 10
+
+# Logging configuration
+logging:
+  use_wandb: false
+  wandb_project: "icl-retrieval-multimodal"
+  wandb_entity: null
+  log_interval: 10
+
+# Device configuration
+use_mps: true

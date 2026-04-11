@@ -1,8 +1,8 @@
 """
-CLIP-based reranker model for predicting marginal utilities.
+MLP-based reranker model for predicting marginal utilities.
 
-Simple MLP that takes query and example CLIP embeddings (+ similarity)
-and predicts the marginal utility score.
+Simple MLP that concatenates query and example CLIP embeddings (+ similarity)
+and predicts the marginal utility score through feedforward layers.
 """
 
 import sys
@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from data.marginal_utility_dataset import InteractionFeaturesConfig
 
 
-class CLIPReranker(nn.Module):
+class MLPReranker(nn.Module):
     """
     MLP-based reranker for predicting marginal utility from CLIP embeddings.
 
@@ -168,11 +168,11 @@ class CLIPReranker(nn.Module):
 
 if __name__ == "__main__":
     # Quick test
-    print("Testing CLIPReranker model...")
+    print("Testing MLPReranker model...")
     print("=" * 70)
 
     # Create model
-    model = CLIPReranker(
+    model = MLPReranker(
         embedding_dim=512,
         hidden_dims=[512, 256, 128],
         dropout=0.1

@@ -27,18 +27,31 @@ data:
 
 # Model configuration
 model:
+  # Architecture type: "mlp" or "cross_attention"
+  architecture: "mlp"  # Use "cross_attention" for attention-based reranker
+
   embedding_dim: 512  # CLIP ViT-B/32 embedding dimension
+
+  # MLP-specific configuration (only used when architecture="mlp")
   hidden_dims: [512, 256, 128]  # Original 3-layer architecture
+
+  # Interaction features for MLP (only used when architecture="mlp")
+  use_product: false  # Element-wise product of embeddings
+  use_difference: false  # Element-wise difference of embeddings
+  use_l2_distance: false  # L2 distance between embeddings
+
+  # Cross-attention specific configuration (only used when architecture="cross_attention")
+  hidden_dim: 256  # Hidden dimension for attention (must be divisible by num_attention_heads)
+  num_attention_heads: 8  # Number of attention heads
+  num_attention_layers: 2  # Number of cross-attention layers to stack
+  feedforward_dims: [256, 128]  # Feedforward layer dimensions after attention
+
+  # Common configuration
   dropout: 0.1  # Dropout for regularization
 
   # Output activation
   use_sigmoid: false  # If true, apply sigmoid to output (bounds predictions to [0,1])
                       # Automatically enabled when loss_type="bce"
-
-  # Interaction features - set to true to enable
-  use_product: false  # Element-wise product of embeddings
-  use_difference: false  # Element-wise difference of embeddings
-  use_l2_distance: false  # L2 distance between embeddings
 
 # Training configuration
 training:

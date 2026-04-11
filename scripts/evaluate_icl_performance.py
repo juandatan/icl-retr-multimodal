@@ -45,7 +45,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from data.stanford_cars import StanfordCarsDataset
 from data.mini_imagenet import MiniImageNetDataset
 from data.marginal_utility_dataset import InteractionFeaturesConfig
-from models.reranker import CLIPReranker
+from models.mlp_reranker import MLPReranker
 from models.llava_wrapper import LLaVAWrapper
 from utils.multigpu_utils import MultiGPUManager, merge_dict_results
 from utils.imagenet_names import get_readable_name, get_synset_id, IMAGENET_SYNSET_TO_NAME
@@ -189,7 +189,7 @@ def download_from_kaggle_dataset(kaggle_dataset: str, filename: str, cache_dir: 
     return cache_path
 
 
-def load_reranker(checkpoint_path: str, device: str, kaggle_dataset: str = None, force_refresh: bool = False) -> CLIPReranker:
+def load_reranker(checkpoint_path: str, device: str, kaggle_dataset: str = None, force_refresh: bool = False) -> MLPReranker:
     """
     Load trained reranker model from checkpoint.
 
@@ -235,7 +235,7 @@ def load_reranker(checkpoint_path: str, device: str, kaggle_dataset: str = None,
     )
 
     # Initialize model
-    model = CLIPReranker(
+    model = MLPReranker(
         embedding_dim=model_config['embedding_dim'],
         hidden_dims=model_config['hidden_dims'],
         dropout=model_config.get('dropout', 0.1),
@@ -285,7 +285,7 @@ def retrieve_by_clip(
 def retrieve_by_reranker(
     query_emb: np.ndarray,
     train_dataset,
-    reranker: CLIPReranker,
+    reranker: MLPReranker,
     interaction_features: InteractionFeaturesConfig,
     device: str,
     k: int
