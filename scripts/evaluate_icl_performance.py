@@ -403,10 +403,8 @@ def evaluate_icl_worker(
     # Load datasets
     test_dataset = load_dataset(dataset_name, split="test")
 
-    # Only load train dataset if k > 0 (needed for retrieval)
-    train_dataset = None
-    if k > 0:
-        train_dataset = load_dataset(dataset_name, split="train")
+    # For retrieval, use the same split as queries to ensure class overlap
+    retrieval_dataset = test_dataset
 
     # Load reranker if needed
     reranker = None
@@ -466,14 +464,14 @@ def evaluate_icl_worker(
             # Retrieve examples
             if use_reranker:
                 example_indices = retrieve_by_reranker(
-                    query_emb, train_dataset, reranker, interaction_features, device, k
+                    query_emb, retrieval_dataset, reranker, interaction_features, device, k
                 )
             else:
-                example_indices = retrieve_by_clip(query_emb, train_dataset, k)
+                example_indices = retrieve_by_clip(query_emb, retrieval_dataset, k)
 
             # Build ICL prompt with examples
             for ex_idx in example_indices:
-                ex_example, ex_image = train_dataset[ex_idx]
+                ex_example, ex_image = retrieval_dataset[ex_idx]
                 ex_label_text = ex_example.label_name
                 # Convert synset IDs to readable names (for both discriminative and generative)
                 ex_label_text = get_readable_name(ex_label_text)
@@ -662,7 +660,7 @@ def evaluate_icl_multigpu(
 
 def evaluate_icl(
     test_dataset,
-    train_dataset,
+    retrieval_dataset,
     llava_model: LLaVAWrapper,
     retrieval_fn,
     k: int,
@@ -678,9 +676,9 @@ def evaluate_icl(
 
     Args:
         test_dataset: Test examples to query on
-        train_dataset: Training examples to retrieve from
+        retrieval_dataset: Dataset to retrieve ICL examples from
         llava_model: LLaVA model for classification
-        retrieval_fn: Function(query_emb, train_dataset, k) -> List[example_indices]
+        retrieval_fn: Function(query_emb, retrieval_dataset, k) -> List[example_indices]
         k: Number of in-context examples
         num_queries: Number of test queries to evaluate (None = all)
         seed: Random seed for reproducibility
@@ -733,11 +731,11 @@ def evaluate_icl(
             query_emb = test_dataset.clip_embeddings[query_idx]
 
             # Retrieve examples
-            example_indices = retrieval_fn(query_emb, train_dataset, k)
+            example_indices = retrieval_fn(query_emb, retrieval_dataset, k)
 
             # Build ICL prompt
             for ex_idx in example_indices:
-                ex_example, ex_image = train_dataset[ex_idx]
+                ex_example, ex_image = retrieval_dataset[ex_idx]
                 ex_label_text = ex_example.label_name
                 # Convert synset IDs to readable names (for both discriminative and generative)
                 ex_label_text = get_readable_name(ex_label_text)
@@ -921,13 +919,11 @@ def main():
     if use_multi_gpu:
         del temp_dataset
         test_dataset = None
-        train_dataset = None
     else:
         # For single-GPU, keep the loaded dataset
         test_dataset = temp_dataset
-        train_dataset = None
-        if args.k > 0:
-            train_dataset = load_dataset(args.dataset, split="train")
+        # For retrieval, use the same split as queries to ensure class overlap
+        retrieval_dataset = test_dataset
 
     # Check cache for CLIP results
     clip_cache_path = get_cache_path(
@@ -1002,12 +998,12 @@ def main():
             print("EVALUATING: CLIP Similarity Baseline")
             print("="*70)
 
-            def clip_retrieval_fn(query_emb, train_ds, k):
-                return retrieve_by_clip(query_emb, train_ds, k)
+            def clip_retrieval_fn(query_emb, retr_ds, k):
+                return retrieve_by_clip(query_emb, retr_ds, k)
 
             clip_results = evaluate_icl(
                 test_dataset=test_dataset,
-                train_dataset=train_dataset,
+                retrieval_dataset=retrieval_dataset,
                 llava_model=llava_model,
                 retrieval_fn=clip_retrieval_fn,
                 k=args.k,
@@ -1075,14 +1071,14 @@ def main():
                 print("EVALUATING: Learned Reranker")
                 print("="*70)
 
-                def reranker_retrieval_fn(query_emb, train_ds, k):
+                def reranker_retrieval_fn(query_emb, retr_ds, k):
                     return retrieve_by_reranker(
-                        query_emb, train_ds, reranker, interaction_features, device, k
+                        query_emb, retr_ds, reranker, interaction_features, device, k
                     )
 
                 reranker_results = evaluate_icl(
                     test_dataset=test_dataset,
-                    train_dataset=train_dataset,
+                    retrieval_dataset=retrieval_dataset,
                     llava_model=llava_model,
                     retrieval_fn=reranker_retrieval_fn,
                     k=args.k,
