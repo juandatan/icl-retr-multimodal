@@ -66,6 +66,8 @@ def load_dataset(cfg: DictConfig):
             split=cfg.dataset.split,
             data_dir=cfg.dataset.cache_dir,
             class_split_seed=cfg.dataset.class_split_seed,
+            train_ratio=cfg.dataset.get('train_ratio', 0.8),
+            val_ratio=cfg.dataset.get('val_ratio', 0.1),
             cache_dataset_locally=cache_locally
         )
     else:
