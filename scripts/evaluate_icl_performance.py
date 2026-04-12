@@ -269,13 +269,27 @@ def compute_similarity(query_emb: np.ndarray, candidate_embs: np.ndarray) -> np.
 def retrieve_by_clip(
     query_emb: np.ndarray,
     train_dataset,
-    k: int
+    k: int,
+    exclude_indices: Optional[List[int]] = None
 ) -> List[int]:
-    """Retrieve top-K examples using CLIP similarity."""
+    """Retrieve top-K examples using CLIP similarity.
+
+    Args:
+        query_emb: Query embedding
+        train_dataset: Dataset to retrieve from
+        k: Number of examples to retrieve
+        exclude_indices: Indices to exclude from retrieval (e.g., the query itself)
+    """
     candidate_embs = train_dataset.clip_embeddings
 
     # Compute similarities
     similarities = compute_similarity(query_emb, candidate_embs)
+
+    # Exclude specified indices by setting their similarity to -inf
+    if exclude_indices:
+        for idx in exclude_indices:
+            if 0 <= idx < len(similarities):
+                similarities[idx] = -np.inf
 
     # Get top-K
     top_k_indices = np.argsort(similarities)[-k:][::-1]
@@ -289,9 +303,20 @@ def retrieve_by_reranker(
     reranker: MLPReranker,
     interaction_features: InteractionFeaturesConfig,
     device: str,
-    k: int
+    k: int,
+    exclude_indices: Optional[List[int]] = None
 ) -> List[int]:
-    """Retrieve top-K examples using learned reranker."""
+    """Retrieve top-K examples using learned reranker.
+
+    Args:
+        query_emb: Query embedding
+        train_dataset: Dataset to retrieve from
+        reranker: Trained reranker model
+        interaction_features: Interaction features config
+        device: Device to run on
+        k: Number of examples to retrieve
+        exclude_indices: Indices to exclude from retrieval (e.g., the query itself)
+    """
     candidate_embs = train_dataset.clip_embeddings
 
     # Compute CLIP similarities first (needed as input to reranker)
@@ -327,6 +352,12 @@ def retrieve_by_reranker(
             difference=difference,
             l2_distance=l2_distance
         ).squeeze().cpu().numpy()
+
+    # Exclude specified indices by setting their utility to -inf
+    if exclude_indices:
+        for idx in exclude_indices:
+            if 0 <= idx < len(utilities):
+                utilities[idx] = -np.inf
 
     # Get top-K
     top_k_indices = np.argsort(utilities)[-k:][::-1]
@@ -445,7 +476,8 @@ def _evaluate_queries(
         example_indices = []
         if k > 0:
             query_emb = test_dataset.clip_embeddings[query_idx]
-            example_indices = retrieval_fn(query_emb, retrieval_dataset, k)
+            # Exclude the query itself from retrieval
+            example_indices = retrieval_fn(query_emb, retrieval_dataset, k, exclude_indices=[query_idx])
 
             for ex_idx in example_indices:
                 ex_example, ex_image = retrieval_dataset[ex_idx]
@@ -630,11 +662,11 @@ def evaluate_icl_worker(
             clip_text_features = clip_text_features / clip_text_features.norm(dim=-1, keepdim=True)
 
     # Create retrieval function
-    def retrieval_fn(query_emb, dataset, k_examples):
+    def retrieval_fn(query_emb, dataset, k_examples, exclude_indices=None):
         if use_reranker:
-            return retrieve_by_reranker(query_emb, dataset, reranker, interaction_features, device, k_examples)
+            return retrieve_by_reranker(query_emb, dataset, reranker, interaction_features, device, k_examples, exclude_indices)
         else:
-            return retrieve_by_clip(query_emb, dataset, k_examples)
+            return retrieve_by_clip(query_emb, dataset, k_examples, exclude_indices)
 
     print(f"GPU {gpu_id}: Evaluating {len(query_indices)} queries...")
 
@@ -1035,8 +1067,8 @@ def main():
             print("EVALUATING: CLIP Similarity Baseline")
             print("="*70)
 
-            def clip_retrieval_fn(query_emb, retr_ds, k):
-                return retrieve_by_clip(query_emb, retr_ds, k)
+            def clip_retrieval_fn(query_emb, retr_ds, k, exclude_indices=None):
+                return retrieve_by_clip(query_emb, retr_ds, k, exclude_indices)
 
             clip_results = evaluate_icl(
                 test_dataset=test_dataset,
@@ -1108,9 +1140,9 @@ def main():
                 print("EVALUATING: Learned Reranker")
                 print("="*70)
 
-                def reranker_retrieval_fn(query_emb, retr_ds, k):
+                def reranker_retrieval_fn(query_emb, retr_ds, k, exclude_indices=None):
                     return retrieve_by_reranker(
-                        query_emb, retr_ds, reranker, interaction_features, device, k
+                        query_emb, retr_ds, reranker, interaction_features, device, k, exclude_indices
                     )
 
                 reranker_results = evaluate_icl(
