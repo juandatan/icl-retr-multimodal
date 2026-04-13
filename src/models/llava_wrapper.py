@@ -182,7 +182,7 @@ class LLaVAWrapper:
 
     def _compute_label_probabilities_batch(
         self,
-        images: List[Image.Image],
+        images: List,  # List[Image.Image] for single-image or List[List[Image.Image]] for multi-image ICL
         prompts: List[str],
         labels: List[str]
     ) -> List[float]:
@@ -193,7 +193,8 @@ class LLaVAWrapper:
         The causal attention mask ensures proper autoregressive probability computation.
 
         Args:
-            images: List of images (can be lists for multi-image inputs in ICL)
+            images: List of images - can be List[Image.Image] for single-image inputs
+                   or List[List[Image.Image]] for multi-image ICL inputs
             prompts: List of prompt strings (ending in "Answer:")
             labels: List of ground-truth label strings
 
@@ -530,7 +531,8 @@ class LLaVAWrapper:
         self,
         query_image: Image.Image,
         context_examples: List[Tuple[Image.Image, str]],
-        candidate_labels: List[str]
+        candidate_labels: List[str],
+        batch_size: int = 8
     ) -> str:
         """
         Classify an image using in-context learning.
@@ -539,6 +541,8 @@ class LLaVAWrapper:
             query_image: Query image to classify
             context_examples: List of (image, label_text) tuples for ICL context
             candidate_labels: List of candidate label names to choose from
+            batch_size: Number of candidates to process in parallel (default: 8)
+                       Lower this if you get OOM errors with many candidates
 
         Returns:
             Predicted label text (the candidate with highest log probability)
@@ -550,22 +554,25 @@ class LLaVAWrapper:
         # Prepare images: context images + query image
         images = [img for img, _ in context_examples] + [query_image]
 
-        # Compute log probability for each candidate label
-        best_label = candidate_labels[0] if candidate_labels else ""
-        best_log_prob = float('-inf')
+        # Process candidates in chunks to avoid OOM with many classes
+        all_log_probs = []
+        for i in range(0, len(candidate_labels), batch_size):
+            chunk_labels = candidate_labels[i:i + batch_size]
 
-        for label in candidate_labels:
-            log_prob = self._compute_label_probabilities_batch(
-                images=[images],  # Single batch element (all images for one query)
-                prompts=[prompt],
-                labels=[label]
-            )[0]
+            # Batch compute log probabilities for this chunk
+            batch_images = [images] * len(chunk_labels)
+            batch_prompts = [prompt] * len(chunk_labels)
 
-            if log_prob > best_log_prob:
-                best_log_prob = log_prob
-                best_label = label
+            chunk_log_probs = self._compute_label_probabilities_batch(
+                images=batch_images,
+                prompts=batch_prompts,
+                labels=chunk_labels
+            )
+            all_log_probs.extend(chunk_log_probs)
 
-        return best_label
+        # Find label with highest log probability
+        best_idx = max(range(len(all_log_probs)), key=lambda i: all_log_probs[i])
+        return candidate_labels[best_idx]
 
     def classify_with_context_generative(
         self,

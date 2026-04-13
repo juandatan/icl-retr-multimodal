@@ -424,7 +424,8 @@ def _evaluate_queries(
     clip_text_features,
     device: str,
     return_predictions: bool = False,
-    progress_desc: str = "Evaluating"
+    progress_desc: str = "Evaluating",
+    candidate_batch_size: int = 8
 ) -> Dict:
     """
     Shared evaluation logic for both single-GPU and multi-GPU modes.
@@ -515,7 +516,8 @@ def _evaluate_queries(
             predicted_label_text = llava_model.classify_with_context(
                 query_image=query_image,
                 context_examples=context_examples,
-                candidate_labels=candidate_label_names
+                candidate_labels=candidate_label_names,
+                batch_size=candidate_batch_size
             )
             predicted_label_text = get_synset_id(predicted_label_text)
 
@@ -571,7 +573,8 @@ def evaluate_icl_worker(
     return_predictions: bool = False,
     use_reranker: bool = False,
     use_generative: bool = False,
-    prefilter_topk: Optional[int] = None
+    prefilter_topk: Optional[int] = None,
+    candidate_batch_size: int = 8
 ) -> Dict:
     """
     Worker function for multi-GPU evaluation.
@@ -697,7 +700,8 @@ def evaluate_icl_worker(
         clip_text_features=clip_text_features,
         device=device,
         return_predictions=return_predictions,
-        progress_desc=f"GPU {gpu_id}"
+        progress_desc=f"GPU {gpu_id}",
+        candidate_batch_size=candidate_batch_size
     )
 
 
@@ -716,7 +720,8 @@ def evaluate_icl_multigpu(
     use_reranker: bool = False,
     num_gpus: int = 1,
     use_generative: bool = False,
-    prefilter_topk: Optional[int] = None
+    prefilter_topk: Optional[int] = None,
+    candidate_batch_size: int = 8
 ) -> Dict:
     """
     Evaluate ICL performance using multiple GPUs in parallel.
@@ -749,7 +754,8 @@ def evaluate_icl_multigpu(
                 'return_predictions': return_predictions,
                 'use_reranker': use_reranker,
                 'use_generative': use_generative,
-                'prefilter_topk': prefilter_topk
+                'prefilter_topk': prefilter_topk,
+                'candidate_batch_size': candidate_batch_size
             }
         )
 
@@ -803,7 +809,8 @@ def evaluate_icl(
     return_predictions: bool = False,
     use_generative: bool = False,
     prefilter_topk: Optional[int] = None,
-    device: str = "cuda"
+    device: str = "cuda",
+    candidate_batch_size: int = 8
 ) -> Dict:
     """
     Evaluate ICL performance using a given retrieval method.
@@ -861,7 +868,8 @@ def evaluate_icl(
         clip_text_features=clip_text_features,
         device=device,
         return_predictions=return_predictions,
-        progress_desc="Querying LLaVA"
+        progress_desc="Querying LLaVA",
+        candidate_batch_size=candidate_batch_size
     )
 
     # Compute final metrics
@@ -925,6 +933,8 @@ def main():
                         help="Use generative evaluation (free-form generation + matching) instead of discriminative (probability-based)")
     parser.add_argument("--prefilter-topk", type=int, default=None,
                         help="For generative evaluation: Use CLIP to pre-filter to top-K candidates (with oracle guarantee that true label is included)")
+    parser.add_argument("--candidate-batch-size", type=int, default=8,
+                        help="Number of candidate labels to process in parallel (default: 8). Lower this if you get OOM errors with many classes.")
 
     args = parser.parse_args()
 
@@ -1066,7 +1076,8 @@ def main():
                 use_reranker=False,
                 num_gpus=num_gpus,
                 use_generative=args.use_generative,
-                prefilter_topk=args.prefilter_topk
+                prefilter_topk=args.prefilter_topk,
+                candidate_batch_size=args.candidate_batch_size
             )
 
             # Save to cache if requested
@@ -1113,7 +1124,8 @@ def main():
                 return_predictions=True,
                 use_generative=args.use_generative,
                 prefilter_topk=args.prefilter_topk,
-                device=device
+                device=device,
+                candidate_batch_size=args.candidate_batch_size
             )
 
             # Save to cache if requested
@@ -1165,7 +1177,8 @@ def main():
                     use_reranker=True,
                     num_gpus=num_gpus,
                     use_generative=args.use_generative,
-                    prefilter_topk=args.prefilter_topk
+                    prefilter_topk=args.prefilter_topk,
+                    candidate_batch_size=args.candidate_batch_size
                 )
             else:
                 # Single GPU mode for reranker
@@ -1189,7 +1202,8 @@ def main():
                     return_predictions=True,
                     use_generative=args.use_generative,
                     prefilter_topk=args.prefilter_topk,
-                    device=device
+                    device=device,
+                    candidate_batch_size=args.candidate_batch_size
                 )
 
             # Save to cache if requested
