@@ -478,6 +478,7 @@ def _evaluate_queries(
     llava_model: LLaVAWrapper,
     retrieval_fn,
     k: int,
+    candidate_pool_size: int,
     use_generative: bool,
     prefilter_topk: Optional[int],
     clip_model,
@@ -500,7 +501,8 @@ def _evaluate_queries(
         retrieval_dataset: Dataset to retrieve ICL examples from
         llava_model: LLaVA model for classification
         retrieval_fn: Function(query_emb, dataset, k) -> List[indices]
-        k: Number of ICL examples
+        k: Number of ICL examples to include in prompt
+        candidate_pool_size: Number of candidates to retrieve and rerank
         use_generative: Whether to use generative evaluation
         prefilter_topk: Number of candidates for CLIP pre-filtering (or None)
         clip_model: CLIP model for pre-filtering (or None)
@@ -570,13 +572,19 @@ def _evaluate_queries(
         query_example, query_image = test_dataset[query_idx]
         true_label = query_example.label
 
-        # Retrieve k examples (only if k > 0)
+        # Retrieve candidates from pool, then take top k for ICL prompt
         context_examples = []
         example_indices = []
         if k > 0:
             query_emb = test_dataset.clip_embeddings[query_idx]
-            # Exclude the query itself from retrieval
-            example_indices = retrieval_fn(query_emb, retrieval_dataset, k, exclude_indices=[query_idx])
+            # Only exclude query if using same dataset for retrieval
+            exclude_indices = [query_idx] if test_dataset is retrieval_dataset else None
+
+            # Retrieve candidate_pool_size candidates and rerank them
+            all_candidate_indices = retrieval_fn(query_emb, retrieval_dataset, candidate_pool_size, exclude_indices=exclude_indices)
+
+            # Take only top k for the ICL prompt
+            example_indices = all_candidate_indices[:k]
 
             for ex_idx in example_indices:
                 ex_example, ex_image = retrieval_dataset[ex_idx]
@@ -690,6 +698,7 @@ def evaluate_icl_worker(
     llava_model_name: str = "llava-hf/llava-1.5-7b-hf",
     load_in_8bit: bool = False,
     k: int = 1,
+    candidate_pool_size: int = 50,
     seed: int = 42,
     return_predictions: bool = False,
     use_reranker: bool = False,
@@ -806,6 +815,7 @@ def evaluate_icl_worker(
         llava_model=llava_model,
         retrieval_fn=retrieval_fn,
         k=k,
+        candidate_pool_size=candidate_pool_size,
         use_generative=use_generative,
         prefilter_topk=prefilter_topk,
         clip_model=clip_model,
@@ -830,6 +840,7 @@ def evaluate_icl_multigpu(
     llava_model_name: str = "llava-hf/llava-1.5-7b-hf",
     load_in_8bit: bool = False,
     k: int = 1,
+    candidate_pool_size: int = 50,
     num_queries: Optional[int] = None,
     seed: int = 42,
     return_predictions: bool = False,
@@ -869,6 +880,7 @@ def evaluate_icl_multigpu(
                 'llava_model_name': llava_model_name,
                 'load_in_8bit': load_in_8bit,
                 'k': k,
+                'candidate_pool_size': candidate_pool_size,
                 'seed': seed,
                 'return_predictions': return_predictions,
                 'use_reranker': use_reranker,
@@ -983,6 +995,7 @@ def evaluate_icl(
         llava_model=llava_model,
         retrieval_fn=retrieval_fn,
         k=k,
+        candidate_pool_size=args.candidate_pool_size,
         use_generative=use_generative,
         prefilter_topk=prefilter_topk,
         clip_model=clip_model,
@@ -1029,6 +1042,9 @@ def main():
     parser.add_argument("--eval-split", type=str, default="val+test",
                         choices=["train", "val", "test", "val+test"],
                         help="Which split(s) to evaluate on (default: val+test for 20 classes)")
+    parser.add_argument("--retrieval-split", type=str, default=None,
+                        choices=["train", "val", "test"],
+                        help="Which split to retrieve ICL examples from (default: auto - uses train if eval-split is test, otherwise same as eval-split)")
     parser.add_argument("--reranker-checkpoint", type=str, default=None,
                         help="Path to trained reranker checkpoint (local path or filename if using --kaggle-dataset)")
     parser.add_argument("--kaggle-dataset", type=str, default=None,
@@ -1036,7 +1052,9 @@ def main():
     parser.add_argument("--force-refresh", action="store_true",
                         help="Force re-download from Kaggle even if cached")
     parser.add_argument("--k", type=int, default=1,
-                        help="Number of in-context examples")
+                        help="Number of in-context examples to include in prompt")
+    parser.add_argument("--candidate-pool-size", type=int, default=50,
+                        help="Number of candidates to retrieve and rerank (default: 50, aligned with paper)")
     parser.add_argument("--num-queries", type=int, default=None,
                         help="Number of test queries to evaluate (default: all)")
     parser.add_argument("--llava-model", type=str, default="llava-hf/llava-1.5-7b-hf",
@@ -1085,9 +1103,15 @@ def main():
     # Determine if we should use multi-GPU
     use_multi_gpu = num_gpus > 1 and device == "cuda"
 
+    # Determine retrieval split
+    retrieval_split = determine_retrieval_split(args.eval_split, getattr(args, 'retrieval_split', None))
+    print(f"\nEvaluation setup:")
+    print(f"  Queries from: {args.eval_split}")
+    print(f"  ICL candidates from: {retrieval_split}")
+
     # Print evaluation mode
     eval_mode = "Generative" if args.use_generative else "Discriminative (probability-based)"
-    print(f"\nEvaluation mode: {eval_mode}")
+    print(f"Evaluation mode: {eval_mode}")
 
     # Get dataset size for num_queries calculation
     # Load the specified evaluation split(s)
@@ -1171,11 +1195,13 @@ def main():
                 dataset_name=args.dataset,
                 test_dataset_size=test_dataset_size,
                 eval_split=args.eval_split,
+                retrieval_split=retrieval_split,
                 reranker_checkpoint=None,
                 kaggle_dataset=None,
                 llava_model_name=args.llava_model,
                 load_in_8bit=args.load_in_8bit,
                 k=args.k,
+                candidate_pool_size=args.candidate_pool_size,
                 num_queries=args.num_queries or test_dataset_size,
                 seed=args.seed,
                 return_predictions=True,
@@ -1276,11 +1302,13 @@ def main():
                     dataset_name=args.dataset,
                     test_dataset_size=test_dataset_size,
                     eval_split=args.eval_split,
+                    retrieval_split=retrieval_split,
                     reranker_checkpoint=args.reranker_checkpoint,
                     kaggle_dataset=args.kaggle_dataset,
                     llava_model_name=args.llava_model,
                     load_in_8bit=args.load_in_8bit,
                     k=args.k,
+                    candidate_pool_size=args.candidate_pool_size,
                     num_queries=args.num_queries or test_dataset_size,
                     seed=args.seed,
                     return_predictions=True,
