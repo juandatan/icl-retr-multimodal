@@ -7,6 +7,7 @@ This module provides a wrapper around the LLaVA-1.5-7B model to:
 - Calculate marginal utility of ICL examples
 """
 
+import re
 import torch
 import numpy as np
 from typing import List, Optional, Tuple, Dict
@@ -109,6 +110,37 @@ class LLaVAWrapper:
         self.model.eval()
         print("✓ Model loaded successfully\n")
 
+    def _format_candidate_list(self, candidates: List[str], max_per_line: int = 5) -> str:
+        """
+        Format candidate list for readability.
+
+        For many candidates (>20), uses numbered list with multiple per line.
+        For few candidates (<=20), uses simple comma-separated list.
+
+        Args:
+            candidates: List of candidate labels
+            max_per_line: Maximum candidates per line (default: 5)
+
+        Returns:
+            Formatted string
+        """
+        if len(candidates) <= 20:
+            # Simple format for few candidates
+            return ", ".join(candidates)
+
+        # Numbered list format for many candidates
+        lines = []
+        lines.append("Choose from the following options:")
+
+        for i in range(0, len(candidates), max_per_line):
+            chunk = candidates[i:i + max_per_line]
+            # Format as: "1. class1  2. class2  3. class3  4. class4  5. class5"
+            line_items = [f"{i+j+1}. {c}" for j, c in enumerate(chunk)]
+            lines.append("  " + "  ".join(line_items))
+
+        lines.append("Output ONLY the exact class name from the list above.")
+        return "\n".join(lines)
+
     def format_prompt(
         self,
         example_labels: Optional[List[str]] = None,
@@ -160,8 +192,8 @@ class LLaVAWrapper:
 
             # Add query instruction
             if candidate_labels is not None:
-                candidates_str = ", ".join(candidate_labels)
-                prompt_parts.append(f"Classify the following image as granularly as possible. Choose from: {candidates_str}")
+                prompt_parts.append("Classify the following image as granularly as possible.")
+                prompt_parts.append(self._format_candidate_list(candidate_labels))
             else:
                 prompt_parts.append("Classify the following image as granularly as possible:")
         else:
@@ -170,8 +202,7 @@ class LLaVAWrapper:
             prompt_parts.append("")  # Blank line
 
             if candidate_labels is not None:
-                candidates_str = ", ".join(candidate_labels)
-                prompt_parts.append(f"Choose from: {candidates_str}")
+                prompt_parts.append(self._format_candidate_list(candidate_labels))
                 prompt_parts.append("")  # Blank line
 
         # Add query
@@ -179,6 +210,37 @@ class LLaVAWrapper:
         prompt_parts.append("Output:")
 
         return "\n".join(prompt_parts)
+
+    def _format_candidate_list(self, candidates: List[str], max_per_line: int = 5) -> str:
+        """
+        Format candidate list for readability.
+
+        For many candidates (>20), uses numbered list with multiple per line.
+        For few candidates (<=20), uses simple comma-separated list.
+
+        Args:
+            candidates: List of candidate labels
+            max_per_line: Maximum candidates per line (default: 5)
+
+        Returns:
+            Formatted string
+        """
+        if len(candidates) <= 20:
+            # Simple format for few candidates
+            return ", ".join(candidates)
+
+        # Numbered list format for many candidates
+        lines = []
+        lines.append("Choose from the following options:")
+
+        for i in range(0, len(candidates), max_per_line):
+            chunk = candidates[i:i + max_per_line]
+            # Format as: "1. class1  2. class2  3. class3  4. class4  5. class5"
+            line_items = [f"{i+j+1}. {c}" for j, c in enumerate(chunk)]
+            lines.append("  " + "  ".join(line_items))
+
+        lines.append("Output ONLY the exact class name from the list above.")
+        return "\n".join(lines)
 
     def _compute_label_probabilities_batch(
         self,
@@ -635,13 +697,27 @@ class LLaVAWrapper:
         # Remove the input prompt tokens to get only the generated part
         generated_ids = output_ids[0][inputs.input_ids.shape[1]:]
         generated_text = self.processor.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        generated_lower = generated_text.lower()
 
         # Match to closest candidate label
         # Try exact match first (case-insensitive)
-        generated_lower = generated_text.lower()
         for label in candidate_labels:
-            if label.lower() == generated_lower:
+            if label.lower().strip() == generated_lower:
                 return label
+
+        # Try numbered format match (e.g., "5" or "5." or "5. golden retriever")
+        number_match = re.match(r'^(\d+)\.?\s*(.*)', generated_text)
+        if number_match:
+            number = int(number_match.group(1))
+            # Check if number is valid index (1-indexed)
+            if 1 <= number <= len(candidate_labels):
+                return candidate_labels[number - 1]
+            # If there's text after number, try matching that
+            text_after = number_match.group(2).strip()
+            if text_after:
+                for label in candidate_labels:
+                    if label.lower() == text_after.lower():
+                        return label
 
         # Try substring match (check if label appears in generated text)
         for label in candidate_labels:
@@ -653,6 +729,6 @@ class LLaVAWrapper:
             if generated_lower in label.lower():
                 return label
 
-        # If no match found, return the first candidate as default
-        # (This could be improved with fuzzy matching, but let's start simple)
+        # Log warning if no match found
+        print(f"Warning: Generated text '{generated_text}' didn't match any candidate. Using first candidate as fallback.")
         return candidate_labels[0] if candidate_labels else ""

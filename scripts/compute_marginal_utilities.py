@@ -197,6 +197,13 @@ def retrieve_candidates(dataset, query_idx: int, top_k: int, cfg: DictConfig) ->
         exclude_same_class=cfg.retrieval.exclude_same_class
     )
 
+    # Verification assertion: ensure query is excluded from candidates
+    assert query_idx not in similar_indices, f"Query {query_idx} found in candidates!"
+
+    # Debug logging for first few queries to confirm exclusion
+    if query_idx < 3:
+        print(f"[DEBUG] Query {query_idx}: Retrieved {len(similar_indices)} candidates, query excluded: True")
+
     return similar_indices, similarities
 
 
@@ -233,6 +240,13 @@ def retrieve_candidates_stratified(
         exclude_query=True,
         exclude_same_class=cfg.retrieval.exclude_same_class
     )
+
+    # Verification assertion: ensure query is excluded from candidate pool
+    assert query_idx not in all_indices, f"Query {query_idx} found in candidate pool!"
+
+    # Debug logging for first few queries to confirm exclusion in stratified sampling
+    if query_idx < 3:
+        print(f"[DEBUG] Query {query_idx} (stratified): Retrieved pool of {len(all_indices)} candidates, query excluded: True")
 
     if len(all_indices) == 0:
         print(f"Warning: No valid candidates for query {query_idx}")

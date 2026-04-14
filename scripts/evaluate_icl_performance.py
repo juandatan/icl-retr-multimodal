@@ -52,6 +52,52 @@ from utils.multigpu_utils import MultiGPUManager, merge_dict_results
 from utils.imagenet_names import get_readable_name, get_synset_id, IMAGENET_SYNSET_TO_NAME
 
 
+class CombinedDataset:
+    """Combines multiple datasets for evaluation."""
+    def __init__(self, datasets):
+        self.examples = []
+        embeddings_list = []
+        self._datasets = datasets
+        self._dataset_offsets = [0]
+
+        for ds in datasets:
+            # Reindex examples
+            for ex in ds.examples:
+                new_ex = ClassificationExample(
+                    index=len(self.examples),
+                    image_path=ex.image_path,
+                    label=ex.label,
+                    label_name=ex.label_name,
+                    split=ex.split,
+                    _hf_index=ex._hf_index
+                )
+                self.examples.append(new_ex)
+            embeddings_list.append(ds.clip_embeddings)
+            self._dataset_offsets.append(len(self.examples))
+
+        self.clip_embeddings = np.vstack(embeddings_list)
+
+    def __getitem__(self, idx):
+        # Find which dataset this index belongs to
+        for i in range(len(self._datasets)):
+            if idx < self._dataset_offsets[i + 1]:
+                local_idx = idx - self._dataset_offsets[i]
+                return self._datasets[i][local_idx]
+        raise IndexError(f"Index {idx} out of range")
+
+    def __len__(self):
+        return len(self.examples)
+
+
+def determine_retrieval_split(eval_split: str, retrieval_split: Optional[str] = None) -> str:
+    """Determine retrieval split based on eval split if not explicitly provided."""
+    if retrieval_split is not None:
+        return retrieval_split
+    if eval_split == "test":
+        return "train"
+    return eval_split
+
+
 def get_cache_path(
     dataset_name: str,
     method: str,
@@ -638,6 +684,7 @@ def evaluate_icl_worker(
     query_indices: List[int],
     dataset_name: str,
     eval_split: str = "val+test",
+    retrieval_split: str = None,
     reranker_checkpoint: str = None,
     kaggle_dataset: str = None,
     llava_model_name: str = "llava-hf/llava-1.5-7b-hf",
@@ -659,18 +706,14 @@ def evaluate_icl_worker(
     # Set device for this worker
     device = f"cuda:{gpu_id}"
 
-    # Load datasets based on eval_split parameter
-    print(f"GPU {gpu_id}: Loading {eval_split} split(s)...")
+    # Determine retrieval split
+    retrieval_split = determine_retrieval_split(eval_split, retrieval_split)
+    print(f"[GPU {gpu_id}] Queries from {eval_split}, candidates from {retrieval_split}")
 
     # Build complete label mapping if use_all_classes is True
     all_classes_label_mapping = None
-<<<<<<< Updated upstream
-    if use_all_classes and not use_generative:
-        print(f"GPU {gpu_id}: Building complete label mapping from all splits...")
-=======
     if use_all_classes:
         print(f"[GPU {gpu_id}] Building complete label mapping from all splits...")
->>>>>>> Stashed changes
         all_splits_datasets = [
             load_dataset(dataset_name, split="train"),
             load_dataset(dataset_name, split="val"),
@@ -681,8 +724,9 @@ def evaluate_icl_worker(
             for ex in ds.examples:
                 if ex.label_name not in all_classes_label_mapping:
                     all_classes_label_mapping[ex.label_name] = ex.label
-        print(f"GPU {gpu_id}: Using {len(all_classes_label_mapping)} classes as candidates")
+        print(f"[GPU {gpu_id}] Using {len(all_classes_label_mapping)} classes as candidates")
 
+    # Load eval dataset
     if eval_split == "val+test":
         datasets_to_combine = [
             load_dataset(dataset_name, split="val"),
@@ -691,53 +735,20 @@ def evaluate_icl_worker(
     else:
         datasets_to_combine = [load_dataset(dataset_name, split=eval_split)]
 
-    # Combine datasets if multiple
+    # Combine if needed
     if len(datasets_to_combine) > 1:
-        class CombinedDataset:
-            """Combines multiple datasets for evaluation."""
-            def __init__(self, datasets):
-                self.examples = []
-                embeddings_list = []
-                self._datasets = datasets
-                self._dataset_offsets = [0]
-
-                for ds in datasets:
-                    # Reindex examples
-                    for ex in ds.examples:
-                        new_ex = ClassificationExample(
-                            index=len(self.examples),
-                            image_path=ex.image_path,
-                            label=ex.label,
-                            label_name=ex.label_name,
-                            split=ex.split,
-                            _hf_index=ex._hf_index
-                        )
-                        self.examples.append(new_ex)
-                    embeddings_list.append(ds.clip_embeddings)
-                    self._dataset_offsets.append(len(self.examples))
-
-                self.clip_embeddings = np.vstack(embeddings_list)
-
-            def __getitem__(self, idx):
-                # Find which dataset this index belongs to
-                for i in range(len(self._datasets)):
-                    if idx < self._dataset_offsets[i + 1]:
-                        local_idx = idx - self._dataset_offsets[i]
-                        return self._datasets[i][local_idx]
-                raise IndexError(f"Index {idx} out of range")
-
-            def __len__(self):
-                return len(self.examples)
-
         test_dataset = CombinedDataset(datasets_to_combine)
-        print(f"GPU {gpu_id}: Combined dataset has {len(test_dataset)} examples from {len(set(ex.label for ex in test_dataset.examples))} classes")
+        print(f"[GPU {gpu_id}] Combined dataset has {len(test_dataset)} examples from {len(set(ex.label for ex in test_dataset.examples))} classes")
     else:
         # Single split, no need to combine
         test_dataset = datasets_to_combine[0]
-        print(f"GPU {gpu_id}: Using {eval_split} split with {len(test_dataset)} examples from {len(set(ex.label for ex in test_dataset.examples))} classes")
+        print(f"[GPU {gpu_id}] Using {eval_split} split with {len(test_dataset)} examples from {len(set(ex.label for ex in test_dataset.examples))} classes")
 
-    # For retrieval, use the same dataset
-    retrieval_dataset = test_dataset
+    # Load retrieval dataset separately if different
+    if retrieval_split == eval_split and eval_split != "val+test":
+        retrieval_dataset = test_dataset
+    else:
+        retrieval_dataset = load_dataset(dataset_name, split=retrieval_split)
 
     # Load reranker if needed
     reranker = None
@@ -813,6 +824,7 @@ def evaluate_icl_multigpu(
     dataset_name: str,
     test_dataset_size: int,
     eval_split: str = "val+test",
+    retrieval_split: str = None,
     reranker_checkpoint: Optional[str] = None,
     kaggle_dataset: Optional[str] = None,
     llava_model_name: str = "llava-hf/llava-1.5-7b-hf",
@@ -851,6 +863,7 @@ def evaluate_icl_multigpu(
             worker_kwargs={
                 'dataset_name': dataset_name,
                 'eval_split': eval_split,
+                'retrieval_split': retrieval_split,
                 'reranker_checkpoint': reranker_checkpoint,
                 'kaggle_dataset': kaggle_dataset,
                 'llava_model_name': llava_model_name,
@@ -1101,43 +1114,6 @@ def main():
         # For single-GPU, combine and keep the loaded datasets
         if len(temp_datasets) > 1:
             print(f"\nCombining {args.eval_split} splits for single-GPU evaluation...")
-
-            class CombinedDataset:
-                """Combines multiple datasets for evaluation."""
-                def __init__(self, datasets):
-                    self.examples = []
-                    embeddings_list = []
-                    self._datasets = datasets
-                    self._dataset_offsets = [0]
-
-                    for ds in datasets:
-                        # Reindex examples
-                        for ex in ds.examples:
-                            new_ex = ClassificationExample(
-                                index=len(self.examples),
-                                image_path=ex.image_path,
-                                label=ex.label,
-                                label_name=ex.label_name,
-                                split=ex.split,
-                                _hf_index=ex._hf_index
-                            )
-                            self.examples.append(new_ex)
-                        embeddings_list.append(ds.clip_embeddings)
-                        self._dataset_offsets.append(len(self.examples))
-
-                    self.clip_embeddings = np.vstack(embeddings_list)
-
-                def __getitem__(self, idx):
-                    # Find which dataset this index belongs to
-                    for i in range(len(self._datasets)):
-                        if idx < self._dataset_offsets[i + 1]:
-                            local_idx = idx - self._dataset_offsets[i]
-                            return self._datasets[i][local_idx]
-                    raise IndexError(f"Index {idx} out of range")
-
-                def __len__(self):
-                    return len(self.examples)
-
             test_dataset = CombinedDataset(temp_datasets)
             print(f"Combined dataset has {len(test_dataset)} examples from {len(set(ex.label for ex in test_dataset.examples))} classes")
         else:
