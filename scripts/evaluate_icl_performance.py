@@ -60,7 +60,8 @@ def get_cache_path(
     seed: int,
     reranker_checkpoint: str = None,
     use_generative: bool = False,
-    prefilter_topk: Optional[int] = None
+    prefilter_topk: Optional[int] = None,
+    use_all_classes: bool = False
 ) -> Path:
     """Generate cache path for evaluation results."""
     cache_dir = Path("outputs/icl_evaluation_cache")
@@ -82,16 +83,30 @@ def get_cache_path(
     if prefilter_topk is not None:
         config_id += f"_prefilter{prefilter_topk}"
 
+    # Add use_all_classes setting to cache key
+    if use_all_classes:
+        config_id += "_allclasses"
+
     return cache_dir / f"{config_id}.pkl"
 
 
 def load_cached_results(cache_path: Path) -> Optional[Dict]:
-    """Load cached evaluation results if they exist."""
+    """Load cached evaluation results if they exist.
+
+    Returns a dict with 'predictions' list and 'completed_queries' set.
+    """
     if cache_path.exists():
         print(f"Found cached results at {cache_path}")
         with open(cache_path, 'rb') as f:
             cached = pickle.load(f)
-        print(f"✓ Loaded {cached['total']} cached predictions")
+
+        # Handle old cache format (convert to incremental format)
+        if 'predictions' in cached and 'completed_queries' not in cached:
+            completed = {pred['query_idx'] for pred in cached['predictions']}
+            cached['completed_queries'] = completed
+
+        num_completed = len(cached.get('completed_queries', set()))
+        print(f"✓ Loaded cache with {num_completed} completed queries")
         return cached
     return None
 
@@ -425,7 +440,10 @@ def _evaluate_queries(
     device: str,
     return_predictions: bool = False,
     progress_desc: str = "Evaluating",
-    candidate_batch_size: int = 8
+    candidate_batch_size: int = 8,
+    cache_path: Optional[Path] = None,
+    save_frequency: int = 50,
+    all_classes_label_mapping: Optional[Dict] = None
 ) -> Dict:
     """
     Shared evaluation logic for both single-GPU and multi-GPU modes.
@@ -445,30 +463,64 @@ def _evaluate_queries(
         device: Device string
         return_predictions: Whether to return detailed predictions
         progress_desc: Description for progress bar
+        all_classes_label_mapping: Optional complete label_name -> label mapping for all classes
 
     Returns:
         Dictionary with evaluation results
     """
-    correct = 0
-    total = 0
-    per_class_correct = {}
-    per_class_total = {}
-    predictions = []
+    # Load existing cache if available
+    completed_queries = set()
+    if cache_path and cache_path.exists():
+        cached = load_cached_results(cache_path)
+        if cached:
+            completed_queries = cached.get('completed_queries', set())
+            predictions = cached.get('predictions', [])
+            correct = cached.get('correct', 0)
+            total = cached.get('total', 0)
+            per_class_correct = cached.get('per_class_correct', {})
+            per_class_total = cached.get('per_class_total', {})
+            print(f"Resuming from {len(completed_queries)} completed queries")
+        else:
+            predictions = []
+            correct = 0
+            total = 0
+            per_class_correct = {}
+            per_class_total = {}
+    else:
+        predictions = []
+        correct = 0
+        total = 0
+        per_class_correct = {}
+        per_class_total = {}
 
     # Build label_name -> label mapping for O(1) lookups
-    label_name_to_label = {ex.label_name: ex.label for ex in test_dataset.examples}
+    if all_classes_label_mapping is not None:
+        # Use complete mapping across all splits
+        label_name_to_label = all_classes_label_mapping
+    else:
+        # Use only classes from test_dataset
+        label_name_to_label = {ex.label_name: ex.label for ex in test_dataset.examples}
 
     # Precompute candidate labels for discriminative evaluation
     discriminative_candidate_labels = None
     if not use_generative:
-        discriminative_candidate_labels = [get_readable_name(ex.label_name) for ex in test_dataset.examples]
-        seen = set()
-        discriminative_candidate_labels = [x for x in discriminative_candidate_labels if not (x in seen or seen.add(x))]
+        if all_classes_label_mapping is not None:
+            # Use all classes as candidates
+            discriminative_candidate_labels = sorted([get_readable_name(label_name) for label_name in all_classes_label_mapping.keys()])
+        else:
+            # Use only classes from test_dataset
+            discriminative_candidate_labels = [get_readable_name(ex.label_name) for ex in test_dataset.examples]
+            seen = set()
+            discriminative_candidate_labels = [x for x in discriminative_candidate_labels if not (x in seen or seen.add(x))]
 
     # Precompute all class names for generative evaluation
     all_class_names_sorted = sorted([name for name in IMAGENET_SYNSET_TO_NAME.values()]) if use_generative else []
 
-    for query_idx in tqdm(query_indices, desc=progress_desc):
+    # Filter out already completed queries
+    queries_to_process = [idx for idx in query_indices if idx not in completed_queries]
+    print(f"Processing {len(queries_to_process)} queries ({len(completed_queries)} already cached)")
+
+    for query_idx in tqdm(queries_to_process, desc=progress_desc):
         query_example, query_image = test_dataset[query_idx]
         true_label = query_example.label
 
@@ -550,13 +602,35 @@ def _evaluate_queries(
                 'predicted_label_text': predicted_label_text
             })
 
-    return {
+        # Mark as completed
+        completed_queries.add(query_idx)
+
+        # Save incrementally every N queries
+        if cache_path and len(completed_queries) % save_frequency == 0:
+            intermediate_results = {
+                'correct': correct,
+                'total': total,
+                'per_class_correct': per_class_correct,
+                'per_class_total': per_class_total,
+                'predictions': predictions if return_predictions else [],
+                'completed_queries': completed_queries
+            }
+            save_cached_results(cache_path, intermediate_results)
+
+    # Final save
+    final_results = {
         'correct': correct,
         'total': total,
         'per_class_correct': per_class_correct,
         'per_class_total': per_class_total,
-        'predictions': predictions if return_predictions else []
+        'predictions': predictions if return_predictions else [],
+        'completed_queries': completed_queries
     }
+
+    if cache_path:
+        save_cached_results(cache_path, final_results)
+
+    return final_results
 
 
 def evaluate_icl_worker(
@@ -574,7 +648,9 @@ def evaluate_icl_worker(
     use_reranker: bool = False,
     use_generative: bool = False,
     prefilter_topk: Optional[int] = None,
-    candidate_batch_size: int = 8
+    candidate_batch_size: int = 8,
+    cache_path_base: Optional[str] = None,
+    use_all_classes: bool = False
 ) -> Dict:
     """
     Worker function for multi-GPU evaluation.
@@ -585,6 +661,27 @@ def evaluate_icl_worker(
 
     # Load datasets based on eval_split parameter
     print(f"GPU {gpu_id}: Loading {eval_split} split(s)...")
+
+    # Build complete label mapping if use_all_classes is True
+    all_classes_label_mapping = None
+<<<<<<< Updated upstream
+    if use_all_classes and not use_generative:
+        print(f"GPU {gpu_id}: Building complete label mapping from all splits...")
+=======
+    if use_all_classes:
+        print(f"[GPU {gpu_id}] Building complete label mapping from all splits...")
+>>>>>>> Stashed changes
+        all_splits_datasets = [
+            load_dataset(dataset_name, split="train"),
+            load_dataset(dataset_name, split="val"),
+            load_dataset(dataset_name, split="test")
+        ]
+        all_classes_label_mapping = {}
+        for ds in all_splits_datasets:
+            for ex in ds.examples:
+                if ex.label_name not in all_classes_label_mapping:
+                    all_classes_label_mapping[ex.label_name] = ex.label
+        print(f"GPU {gpu_id}: Using {len(all_classes_label_mapping)} classes as candidates")
 
     if eval_split == "val+test":
         datasets_to_combine = [
@@ -685,6 +782,11 @@ def evaluate_icl_worker(
 
     print(f"GPU {gpu_id}: Evaluating {len(query_indices)} queries...")
 
+    # Create GPU-specific cache path if base path provided
+    cache_path = None
+    if cache_path_base:
+        cache_path = Path(f"{cache_path_base}.gpu{gpu_id}")
+
     # Use shared evaluation logic
     return _evaluate_queries(
         query_indices=query_indices,
@@ -701,7 +803,9 @@ def evaluate_icl_worker(
         device=device,
         return_predictions=return_predictions,
         progress_desc=f"GPU {gpu_id}",
-        candidate_batch_size=candidate_batch_size
+        candidate_batch_size=candidate_batch_size,
+        cache_path=cache_path,
+        all_classes_label_mapping=all_classes_label_mapping
     )
 
 
@@ -721,7 +825,9 @@ def evaluate_icl_multigpu(
     num_gpus: int = 1,
     use_generative: bool = False,
     prefilter_topk: Optional[int] = None,
-    candidate_batch_size: int = 8
+    candidate_batch_size: int = 8,
+    cache_path: Optional[Path] = None,
+    use_all_classes: bool = False
 ) -> Dict:
     """
     Evaluate ICL performance using multiple GPUs in parallel.
@@ -755,7 +861,9 @@ def evaluate_icl_multigpu(
                 'use_reranker': use_reranker,
                 'use_generative': use_generative,
                 'prefilter_topk': prefilter_topk,
-                'candidate_batch_size': candidate_batch_size
+                'candidate_batch_size': candidate_batch_size,
+                'cache_path_base': str(cache_path) if cache_path else None,
+                'use_all_classes': use_all_classes
             }
         )
 
@@ -810,7 +918,8 @@ def evaluate_icl(
     use_generative: bool = False,
     prefilter_topk: Optional[int] = None,
     device: str = "cuda",
-    candidate_batch_size: int = 8
+    candidate_batch_size: int = 8,
+    all_classes_label_mapping: Optional[Dict] = None
 ) -> Dict:
     """
     Evaluate ICL performance using a given retrieval method.
@@ -869,7 +978,9 @@ def evaluate_icl(
         device=device,
         return_predictions=return_predictions,
         progress_desc="Querying LLaVA",
-        candidate_batch_size=candidate_batch_size
+        candidate_batch_size=candidate_batch_size,
+        cache_path=None,  # Single-GPU uses external caching
+        all_classes_label_mapping=all_classes_label_mapping
     )
 
     # Compute final metrics
@@ -935,6 +1046,8 @@ def main():
                         help="For generative evaluation: Use CLIP to pre-filter to top-K candidates (with oracle guarantee that true label is included)")
     parser.add_argument("--candidate-batch-size", type=int, default=8,
                         help="Number of candidate labels to process in parallel (default: 8). Lower this if you get OOM errors with many classes.")
+    parser.add_argument("--use-all-classes", action="store_true",
+                        help="Use all 100 dataset classes as candidates (instead of only classes in eval split). Only applicable for discriminative evaluation.")
 
     args = parser.parse_args()
 
@@ -1035,6 +1148,22 @@ def main():
         # For retrieval, use the same dataset
         retrieval_dataset = test_dataset
 
+        # Build complete label mapping if use_all_classes is True
+        all_classes_label_mapping = None
+        if args.use_all_classes and not args.use_generative:
+            print("\nBuilding complete label mapping from all splits...")
+            all_splits_datasets = [
+                load_dataset(args.dataset, split="train"),
+                load_dataset(args.dataset, split="val"),
+                load_dataset(args.dataset, split="test")
+            ]
+            all_classes_label_mapping = {}
+            for ds in all_splits_datasets:
+                for ex in ds.examples:
+                    if ex.label_name not in all_classes_label_mapping:
+                        all_classes_label_mapping[ex.label_name] = ex.label
+            print(f"✓ Using {len(all_classes_label_mapping)} classes as candidates (from all splits)")
+
     # Check cache for CLIP results
     clip_cache_path = get_cache_path(
         dataset_name=args.dataset,
@@ -1043,7 +1172,8 @@ def main():
         num_queries=args.num_queries or test_dataset_size,
         seed=args.seed,
         use_generative=args.use_generative,
-        prefilter_topk=args.prefilter_topk
+        prefilter_topk=args.prefilter_topk,
+        use_all_classes=args.use_all_classes
     )
 
     clip_results = None
@@ -1077,7 +1207,9 @@ def main():
                 num_gpus=num_gpus,
                 use_generative=args.use_generative,
                 prefilter_topk=args.prefilter_topk,
-                candidate_batch_size=args.candidate_batch_size
+                candidate_batch_size=args.candidate_batch_size,
+                cache_path=clip_cache_path,
+                use_all_classes=args.use_all_classes
             )
 
             # Save to cache if requested
@@ -1125,7 +1257,8 @@ def main():
                 use_generative=args.use_generative,
                 prefilter_topk=args.prefilter_topk,
                 device=device,
-                candidate_batch_size=args.candidate_batch_size
+                candidate_batch_size=args.candidate_batch_size,
+                all_classes_label_mapping=all_classes_label_mapping
             )
 
             # Save to cache if requested
@@ -1149,7 +1282,8 @@ def main():
             seed=args.seed,
             reranker_checkpoint=args.reranker_checkpoint,
             use_generative=args.use_generative,
-            prefilter_topk=args.prefilter_topk
+            prefilter_topk=args.prefilter_topk,
+            use_all_classes=args.use_all_classes
         )
 
         if args.use_cache and not args.force_recompute:
@@ -1178,7 +1312,9 @@ def main():
                     num_gpus=num_gpus,
                     use_generative=args.use_generative,
                     prefilter_topk=args.prefilter_topk,
-                    candidate_batch_size=args.candidate_batch_size
+                    candidate_batch_size=args.candidate_batch_size,
+                    cache_path=reranker_cache_path,
+                    use_all_classes=args.use_all_classes
                 )
             else:
                 # Single GPU mode for reranker
@@ -1203,7 +1339,8 @@ def main():
                     use_generative=args.use_generative,
                     prefilter_topk=args.prefilter_topk,
                     device=device,
-                    candidate_batch_size=args.candidate_batch_size
+                    candidate_batch_size=args.candidate_batch_size,
+                    all_classes_label_mapping=all_classes_label_mapping
                 )
 
             # Save to cache if requested
