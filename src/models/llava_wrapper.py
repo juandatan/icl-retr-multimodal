@@ -1,9 +1,9 @@
 """
-LLaVA-1.5 wrapper for computing output probabilities and utilities.
+LLaVA-1.6 (LLaVA-NeXT) wrapper for computing output probabilities and utilities.
 
-This module provides a wrapper around the LLaVA-1.5-7B model to:
+This module provides a wrapper around LLaVA-1.6 models to:
 - Compute output probabilities for classification tasks
-- Support 0-shot and n-shot in-context learning
+- Support 0-shot and n-shot in-context learning with multi-image support
 - Calculate marginal utility of ICL examples
 """
 
@@ -12,18 +12,18 @@ import torch
 import numpy as np
 from typing import List, Optional, Tuple, Dict
 from PIL import Image
-from transformers import AutoTokenizer, AutoProcessor, LlavaForConditionalGeneration, BitsAndBytesConfig
+from transformers import AutoProcessor, LlavaNextForConditionalGeneration, BitsAndBytesConfig
 from torch.cuda.amp import autocast
 class LLaVAWrapper:
     """
-    Wrapper for LLaVA-1.5-7B model to compute classification probabilities.
+    Wrapper for LLaVA-1.6 (LLaVA-NeXT) model to compute classification probabilities.
 
     Computes the probability of generating the correct class name by:
     - Concatenating prompt + label tokens
     - Single forward pass with causal attention
     - Extracting log probabilities for label tokens
 
-    Supports batched processing for efficiency.
+    Supports batched processing for efficiency and multi-image in-context learning.
 
     Supports:
     - 0-shot prediction: P(class_name|image)
@@ -33,7 +33,7 @@ class LLaVAWrapper:
 
     def __init__(
         self,
-        model_name: str = "llava-hf/llava-1.5-7b-hf",
+        model_name: str = "llava-hf/llava-v1.6-mistral-7b-hf",
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         load_in_8bit: bool = False,
         load_in_4bit: bool = False,
@@ -42,10 +42,10 @@ class LLaVAWrapper:
         max_vision_cache_size: int = 5000,
     ):
         """
-        Initialize LLaVA model.
+        Initialize LLaVA-1.6 model.
 
         Args:
-            model_name: HuggingFace model name
+            model_name: HuggingFace model name (must be LLaVA-1.6/LLaVA-NeXT)
             device: Device to load model on
             load_in_8bit: Whether to use 8-bit quantization
             load_in_4bit: Whether to use 4-bit quantization
@@ -64,7 +64,7 @@ class LLaVAWrapper:
         # Vision embedding cache: maps image hash -> vision embeddings
         self._vision_cache = {} if cache_vision_embeddings else None
 
-        print(f"Loading LLaVA model: {model_name}")
+        print(f"Loading LLaVA-1.6 model: {model_name}")
         print(f"Device: {device}")
         if load_in_8bit:
             print("Using 8-bit quantization")
@@ -98,7 +98,9 @@ class LLaVAWrapper:
             if device.startswith("cuda"):
                 model_kwargs['device_map'] = "auto"
 
-        self.model = LlavaForConditionalGeneration.from_pretrained(
+        # Load LLaVA-1.6 (LLaVA-NeXT)
+        print("Loading LLaVA-1.6 with multi-image support")
+        self.model = LlavaNextForConditionalGeneration.from_pretrained(
             model_name,
             **model_kwargs
         )
@@ -110,104 +112,46 @@ class LLaVAWrapper:
         self.model.eval()
         print("✓ Model loaded successfully\n")
 
-    def _format_candidate_list(self, candidates: List[str], max_per_line: int = 5) -> str:
-        """
-        Format candidate list for readability.
-
-        For many candidates (>20), uses numbered list with multiple per line.
-        For few candidates (<=20), uses simple comma-separated list.
-
-        Args:
-            candidates: List of candidate labels
-            max_per_line: Maximum candidates per line (default: 5)
-
-        Returns:
-            Formatted string
-        """
-        if len(candidates) <= 20:
-            # Simple format for few candidates
-            return ", ".join(candidates)
-
-        # Numbered list format for many candidates
-        lines = []
-        lines.append("Choose from the following options:")
-
-        for i in range(0, len(candidates), max_per_line):
-            chunk = candidates[i:i + max_per_line]
-            # Format as: "1. class1  2. class2  3. class3  4. class4  5. class5"
-            line_items = [f"{i+j+1}. {c}" for j, c in enumerate(chunk)]
-            lines.append("  " + "  ".join(line_items))
-
-        lines.append("Output ONLY the exact class name from the list above.")
-        return "\n".join(lines)
-
     def format_prompt(
         self,
         example_labels: Optional[List[str]] = None,
         candidate_labels: Optional[List[str]] = None,
     ) -> str:
         """
-        Format prompt for classification task.
-
-        For 0-shot:
-            "You are an expert image classifier. Classify the following image as granularly as possible.\n\n
-             Image: <image>\nOutput:"
-
-        For n-shot:
-            "You are an expert image classifier. Use the following examples to inform your answer.\n\n
-             Image: <image>\nOutput: {label1}\n\n
-             Image: <image>\nOutput: {label2}\n\n
-             Classify the following image as granularly as possible:\n
-             Image: <image>\nOutput:"
-
-        With candidates (generative evaluation):
-            Note: Candidates are only shown for the final query, not for ICL examples.
-            This allows any class to be demonstrated without constraint.
-
-            "You are an expert image classifier. Use the following examples to inform your answer.\n\n
-             Image: <image>\nOutput: {label1}\n\n
-             Classify the following image as granularly as possible. Choose from: {candidate1}, {candidate2}, ...\n
-             Image: <image>\nOutput:"
+        Format prompt for classification task with manual <image> token placement.
 
         Args:
             example_labels: List of example labels for ICL
             candidate_labels: List of candidate labels to choose from (for generative evaluation)
-                             Only shown in the final query question, not in example demonstrations.
 
         Returns:
-            Formatted prompt string with <image> tokens
+            String prompt with <image> tokens properly placed
         """
-        prompt_parts = []
-
-        # Add system instruction and examples if provided
-        if example_labels is not None and len(example_labels) > 0:
-            prompt_parts.append("You are an expert image classifier. Use the following examples to inform your answer.")
-            prompt_parts.append("")  # Blank line
-
-            # Add examples
-            for ex_label in example_labels:
-                prompt_parts.append("Image: <image>")
-                prompt_parts.append(f"Output: {ex_label}")
-                prompt_parts.append("")  # Blank line
-
-            # Add query instruction
-            if candidate_labels is not None:
-                prompt_parts.append("Classify the following image as granularly as possible.")
-                prompt_parts.append(self._format_candidate_list(candidate_labels))
-            else:
-                prompt_parts.append("Classify the following image as granularly as possible:")
+        # Build task description
+        task_parts = []
+        if candidate_labels is not None:
+            num_classes = len(candidate_labels)
+            task_parts.append(f"The goal of this task is to correctly classify an image. There are {num_classes} possible classes:")
+            task_parts.append(self._format_candidate_list(candidate_labels))
+            task_parts.append("Output only the exact class name from the list above.")
         else:
-            # 0-shot: simpler instruction
-            prompt_parts.append("You are an expert image classifier. Classify the following image as granularly as possible.")
-            prompt_parts.append("")  # Blank line
+            task_parts.append("The goal of this task is to correctly classify an image.")
 
-            if candidate_labels is not None:
-                prompt_parts.append(self._format_candidate_list(candidate_labels))
-                prompt_parts.append("")  # Blank line
+        task_description = "\n".join(task_parts)
+
+        # Build prompt with proper <image> token placement
+        prompt_parts = ["[INST] " + task_description, ""]
+
+        # Add examples with interleaved images
+        if example_labels is not None and len(example_labels) > 0:
+            for ex_label in example_labels:
+                prompt_parts.append("<image>")
+                prompt_parts.append(f"Output: {ex_label}")
+                prompt_parts.append("")
 
         # Add query
-        prompt_parts.append("Image: <image>")
-        prompt_parts.append("Output:")
+        prompt_parts.append("<image>")
+        prompt_parts.append("Output: [/INST]")
 
         return "\n".join(prompt_parts)
 
@@ -231,7 +175,6 @@ class LLaVAWrapper:
 
         # Numbered list format for many candidates
         lines = []
-        lines.append("Choose from the following options:")
 
         for i in range(0, len(candidates), max_per_line):
             chunk = candidates[i:i + max_per_line]
@@ -239,13 +182,12 @@ class LLaVAWrapper:
             line_items = [f"{i+j+1}. {c}" for j, c in enumerate(chunk)]
             lines.append("  " + "  ".join(line_items))
 
-        lines.append("Output ONLY the exact class name from the list above.")
         return "\n".join(lines)
 
     def _compute_label_probabilities_batch(
         self,
-        images: List,  # List[Image.Image] for single-image or List[List[Image.Image]] for multi-image ICL
-        prompts: List[str],
+        images: List[List[Image.Image]],  # List of image lists for multi-image ICL
+        prompts: List[str],  # List of prompt strings with <image> tokens
         labels: List[str]
     ) -> List[float]:
         """
@@ -255,9 +197,8 @@ class LLaVAWrapper:
         The causal attention mask ensures proper autoregressive probability computation.
 
         Args:
-            images: List of images - can be List[Image.Image] for single-image inputs
-                   or List[List[Image.Image]] for multi-image ICL inputs
-            prompts: List of prompt strings (ending in "Answer:")
+            images: List of image lists (e.g., [[img1, img2], [img3]] for batch_size=2)
+            prompts: List of prompt strings with <image> tokens
             labels: List of ground-truth label strings
 
         Returns:
@@ -274,13 +215,34 @@ class LLaVAWrapper:
             )
             all_label_tokens.append(label_tokens)
 
-        # Process prompts (without labels)
+        # Flatten images list: [[img1, img2], [img3, img4]] -> [img1, img2, img3, img4]
+        flat_images = [img for img_list in images for img in img_list]
+
+        # Process with flat image list and text prompts
         prompt_inputs = self.processor(
             text=prompts,
-            images=images,
+            images=flat_images,
             return_tensors="pt",
             padding=True
         )
+
+        # DEBUG: Log processor output shapes and verify images are different
+        print(f"[DEBUG] Processor output:")
+        for k, v in prompt_inputs.items():
+            if isinstance(v, torch.Tensor):
+                print(f"  {k}: shape={v.shape}")
+                # For pixel_values, check if images are different
+                if k == "pixel_values" and v.shape[0] >= 2:
+                    img1 = v[0]
+                    img2 = v[1]
+                    diff = torch.abs(img1 - img2).mean().item()
+                    print(f"  Mean absolute difference between first two images: {diff:.6f}")
+                    if diff < 0.001:
+                        print(f"  ⚠️  WARNING: Images appear identical or nearly identical!")
+                    else:
+                        print(f"  ✓ Images are different")
+            elif isinstance(v, list) and len(v) > 0:
+                print(f"  {k}: list with {len(v)} items")
 
         # Move to device
         prompt_inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
@@ -331,23 +293,25 @@ class LLaVAWrapper:
         full_attention_mask = torch.stack(full_attention_mask)
 
         # Single forward pass for entire batch with mixed precision
+        # Prepare model inputs (handle both LLaVA-1.5 and LLaVA-1.6)
+        model_inputs = {
+            'input_ids': full_input_ids,
+            'attention_mask': full_attention_mask,
+            'pixel_values': prompt_inputs.get('pixel_values'),
+            'use_cache': self.use_cache,
+        }
+
+        # LLaVA-1.6 requires image_sizes
+        if 'image_sizes' in prompt_inputs:
+            model_inputs['image_sizes'] = prompt_inputs['image_sizes']
+
         with torch.no_grad():
             # Use autocast for CUDA devices to speed up computation
             if self.device.startswith("cuda"):
                 with autocast(dtype=torch.float16):
-                    outputs = self.model(
-                        input_ids=full_input_ids,
-                        attention_mask=full_attention_mask,
-                        pixel_values=prompt_inputs.get('pixel_values'),
-                        use_cache=self.use_cache,
-                    )
+                    outputs = self.model(**model_inputs)
             else:
-                outputs = self.model(
-                    input_ids=full_input_ids,
-                    attention_mask=full_attention_mask,
-                    pixel_values=prompt_inputs.get('pixel_values'),
-                    use_cache=self.use_cache,
-                )
+                outputs = self.model(**model_inputs)
 
         # Extract log probabilities for each sample
         logits = outputs.logits  # [batch_size, seq_len, vocab_size]
@@ -406,7 +370,7 @@ class LLaVAWrapper:
 
             for idx in range(start_idx, end_idx):
                 example, image = dataset[idx]
-                batch_images.append(image)  # Single image per sample for 0-shot
+                batch_images.append([image])  # Single image per sample for 0-shot
                 batch_prompts.append(self.format_prompt(example_labels=None))
                 batch_labels.append(example.label_name)
                 batch_indices.append(idx)
@@ -641,7 +605,7 @@ class LLaVAWrapper:
         query_image: Image.Image,
         context_examples: List[Tuple[Image.Image, str]],
         candidate_labels: List[str],
-        max_new_tokens: int = 10
+        max_new_tokens: int = 50
     ) -> str:
         """
         Classify an image using generative decoding (free-form generation).
@@ -666,12 +630,16 @@ class LLaVAWrapper:
         # Prepare images: context images + query image
         images = [img for img, _ in context_examples] + [query_image]
 
-        # Process inputs
+        # Process inputs (prompt already has [INST]...[/INST] wrapper)
         inputs = self.processor(
             text=prompt,
             images=images,
             return_tensors="pt"
         ).to(self.device)
+
+        # Encode stop sequences (newline to prevent continuing after answer)
+        stop_str = "\n\n"
+        stop_token_ids = self.processor.tokenizer.encode(stop_str, add_special_tokens=False)
 
         # Generate
         with torch.no_grad():
@@ -682,7 +650,7 @@ class LLaVAWrapper:
                         max_new_tokens=max_new_tokens,
                         do_sample=False,  # Greedy decoding for consistency
                         pad_token_id=self.processor.tokenizer.pad_token_id,
-                        eos_token_id=self.processor.tokenizer.eos_token_id
+                        eos_token_id=[self.processor.tokenizer.eos_token_id] + stop_token_ids
                     )
             else:
                 output_ids = self.model.generate(
@@ -690,13 +658,22 @@ class LLaVAWrapper:
                     max_new_tokens=max_new_tokens,
                     do_sample=False,
                     pad_token_id=self.processor.tokenizer.pad_token_id,
-                    eos_token_id=self.processor.tokenizer.eos_token_id
+                    eos_token_id=[self.processor.tokenizer.eos_token_id] + stop_token_ids
                 )
 
         # Decode generated text
         # Remove the input prompt tokens to get only the generated part
         generated_ids = output_ids[0][inputs.input_ids.shape[1]:]
         generated_text = self.processor.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+        # Log the raw generation for debugging
+        print(f"[RAW GENERATION] '{generated_text}'")
+
+        # Take only the first line (before any newline) to avoid prompt repetition
+        if '\n' in generated_text:
+            generated_text = generated_text.split('\n')[0].strip()
+            print(f"[CLEANED] '{generated_text}'")
+
         generated_lower = generated_text.lower()
 
         # Match to closest candidate label
