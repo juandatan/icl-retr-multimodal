@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from data.dataclasses import MarginalUtilityResult
 from data.stanford_cars import StanfordCarsDataset
 from data.mini_imagenet import MiniImageNetDataset
-from models.llava_wrapper import LLaVAWrapper
+from models.idefics2_wrapper import Idefics2Wrapper
 from utils.kaggle_utils import (
     is_kaggle_environment,
     get_kaggle_checkpoint_dataset,
@@ -83,11 +83,11 @@ def load_clip_embeddings(dataset, cfg: DictConfig):
 
 
 def initialize_model(cfg: DictConfig):
-    """Initialize LLaVA model."""
-    print("Initializing LLaVA model...")
+    """Initialize Idefics2 model."""
+    print("Initializing Idefics2 model...")
     print(f"  Model: {cfg.model.name}")
     print(f"  Quantization: {'8-bit' if cfg.model.load_in_8bit else '4-bit' if cfg.model.load_in_4bit else 'None (fp16/fp32)'}")
-    print(f"\nNote: First time may take a while to download model (~14GB)...")
+    print(f"\nNote: First time may take a while to download model (~16GB for Idefics2-8B)...")
     print(f"If download fails with SSL errors, you can:")
     print(f"  1. Wait and retry (network issues are usually temporary)")
     print(f"  2. Pre-download: huggingface-cli download {cfg.model.name}")
@@ -107,7 +107,7 @@ def initialize_model(cfg: DictConfig):
         # Check if vision caching should be disabled (for memory-constrained environments)
         enable_vision_cache = cfg.model.get('cache_vision_embeddings', False)  # Default to False for safety
 
-        model = LLaVAWrapper(
+        model = Idefics2Wrapper(
             model_name=cfg.model.name,
             device=device,
             load_in_8bit=cfg.model.load_in_8bit,
@@ -340,7 +340,7 @@ def compute_utilities_for_query(
     Compute marginal utilities for all candidates of a query.
 
     Args:
-        model: LLaVA model
+        model: Idefics2 model
         dataset: Dataset
         query_idx: Index of query example
         candidate_indices: Indices of candidate examples
@@ -507,7 +507,7 @@ def run_experiment(model, dataset, baseline_probs: Dict[int, float], cfg: DictCo
     Run the full marginal utility computation experiment.
 
     Args:
-        model: LLaVA model
+        model: Idefics2 model
         dataset: Dataset
         baseline_probs: Pre-computed baseline probabilities
         cfg: Configuration
@@ -649,7 +649,7 @@ def main(cfg: DictConfig):
     # Load CLIP embeddings
     load_clip_embeddings(dataset, cfg)
 
-    # Initialize LLaVA model
+    # Initialize Idefics2 model
     model = initialize_model(cfg)
 
     # Compute or load baseline probabilities

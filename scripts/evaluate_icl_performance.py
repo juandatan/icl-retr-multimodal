@@ -7,7 +7,7 @@ This script compares:
 
 For each method, we:
 - Select K in-context examples for each test query
-- Query LLaVA for classification
+- Query Idefics2 for classification
 - Measure accuracy
 
 Usage:
@@ -47,7 +47,7 @@ from data.mini_imagenet import MiniImageNetDataset
 from data.marginal_utility_dataset import InteractionFeaturesConfig
 from data.base_dataset import ClassificationExample
 from models.mlp_reranker import MLPReranker
-from models.llava_wrapper import LLaVAWrapper
+from models.idefics2_wrapper import Idefics2Wrapper
 from utils.multigpu_utils import MultiGPUManager, merge_dict_results
 from utils.imagenet_names import get_readable_name, get_synset_id, IMAGENET_SYNSET_TO_NAME
 
@@ -475,7 +475,7 @@ def _evaluate_queries(
     query_indices: List[int],
     test_dataset,
     retrieval_dataset,
-    llava_model: LLaVAWrapper,
+    llava_model: Idefics2Wrapper,
     retrieval_fn,
     k: int,
     candidate_pool_size: int,
@@ -499,7 +499,7 @@ def _evaluate_queries(
         query_indices: List of query indices to evaluate
         test_dataset: Test dataset
         retrieval_dataset: Dataset to retrieve ICL examples from
-        llava_model: LLaVA model for classification
+        llava_model: Idefics2 model for classification
         retrieval_fn: Function(query_emb, dataset, k) -> List[indices]
         k: Number of ICL examples to include in prompt
         candidate_pool_size: Number of candidates to retrieve and rerank
@@ -610,7 +610,7 @@ def _evaluate_queries(
         else:
             candidate_label_names = discriminative_candidate_labels
 
-        # Query LLaVA
+        # Query Idefics2
         if use_generative:
             predicted_label_text = llava_model.classify_with_context_generative(
                 query_image=query_image,
@@ -770,8 +770,8 @@ def evaluate_icl_worker(
             force_refresh=False
         )
 
-    # Initialize LLaVA
-    llava_model = LLaVAWrapper(
+    # Initialize Idefics2
+    llava_model = Idefics2Wrapper(
         model_name=llava_model_name,
         device=device,
         load_in_8bit=load_in_8bit
@@ -934,7 +934,7 @@ def evaluate_icl_multigpu(
 def evaluate_icl(
     test_dataset,
     retrieval_dataset,
-    llava_model: LLaVAWrapper,
+    llava_model: Idefics2Wrapper,
     retrieval_fn,
     k: int,
     num_queries: int = None,
@@ -952,7 +952,7 @@ def evaluate_icl(
     Args:
         test_dataset: Test examples to query on
         retrieval_dataset: Dataset to retrieve ICL examples from
-        llava_model: LLaVA model for classification
+        llava_model: Idefics2 model for classification
         retrieval_fn: Function(query_emb, retrieval_dataset, k) -> List[example_indices]
         k: Number of in-context examples
         num_queries: Number of test queries to evaluate (None = all)
@@ -1003,7 +1003,7 @@ def evaluate_icl(
         clip_text_features=clip_text_features,
         device=device,
         return_predictions=return_predictions,
-        progress_desc="Querying LLaVA",
+        progress_desc="Querying Idefics2",
         candidate_batch_size=candidate_batch_size,
         cache_path=None,  # Single-GPU uses external caching
         all_classes_label_mapping=all_classes_label_mapping
@@ -1057,10 +1057,10 @@ def main():
                         help="Number of candidates to retrieve and rerank (default: 50, aligned with paper)")
     parser.add_argument("--num-queries", type=int, default=None,
                         help="Number of test queries to evaluate (default: all)")
-    parser.add_argument("--llava-model", type=str, default="llava-hf/llava-1.5-7b-hf",
-                        help="LLaVA model to use")
+    parser.add_argument("--llava-model", type=str, default="HuggingFaceM4/idefics2-8b",
+                        help="Idefics2 model to use")
     parser.add_argument("--load-in-8bit", action="store_true",
-                        help="Load LLaVA in 8-bit mode")
+                        help="Load Idefics2 in 8-bit mode")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     parser.add_argument("--output", type=str, default=None,
@@ -1230,14 +1230,14 @@ def main():
                     force_refresh=args.force_refresh
                 )
 
-            # Initialize LLaVA
-            print(f"\nInitializing LLaVA model: {args.llava_model}")
-            llava_model = LLaVAWrapper(
+            # Initialize Idefics2
+            print(f"\nInitializing Idefics2 model: {args.llava_model}")
+            llava_model = Idefics2Wrapper(
                 model_name=args.llava_model,
                 device=device,
                 load_in_8bit=args.load_in_8bit
             )
-            print("✓ LLaVA model loaded")
+            print("✓ Idefics2 model loaded")
 
             # Evaluate CLIP similarity baseline
             print("\n" + "="*70)

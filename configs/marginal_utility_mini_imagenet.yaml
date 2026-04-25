@@ -47,7 +47,7 @@ retrieval:
 
 # Model configuration
 model:
-  name: "llava-hf/llava-1.5-7b-hf"
+  name: "HuggingFaceM4/idefics2-8b"
   load_in_8bit: false  # Use 8-bit quantization (requires CUDA)
   load_in_4bit: false  # Use 4-bit quantization (requires CUDA)
   device_map: "auto"  # Automatic device placement
@@ -55,7 +55,7 @@ model:
 
 # Computation configuration
 computation:
-  batch_size: 1  # Batch size for LLaVA inference (1 for CPU, 4-8 for GPU)
+  batch_size: 1  # Batch size for Idefics2 inference (1 for CPU, 4-8 for GPU)
   baseline_batch_size: 1  # Batch size for baseline computation (1 for CPU, 8+ for GPU)
   num_workers: 0  # Number of data loading workers
   cache_baselines: true  # Cache baseline probabilities to disk

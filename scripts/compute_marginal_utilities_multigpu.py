@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from data.dataclasses import MarginalUtilityResult
 from data.stanford_cars import StanfordCarsDataset
 from data.mini_imagenet import MiniImageNetDataset
-from models.llava_wrapper import LLaVAWrapper
+from models.idefics2_wrapper import Idefics2Wrapper
 from utils.kaggle_utils import (
     is_kaggle_environment,
     get_kaggle_checkpoint_dataset,
@@ -91,8 +91,8 @@ def load_clip_embeddings(dataset, cfg: DictConfig):
 
 
 def initialize_model(cfg: DictConfig, gpu_id: int):
-    """Initialize LLaVA model on specific GPU."""
-    print(f"[GPU {gpu_id}] Initializing LLaVA model...")
+    """Initialize Idefics2 model on specific GPU."""
+    print(f"[GPU {gpu_id}] Initializing Idefics2 model...")
     print(f"  Model: {cfg.model.name}")
     print(f"  Quantization: {'8-bit' if cfg.model.load_in_8bit else '4-bit' if cfg.model.load_in_4bit else 'None (fp16/fp32)'}")
 
@@ -101,7 +101,7 @@ def initialize_model(cfg: DictConfig, gpu_id: int):
         # Default to False for multi-GPU to prevent OOM on T4 GPUs
         enable_vision_cache = cfg.model.get('cache_vision_embeddings', False)
 
-        model = LLaVAWrapper(
+        model = Idefics2Wrapper(
             model_name=cfg.model.name,
             device=f"cuda:{gpu_id}",
             load_in_8bit=cfg.model.load_in_8bit,
@@ -377,8 +377,39 @@ def load_gpu_checkpoint(gpu_id: int, cfg: DictConfig, query_start: int, query_en
     return results, last_query
 
 
-def process_query_range(
+def _worker_with_gpu_isolation(
     gpu_id: int,
+    query_start: int,
+    query_end: int,
+    cfg: DictConfig,
+    return_dict: dict,
+    checkpoint_lock=None,
+    num_gpus: int = 1,
+) -> None:
+    """
+    Wrapper that sets CUDA_VISIBLE_DEVICES before importing CUDA.
+    This MUST be the entry point for multiprocessing to avoid OOM.
+    """
+    # CRITICAL: Set CUDA_VISIBLE_DEVICES FIRST before any CUDA operations
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+
+    # After setting CUDA_VISIBLE_DEVICES, the assigned GPU becomes cuda:0
+    # Pass the original gpu_id for logging, but use device_id=0 for actual device
+    process_query_range(
+        original_gpu_id=gpu_id,  # For logging and return_dict key
+        device_id=0,  # Always 0 since we only see one GPU
+        query_start=query_start,
+        query_end=query_end,
+        cfg=cfg,
+        return_dict=return_dict,
+        checkpoint_lock=checkpoint_lock,
+        num_gpus=num_gpus
+    )
+
+
+def process_query_range(
+    original_gpu_id: int,
+    device_id: int,
     query_start: int,
     query_end: int,
     cfg: DictConfig,
@@ -390,7 +421,8 @@ def process_query_range(
     Process a range of queries on a specific GPU.
 
     Args:
-        gpu_id: GPU device ID
+        original_gpu_id: Original GPU ID (for logging and return_dict key)
+        device_id: Local device ID (always 0 after CUDA_VISIBLE_DEVICES is set)
         query_start: Starting query index
         query_end: Ending query index (exclusive)
         cfg: Configuration
@@ -399,36 +431,39 @@ def process_query_range(
         num_gpus: Total number of GPUs being used
     """
     try:
-        # Set CUDA device for this process
-        torch.cuda.set_device(gpu_id)
+        # CUDA_VISIBLE_DEVICES is already set by wrapper
+        # This process only sees one GPU (cuda:0)
+        torch.cuda.set_device(device_id)
 
-        print(f"[GPU {gpu_id}] Processing queries {query_start} to {query_end-1}")
+        print(f"[GPU {original_gpu_id}] Processing queries {query_start} to {query_end-1}")
+        print(f"[GPU {original_gpu_id}] Using local device cuda:{device_id}")
 
         # Load dataset (each process needs its own copy)
         dataset = load_dataset(cfg)
         load_clip_embeddings(dataset, cfg)
 
         # Initialize model on this GPU
-        model = initialize_model(cfg, gpu_id)
+        # Since CUDA_VISIBLE_DEVICES is set, use device_id (which is 0)
+        model = initialize_model(cfg, device_id)
 
         # Load baseline probabilities
         baseline_probs = load_baseline_probs(cfg)
 
         # Try to load checkpoint for this GPU
-        print(f"[GPU {gpu_id}] Checking for checkpoints in: {Path(cfg.checkpoint.save_dir) / cfg.experiment.name / 'checkpoints'}")
-        all_results, last_completed = load_gpu_checkpoint(gpu_id, cfg, query_start, query_end, checkpoint_lock)
+        print(f"[GPU {original_gpu_id}] Checking for checkpoints in: {Path(cfg.checkpoint.save_dir) / cfg.experiment.name / 'checkpoints'}")
+        all_results, last_completed = load_gpu_checkpoint(original_gpu_id, cfg, query_start, query_end, checkpoint_lock)
 
         # Adjust start position if resuming
         resume_start = max(query_start, last_completed + 1)
         if resume_start > query_start:
-            print(f"[GPU {gpu_id}] ✓ Resuming from query {resume_start} (loaded {len(all_results)} existing results)")
+            print(f"[GPU {original_gpu_id}] ✓ Resuming from query {resume_start} (loaded {len(all_results)} existing results)")
         else:
-            print(f"[GPU {gpu_id}] Starting fresh from query {query_start}")
+            print(f"[GPU {original_gpu_id}] Starting fresh from query {query_start}")
 
         # Process queries
         # Configure tqdm based on environment
         tqdm_kwargs = {
-            'desc': f"GPU {gpu_id}",
+            'desc': f"GPU {original_gpu_id}",
             'initial': resume_start - query_start,
             'total': query_end - query_start,
             'leave': True,  # Keep the progress bar after completion
@@ -436,7 +471,7 @@ def process_query_range(
 
         # Only use position parameter in terminal (not in Kaggle notebooks)
         if not is_kaggle_environment():
-            tqdm_kwargs['position'] = gpu_id
+            tqdm_kwargs['position'] = original_gpu_id
 
         for query_idx in tqdm(range(resume_start, query_end), **tqdm_kwargs):
             # Retrieve candidates
@@ -467,35 +502,35 @@ def process_query_range(
                 # Print cache stats
                 cache_stats = model.get_cache_stats()
                 if cache_stats['cache_enabled']:
-                    print(f"\n[GPU {gpu_id}] Vision cache size: {cache_stats['cache_size']} images")
+                    print(f"\n[GPU {original_gpu_id}] Vision cache size: {cache_stats['cache_size']} images")
 
             # Clear vision cache periodically to prevent OOM (every 1000 queries)
             if (query_idx - resume_start + 1) % 1000 == 0:
-                print(f"\n[GPU {gpu_id}] Clearing vision cache to free memory...")
+                print(f"\n[GPU {original_gpu_id}] Clearing vision cache to free memory...")
                 model.clear_vision_cache()
                 torch.cuda.empty_cache()
 
             # Save checkpoint periodically (each GPU saves independently)
             if cfg.checkpoint.enabled and (query_idx + 1) % cfg.checkpoint.save_interval == 0:
                 # Upload to Kaggle every checkpoint save (every save_interval queries, default 100)
-                save_gpu_checkpoint(gpu_id, all_results, query_idx, cfg, upload_to_kaggle=True, checkpoint_lock=checkpoint_lock, num_gpus=num_gpus)
-                print(f"\n[GPU {gpu_id}] ✓ Checkpoint saved: query {query_idx}")
+                save_gpu_checkpoint(original_gpu_id, all_results, query_idx, cfg, upload_to_kaggle=True, checkpoint_lock=checkpoint_lock, num_gpus=num_gpus)
+                print(f"\n[GPU {original_gpu_id}] ✓ Checkpoint saved: query {query_idx}")
 
         # Save final checkpoint for this GPU and upload to Kaggle
         if cfg.checkpoint.enabled and len(all_results) > 0:
-            save_gpu_checkpoint(gpu_id, all_results, query_end - 1, cfg, upload_to_kaggle=True, checkpoint_lock=checkpoint_lock, num_gpus=num_gpus)
-            print(f"\n[GPU {gpu_id}] ✓ Final checkpoint saved")
+            save_gpu_checkpoint(original_gpu_id, all_results, query_end - 1, cfg, upload_to_kaggle=True, checkpoint_lock=checkpoint_lock, num_gpus=num_gpus)
+            print(f"\n[GPU {original_gpu_id}] ✓ Final checkpoint saved")
 
         # Store results in shared dictionary
-        return_dict[gpu_id] = all_results
+        return_dict[original_gpu_id] = all_results
 
-        print(f"\n[GPU {gpu_id}] ✓ Completed {len(all_results)} results")
+        print(f"\n[GPU {original_gpu_id}] ✓ Completed {len(all_results)} results")
 
     except Exception as e:
-        print(f"\n[GPU {gpu_id}] ❌ Error: {e}")
+        print(f"\n[GPU {original_gpu_id}] ❌ Error: {e}")
         import traceback
         traceback.print_exc()
-        return_dict[gpu_id] = []
+        return_dict[original_gpu_id] = []
 
 
 def save_results(results: List[MarginalUtilityResult], cfg: DictConfig):
@@ -572,7 +607,7 @@ def main(cfg: DictConfig):
     processes = []
     for gpu_id, start, end in query_ranges:
         p = mp.Process(
-            target=process_query_range,
+            target=_worker_with_gpu_isolation,
             args=(gpu_id, start, end, cfg, return_dict, checkpoint_lock, len(gpu_ids))
         )
         p.start()
