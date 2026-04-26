@@ -106,7 +106,7 @@ def initialize_model(cfg: DictConfig, gpu_id: int):
             device=f"cuda:{gpu_id}",
             load_in_8bit=cfg.model.load_in_8bit,
             load_in_4bit=cfg.model.load_in_4bit,
-            use_cache=True,
+            use_cache=False,  # Disabled for discriminative eval (no autoregressive generation)
             cache_vision_embeddings=enable_vision_cache,
             max_vision_cache_size=5000,  # Limit cache to prevent OOM
         )
@@ -167,7 +167,11 @@ def compute_utilities_for_query(
     baseline_probs: Dict[int, float],
     cfg: DictConfig
 ) -> List[MarginalUtilityResult]:
-    """Compute marginal utilities for all candidates of a query."""
+    """
+    Compute marginal utilities for all candidates of a query.
+
+    Uses vision feature caching to avoid re-encoding the query image for each candidate.
+    """
     query_example, query_image = dataset[query_idx]
     baseline_log_prob = baseline_probs[query_idx]
 
@@ -180,33 +184,28 @@ def compute_utilities_for_query(
         batch_indices = candidate_indices[batch_start:batch_end]
         batch_similarities = similarity_scores[batch_start:batch_end]
 
-        # Prepare batch data
-        query_images = []
-        query_labels = []
+        # Prepare batch data (example images only, query is cached)
         example_images = []
         example_labels = []
-        baseline_log_probs = []
 
         for candidate_idx in batch_indices:
             candidate_example, candidate_image = dataset[candidate_idx]
-
-            query_images.append(query_image)
-            query_labels.append(query_example.label_name)
             example_images.append(candidate_image)
             example_labels.append(candidate_example.label_name)
-            baseline_log_probs.append(baseline_log_prob)
 
-        # Compute utilities for batch
+        # Compute utilities for batch using cached query features
         try:
-            utilities = model.compute_marginal_utilities_batch(
-                query_images=query_images,
-                query_labels=query_labels,
+            utilities = model.compute_marginal_utilities_batch_cached(
+                query_image=query_image,  # Cached once per batch
+                query_label=query_example.label_name,
                 example_images=example_images,
                 example_labels=example_labels,
-                baseline_log_probs=baseline_log_probs
+                baseline_log_prob=baseline_log_prob
             )
         except Exception as e:
             print(f"\n⚠️  Error computing utilities for query {query_idx}: {e}")
+            import traceback
+            traceback.print_exc()
             continue
 
         # Create results
