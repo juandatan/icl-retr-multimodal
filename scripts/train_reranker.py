@@ -11,6 +11,7 @@ Usage:
 
 import sys
 from pathlib import Path
+from typing import Optional
 
 import hydra
 import matplotlib.pyplot as plt
@@ -37,6 +38,11 @@ from src.models.mlp_reranker import MLPReranker
 from src.models.cross_attention_reranker import CrossAttentionReranker
 from src.models.patch_cross_attention_reranker import PatchCrossAttentionReranker
 from src.utils.kaggle_utils import is_kaggle_environment, resolve_data_paths
+
+
+def is_main_process(rank: int) -> bool:
+    """Check if this is the main process (rank 0)."""
+    return rank == 0
 
 
 def set_seed(seed: int):
@@ -547,6 +553,8 @@ def plot_training_curves(
 @hydra.main(version_base=None, config_path="../configs", config_name="train_reranker")
 def main(cfg: DictConfig):
     """Main training function."""
+    rank = 0  # Default for single-GPU; overridden by DDP setup if multi-GPU
+
     print("=" * 70)
     print(f"Experiment: {cfg.experiment.name}")
     print(f"Description: {cfg.experiment.description}")
@@ -571,15 +579,20 @@ def main(cfg: DictConfig):
         required=True
     )
 
-    embeddings_path = resolve_data_paths(
-        local_path=cfg.data.embeddings_path,
-        kaggle_path=cfg.data.get('kaggle_embeddings_path', '/kaggle/input/d/juandatan/stanford-cars-clip/clip_embeddings_train.pkl'),
-        dataset_name='juandatan/stanford-cars-clip',
-        required=True
-    )
-
-    print(f"  Results: {results_path}")
-    print(f"  Embeddings: {embeddings_path}")
+    use_embeddings = cfg.data.get('use_embeddings', True)
+    if use_embeddings:
+        embeddings_path = resolve_data_paths(
+            local_path=cfg.data.embeddings_path,
+            kaggle_path=cfg.data.get('kaggle_embeddings_path', '/kaggle/input/d/juandatan/stanford-cars-clip/clip_embeddings_train.pkl'),
+            dataset_name='juandatan/stanford-cars-clip',
+            required=True
+        )
+        print(f"  Results: {results_path}")
+        print(f"  Embeddings: {embeddings_path}")
+    else:
+        embeddings_path = None
+        print(f"  Results: {results_path}")
+        print(f"  Embeddings: N/A (using raw images)")
 
     # Create interaction features config from model config
     print(f"\nReading interaction features from config...")

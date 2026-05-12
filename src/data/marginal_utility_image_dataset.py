@@ -179,9 +179,8 @@ class MarginalUtilityImageDataset(Dataset):
     def _load_image(self, image_idx: int) -> Image.Image:
         """Load and return PIL Image from base dataset."""
         try:
-            # Get example from base dataset
-            example = self.base_dataset.examples[image_idx]
-            return example.image
+            _, image = self.base_dataset[image_idx]
+            return image.convert('RGB')
         except Exception as e:
             print(f"Error loading image at index {image_idx}: {e}")
             # Return blank image as fallback

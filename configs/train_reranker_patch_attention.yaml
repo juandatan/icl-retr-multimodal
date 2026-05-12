@@ -11,6 +11,9 @@ data:
   # Dataset name (stanford_cars, mini_imagenet, etc.)
   dataset_name: "stanford_cars"
 
+  # Whether to load pre-computed embeddings (false for patch-based models)
+  use_embeddings: false
+
   # Marginal utility results
   results_path: "outputs/marginal_utilities/marginal_utility_stanford_cars/marginal_utilities_train.pkl"
 

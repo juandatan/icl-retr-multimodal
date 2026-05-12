@@ -10,6 +10,7 @@ experiment:
 # Data configuration
 data:
   # Local paths (used when running locally)
+  use_embeddings: true
   results_path: "outputs/marginal_utilities/marginal_utility_stanford_cars/marginal_utilities_train.pkl"
   embeddings_path: "data/stanford_cars/clip_embeddings_train.pkl"
 
