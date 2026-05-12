@@ -30,8 +30,12 @@ from src.data.marginal_utility_dataset import (
     MarginalUtilityDataset,
     PairwiseMarginalUtilityDataset,
 )
+from src.data.marginal_utility_image_dataset import MarginalUtilityImageDataset
+from src.data.stanford_cars import StanfordCarsDataset
+from src.data.mini_imagenet import MiniImageNetDataset
 from src.models.mlp_reranker import MLPReranker
 from src.models.cross_attention_reranker import CrossAttentionReranker
+from src.models.patch_cross_attention_reranker import PatchCrossAttentionReranker
 from src.utils.kaggle_utils import is_kaggle_environment, resolve_data_paths
 
 
@@ -98,10 +102,132 @@ def train_epoch(
     return total_loss / num_batches
 
 
+def _is_patch_model(model: nn.Module) -> bool:
+    """Check if model is a patch-based model."""
+    try:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        unwrapped = model.module if isinstance(model, DDP) else model
+    except:
+        unwrapped = model
+    return isinstance(unwrapped, PatchCrossAttentionReranker)
+
+
+def train_epoch_patch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: str,
+    grad_clip: float = 1.0,
+    rank: int = 0
+) -> float:
+    """Train for one epoch with patch-based model."""
+    model.train()
+    total_loss = 0.0
+    num_batches = 0
+
+    iterator = tqdm(dataloader, desc="Training (Patch)", leave=False, disable=(rank != 0))
+
+    for batch in iterator:
+        # Patch model: (query_image, example_image, similarity, utility)
+        query_img, example_img, similarity, utility = batch
+
+        # Move to device
+        query_img = query_img.to(device)
+        example_img = example_img.to(device)
+        similarity = similarity.to(device)
+        utility = utility.to(device)
+
+        # Forward pass
+        pred_utility = model(query_img, example_img, similarity)
+
+        # Compute loss
+        loss = criterion(pred_utility, utility)
+
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+
+        # Gradient clipping
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+        optimizer.step()
+
+        total_loss += loss.item()
+        num_batches += 1
+
+    return total_loss / num_batches
+
+
+@torch.no_grad()
+def evaluate_patch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    device: str,
+    rank: int = 0
+) -> dict:
+    """Evaluate patch-based model."""
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+
+    all_predictions = []
+    all_targets = []
+
+    iterator = tqdm(dataloader, desc="Evaluating (Patch)", leave=False, disable=(rank != 0))
+
+    for batch in iterator:
+        # Patch model: (query_image, example_image, similarity, utility)
+        query_img, example_img, similarity, utility = batch
+
+        # Move to device
+        query_img = query_img.to(device)
+        example_img = example_img.to(device)
+        similarity = similarity.to(device)
+        utility = utility.to(device)
+
+        # Forward pass
+        pred_utility = model(query_img, example_img, similarity)
+
+        # Compute loss
+        loss = criterion(pred_utility, utility)
+        total_loss += loss.item()
+        num_batches += 1
+
+        # Store predictions and targets
+        all_predictions.extend(pred_utility.cpu().numpy().flatten())
+        all_targets.extend(utility.cpu().numpy().flatten())
+
+    # Compute metrics
+    all_predictions = np.array(all_predictions)
+    all_targets = np.array(all_targets)
+
+    mse = np.mean((all_predictions - all_targets) ** 2)
+    mae = np.mean(np.abs(all_predictions - all_targets))
+
+    # R² score
+    ss_res = np.sum((all_targets - all_predictions) ** 2)
+    ss_tot = np.sum((all_targets - np.mean(all_targets)) ** 2)
+    r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+    # Spearman correlation
+    spearman_corr, _ = spearmanr(all_predictions, all_targets)
+
+    return {
+        'loss': total_loss / num_batches,
+        'mse': mse,
+        'mae': mae,
+        'r2': r2,
+        'spearman': spearman_corr
+    }
+
+
 def _unpack_and_forward(
     model: nn.Module,
     features: list,
-    interaction_features: InteractionFeaturesConfig
+    interaction_features: Optional[InteractionFeaturesConfig]
 ) -> torch.Tensor:
     """Helper to unpack features and run forward pass."""
     query_emb, example_emb, similarity = features[:3]
@@ -112,16 +238,17 @@ def _unpack_and_forward(
     difference = None
     l2_distance = None
 
-    feat_idx = 0
-    if interaction_features.use_product and feat_idx < len(interaction_feats):
-        product = interaction_feats[feat_idx]
-        feat_idx += 1
-    if interaction_features.use_difference and feat_idx < len(interaction_feats):
-        difference = interaction_feats[feat_idx]
-        feat_idx += 1
-    if interaction_features.use_l2_distance and feat_idx < len(interaction_feats):
-        l2_distance = interaction_feats[feat_idx]
-        feat_idx += 1
+    if interaction_features is not None:
+        feat_idx = 0
+        if interaction_features.use_product and feat_idx < len(interaction_feats):
+            product = interaction_feats[feat_idx]
+            feat_idx += 1
+        if interaction_features.use_difference and feat_idx < len(interaction_feats):
+            difference = interaction_feats[feat_idx]
+            feat_idx += 1
+        if interaction_features.use_l2_distance and feat_idx < len(interaction_feats):
+            l2_distance = interaction_feats[feat_idx]
+            feat_idx += 1
 
     return model(query_emb, example_emb, similarity,
                 product=product, difference=difference, l2_distance=l2_distance)
@@ -472,45 +599,88 @@ def main(cfg: DictConfig):
     loss_type = cfg.training.get('loss_type', 'huber')
     print(f"\nLoss type: {loss_type}")
 
-    # Map loss types to dataset classes
-    dataset_classes = {
-        'mse': MarginalUtilityDataset,
-        'huber': MarginalUtilityDataset,
-        'ranking': PairwiseMarginalUtilityDataset
-    }
+    # Check if using patch-based model (loads images instead of embeddings)
+    architecture = cfg.model.get('architecture', 'mlp')
+    use_patch_model = (architecture == 'patch_attention')
 
-    train_dataset_class = dataset_classes.get(loss_type, MarginalUtilityDataset)
+    if use_patch_model:
+        # Load base dataset for images
+        print(f"\nLoading base dataset for images...")
+        dataset_name = cfg.data.get('dataset_name', 'stanford_cars')
 
-    # Load datasets
-    print(f"\nLoading datasets...")
-    # Check if utilities should be normalized (can be set explicitly in config)
-    normalize_utilities = loss_type == 'bce' or cfg.training.get('normalize_utilities', False)
-    print(f"  Normalize utilities: {normalize_utilities}")
+        if dataset_name == 'stanford_cars':
+            base_dataset = StanfordCarsDataset(split='train')
+        elif dataset_name == 'mini_imagenet':
+            base_dataset = MiniImageNetDataset(split='train')
+        else:
+            raise ValueError(f"Unknown dataset: {dataset_name}")
 
-    train_dataset_kwargs = {
-        'results_path': results_path,
-        'embeddings_path': embeddings_path,
-        'split': 'train',
-        'seed': cfg.experiment.seed,
-        'interaction_features': interaction_features,
-        'normalize_utilities': normalize_utilities
-    }
+        print(f"✓ Loaded {dataset_name} dataset with {len(base_dataset)} examples")
 
-    # Add pairs_per_query for pairwise ranking dataset
-    if loss_type == 'ranking':
-        train_dataset_kwargs['pairs_per_query'] = cfg.training.get('pairs_per_query', 10)
+        # Load image datasets
+        print(f"\nLoading image datasets...")
+        normalize_utilities = loss_type == 'bce' or cfg.training.get('normalize_utilities', False)
+        image_size = cfg.model.get('image_size', 224)
 
-    train_dataset = train_dataset_class(**train_dataset_kwargs)
+        train_dataset = MarginalUtilityImageDataset(
+            results_path=results_path,
+            base_dataset=base_dataset,
+            split='train',
+            seed=cfg.experiment.seed,
+            image_size=image_size,
+            normalize_utilities=normalize_utilities
+        )
 
-    # Validation always uses regular dataset (for MSE/Spearman metrics)
-    val_dataset = MarginalUtilityDataset(
-        results_path=results_path,
-        embeddings_path=embeddings_path,
-        split='val',
-        seed=cfg.experiment.seed,
-        interaction_features=interaction_features,
-        normalize_utilities=normalize_utilities
-    )
+        val_dataset = MarginalUtilityImageDataset(
+            results_path=results_path,
+            base_dataset=base_dataset,
+            split='val',
+            seed=cfg.experiment.seed,
+            image_size=image_size,
+            normalize_utilities=normalize_utilities
+        )
+
+    else:
+        # Use embedding-based datasets (original behavior)
+        # Map loss types to dataset classes
+        dataset_classes = {
+            'mse': MarginalUtilityDataset,
+            'huber': MarginalUtilityDataset,
+            'ranking': PairwiseMarginalUtilityDataset
+        }
+
+        train_dataset_class = dataset_classes.get(loss_type, MarginalUtilityDataset)
+
+        # Load datasets
+        print(f"\nLoading datasets...")
+        # Check if utilities should be normalized (can be set explicitly in config)
+        normalize_utilities = loss_type == 'bce' or cfg.training.get('normalize_utilities', False)
+        print(f"  Normalize utilities: {normalize_utilities}")
+
+        train_dataset_kwargs = {
+            'results_path': results_path,
+            'embeddings_path': embeddings_path,
+            'split': 'train',
+            'seed': cfg.experiment.seed,
+            'interaction_features': interaction_features,
+            'normalize_utilities': normalize_utilities
+        }
+
+        # Add pairs_per_query for pairwise ranking dataset
+        if loss_type == 'ranking':
+            train_dataset_kwargs['pairs_per_query'] = cfg.training.get('pairs_per_query', 10)
+
+        train_dataset = train_dataset_class(**train_dataset_kwargs)
+
+        # Validation always uses regular dataset (for MSE/Spearman metrics)
+        val_dataset = MarginalUtilityDataset(
+            results_path=results_path,
+            embeddings_path=embeddings_path,
+            split='val',
+            seed=cfg.experiment.seed,
+            interaction_features=interaction_features,
+            normalize_utilities=normalize_utilities
+        )
 
     # Compute baseline
     baseline_mse_train = train_dataset.compute_baseline_mse()
@@ -542,12 +712,14 @@ def main(cfg: DictConfig):
     )
 
     # Create model
-    print(f"\nInitializing model...")
+    if is_main_process(rank):
+        print(f"\nInitializing model...")
     architecture = cfg.model.get('architecture', 'mlp')
     use_sigmoid = loss_type == 'bce' or cfg.model.get('use_sigmoid', False)
 
     if architecture == 'mlp':
-        print(f"  Architecture: MLP (concatenation-based)")
+        if is_main_process(rank):
+            print(f"  Architecture: MLP (concatenation-based)")
         model = MLPReranker(
             embedding_dim=cfg.model.embedding_dim,
             hidden_dims=cfg.model.hidden_dims,
@@ -555,9 +727,12 @@ def main(cfg: DictConfig):
             interaction_features=interaction_features,
             use_sigmoid=use_sigmoid
         )
-        print(f"  Input dimension: {2 * cfg.model.embedding_dim + 1 + interaction_features.num_features}")
+        if is_main_process(rank):
+            print(f"  Input dimension: {2 * cfg.model.embedding_dim + 1 + interaction_features.num_features}")
+
     elif architecture == 'cross_attention':
-        print(f"  Architecture: Cross-Attention")
+        if is_main_process(rank):
+            print(f"  Architecture: Cross-Attention")
         model = CrossAttentionReranker(
             embedding_dim=cfg.model.embedding_dim,
             hidden_dim=cfg.model.hidden_dim,
@@ -567,11 +742,35 @@ def main(cfg: DictConfig):
             dropout=cfg.model.dropout,
             use_sigmoid=use_sigmoid
         )
-        print(f"  Hidden dimension: {cfg.model.hidden_dim}")
-        print(f"  Attention heads: {cfg.model.num_attention_heads}")
-        print(f"  Attention layers: {cfg.model.num_attention_layers}")
+        if is_main_process(rank):
+            print(f"  Hidden dimension: {cfg.model.hidden_dim}")
+            print(f"  Attention heads: {cfg.model.num_attention_heads}")
+            print(f"  Attention layers: {cfg.model.num_attention_layers}")
+
+    elif architecture == 'patch_attention':
+        if is_main_process(rank):
+            print(f"  Architecture: Patch-Level Cross-Attention")
+        model = PatchCrossAttentionReranker(
+            clip_model_name=cfg.model.get('clip_model_name', 'ViT-B/32'),
+            hidden_dim=cfg.model.hidden_dim,
+            num_attention_heads=cfg.model.num_attention_heads,
+            num_attention_layers=cfg.model.num_attention_layers,
+            feedforward_dims=cfg.model.get('feedforward_dims', [256, 128]),
+            dropout=cfg.model.dropout,
+            use_sigmoid=use_sigmoid,
+            freeze_clip=cfg.model.get('freeze_clip', True),
+            pooling_method=cfg.model.get('pooling_method', 'cls')
+        )
+        if is_main_process(rank):
+            print(f"  CLIP model: {cfg.model.get('clip_model_name', 'ViT-B/32')}")
+            print(f"  Freeze CLIP: {cfg.model.get('freeze_clip', True)}")
+            print(f"  Hidden dimension: {cfg.model.hidden_dim}")
+            print(f"  Attention heads: {cfg.model.num_attention_heads}")
+            print(f"  Attention layers: {cfg.model.num_attention_layers}")
+            print(f"  Pooling method: {cfg.model.get('pooling_method', 'cls')}")
+
     else:
-        raise ValueError(f"Unknown architecture: {architecture}. Must be 'mlp' or 'cross_attention'")
+        raise ValueError(f"Unknown architecture: {architecture}. Must be 'mlp', 'cross_attention', or 'patch_attention'")
 
     model = model.to(device)
     print(f"  Parameters: {model.get_num_parameters():,}")
@@ -636,11 +835,19 @@ def main(cfg: DictConfig):
     val_calibration_errors = []
     val_top10_overlaps = []
 
+    # Detect if using patch model
+    is_patch_model_flag = _is_patch_model(model)
+
     for epoch in range(cfg.training.num_epochs):
         print(f"\nEpoch {epoch + 1}/{cfg.training.num_epochs}")
 
-        # Train (use appropriate training function based on loss type)
-        if loss_type == 'ranking':
+        # Train
+        if is_patch_model_flag:
+            train_loss = train_epoch_patch(
+                model, train_loader, criterion, optimizer, device,
+                grad_clip=cfg.training.gradient_clip
+            )
+        elif loss_type == 'ranking':
             train_loss = train_epoch_ranking(
                 model, train_loader, criterion, optimizer, device,
                 interaction_features=interaction_features,
@@ -654,7 +861,10 @@ def main(cfg: DictConfig):
             )
 
         # Validate
-        val_metrics = evaluate(model, val_loader, criterion, device, interaction_features, use_bce=(loss_type == 'bce'))
+        if is_patch_model_flag:
+            val_metrics = evaluate_patch(model, val_loader, criterion, device)
+        else:
+            val_metrics = evaluate(model, val_loader, criterion, device, interaction_features, use_bce=(loss_type == 'bce'))
 
         # Update scheduler
         scheduler.step()
