@@ -9,6 +9,7 @@ Usage:
     python scripts/train_reranker.py training.batch_size=128 training.learning_rate=1e-3
 """
 
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -17,10 +18,13 @@ import hydra
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 from scipy.stats import spearmanr
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 # Add project root to path to enable src.* imports
@@ -38,6 +42,24 @@ from src.models.mlp_reranker import MLPReranker
 from src.models.cross_attention_reranker import CrossAttentionReranker
 from src.models.patch_cross_attention_reranker import PatchCrossAttentionReranker
 from src.utils.kaggle_utils import is_kaggle_environment, resolve_data_paths
+
+
+def setup_ddp():
+    """Initialize DDP if running in distributed mode. Returns (rank, world_size, local_rank)."""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+        dist.init_process_group(backend='nccl')
+        torch.cuda.set_device(local_rank)
+        return rank, world_size, local_rank
+    return 0, 1, 0
+
+
+def cleanup_ddp():
+    """Clean up DDP resources."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def is_main_process(rank: int) -> bool:
@@ -110,11 +132,7 @@ def train_epoch(
 
 def _is_patch_model(model: nn.Module) -> bool:
     """Check if model is a patch-based model."""
-    try:
-        from torch.nn.parallel import DistributedDataParallel as DDP
-        unwrapped = model.module if isinstance(model, DDP) else model
-    except:
-        unwrapped = model
+    unwrapped = model.module if hasattr(model, 'module') else model
     return isinstance(unwrapped, PatchCrossAttentionReranker)
 
 
@@ -553,19 +571,28 @@ def plot_training_curves(
 @hydra.main(version_base=None, config_path="../configs", config_name="train_reranker")
 def main(cfg: DictConfig):
     """Main training function."""
-    rank = 0  # Default for single-GPU; overridden by DDP setup if multi-GPU
+    # Setup DDP if launched with torchrun
+    rank, world_size, local_rank = setup_ddp()
+    distributed = world_size > 1
 
-    print("=" * 70)
-    print(f"Experiment: {cfg.experiment.name}")
-    print(f"Description: {cfg.experiment.description}")
-    print("=" * 70)
+    if distributed:
+        device = f"cuda:{local_rank}"
+    else:
+        device = get_device(cfg)
+
+    if is_main_process(rank):
+        print("=" * 70)
+        print(f"Experiment: {cfg.experiment.name}")
+        print(f"Description: {cfg.experiment.description}")
+        print("=" * 70)
 
     # Set seed
     set_seed(cfg.experiment.seed)
 
-    # Get device
-    device = get_device(cfg)
-    print(f"\nDevice: {device}")
+    if is_main_process(rank):
+        if distributed:
+            print(f"\nDistributed training: {world_size} GPUs")
+        print(f"Device: {device}")
 
     # Resolve data paths (handles both local and Kaggle environments)
     print(f"\nResolving data paths...")
@@ -707,21 +734,27 @@ def main(cfg: DictConfig):
     print(f"  Train Spearman: {baseline_spearman_train:.4f}")
     print(f"  Val Spearman:   {baseline_spearman_val:.4f}")
 
-    # Create data loaders
+    # Create data loaders (with DistributedSampler for multi-GPU)
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if distributed else None
+    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False) if distributed else None
+
+    num_workers = cfg.training.get('num_workers', 0)
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg.training.batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=(device == "cuda")
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=("cuda" in str(device))
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=cfg.training.batch_size,
         shuffle=False,
-        num_workers=0,
-        pin_memory=(device == "cuda")
+        sampler=val_sampler,
+        num_workers=num_workers,
+        pin_memory=("cuda" in str(device))
     )
 
     # Create model
@@ -786,8 +819,18 @@ def main(cfg: DictConfig):
         raise ValueError(f"Unknown architecture: {architecture}. Must be 'mlp', 'cross_attention', or 'patch_attention'")
 
     model = model.to(device)
-    print(f"  Parameters: {model.get_num_parameters():,}")
-    print(f"  Use sigmoid output: {use_sigmoid}")
+
+    if is_main_process(rank):
+        print(f"  Parameters: {model.get_num_parameters():,}")
+        print(f"  Use sigmoid output: {use_sigmoid}")
+
+    # Wrap model for multi-GPU
+    if distributed:
+        model = DDP(model, device_ids=[local_rank])
+    elif torch.cuda.device_count() > 1:
+        if is_main_process(rank):
+            print(f"  Using DataParallel across {torch.cuda.device_count()} GPUs")
+        model = nn.DataParallel(model)
 
     # Loss function
     if loss_type == 'mse':
@@ -816,24 +859,25 @@ def main(cfg: DictConfig):
     )
 
     # Training loop
-    print(f"\nStarting training for {cfg.training.num_epochs} epochs...")
-    print("=" * 70)
+    if is_main_process(rank):
+        print(f"\nStarting training for {cfg.training.num_epochs} epochs...")
+        print("=" * 70)
 
     # Choose early stopping metric based on loss type
     if loss_type in ['bce', 'ranking']:
-        # For BCE and ranking: use Spearman correlation (higher is better)
         best_val_mse = float('inf')
         best_val_spearman = float('-inf')
         metric_name = 'spearman'
         metric_mode = 'max'
-        print(f"Early stopping based on: Spearman correlation (maximize)\n")
+        if is_main_process(rank):
+            print(f"Early stopping based on: Spearman correlation (maximize)\n")
     else:
-        # For regression losses: use MSE first, then Spearman as tiebreaker
         best_val_mse = float('inf')
         best_val_spearman = float('-inf')
         metric_name = 'mse'
         metric_mode = 'min'
-        print(f"Early stopping based on: MSE (minimize), then Spearman (maximize)\n")
+        if is_main_process(rank):
+            print(f"Early stopping based on: MSE (minimize), then Spearman (maximize)\n")
 
     patience_counter = 0
 
@@ -852,7 +896,12 @@ def main(cfg: DictConfig):
     is_patch_model_flag = _is_patch_model(model)
 
     for epoch in range(cfg.training.num_epochs):
-        print(f"\nEpoch {epoch + 1}/{cfg.training.num_epochs}")
+        # Set epoch on sampler for proper shuffling in DDP
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
+        if is_main_process(rank):
+            print(f"\nEpoch {epoch + 1}/{cfg.training.num_epochs}")
 
         # Train
         if is_patch_model_flag:
@@ -897,25 +946,23 @@ def main(cfg: DictConfig):
         if 'top10_overlap' in val_metrics:
             val_top10_overlaps.append(val_metrics['top10_overlap'])
 
-        # Print metrics
-        print(f"  Train Loss: {train_loss:.4f}")
-        print(f"  Val Loss:   {val_metrics['loss']:.4f}")
+        # Print metrics (rank 0 only)
+        if is_main_process(rank):
+            print(f"  Train Loss: {train_loss:.4f}")
+            print(f"  Val Loss:   {val_metrics['loss']:.4f}")
 
-        # Show different metrics based on loss type
-        if loss_type == 'bce':
-            # For BCE: focus on ranking and calibration
-            print(f"  Val Spearman:    {val_metrics['spearman']:.4f}  (ranking quality)")
-            print(f"  Val Calibration: {val_metrics['calibration_error']:.4f}  (prediction accuracy)")
-            print(f"  Val Top-10% Hit: {val_metrics['top10_overlap']:.2%}  (best examples ranked correctly)")
-            print(f"  Val MSE:         {val_metrics['mse']:.4f}  (on [0,1] scale)")
-        else:
-            # For regression losses: show traditional metrics
-            print(f"  Val MSE:    {val_metrics['mse']:.4f}")
-            print(f"  Val MAE:    {val_metrics['mae']:.4f}")
-            print(f"  Val R²:     {val_metrics['r2']:.4f}")
-            print(f"  Val Spearman: {val_metrics['spearman']:.4f}")
+            if loss_type == 'bce':
+                print(f"  Val Spearman:    {val_metrics['spearman']:.4f}  (ranking quality)")
+                print(f"  Val Calibration: {val_metrics['calibration_error']:.4f}  (prediction accuracy)")
+                print(f"  Val Top-10% Hit: {val_metrics['top10_overlap']:.2%}  (best examples ranked correctly)")
+                print(f"  Val MSE:         {val_metrics['mse']:.4f}  (on [0,1] scale)")
+            else:
+                print(f"  Val MSE:    {val_metrics['mse']:.4f}")
+                print(f"  Val MAE:    {val_metrics['mae']:.4f}")
+                print(f"  Val R²:     {val_metrics['r2']:.4f}")
+                print(f"  Val Spearman: {val_metrics['spearman']:.4f}")
 
-        print(f"  LR:         {optimizer.param_groups[0]['lr']:.6f}")
+            print(f"  LR:         {optimizer.param_groups[0]['lr']:.6f}")
 
         # Save best model based on two-stage criteria: MSE first, then Spearman
         current_mse = val_metrics['mse']
@@ -943,49 +990,57 @@ def main(cfg: DictConfig):
             best_val_spearman = current_spearman
             patience_counter = 0
 
-            if cfg.checkpoint.enabled:
+            if cfg.checkpoint.enabled and is_main_process(rank):
+                # Save unwrapped model state for DDP/DataParallel
+                model_to_save = model.module if hasattr(model, 'module') else model
                 checkpoint_path = Path(cfg.checkpoint.save_dir) / cfg.experiment.name / "best_model.pt"
-                save_checkpoint(model, optimizer, epoch, val_metrics, cfg, checkpoint_path)
+                save_checkpoint(model_to_save, optimizer, epoch, val_metrics, cfg, checkpoint_path)
                 print(f"  ✓ Saved best model (MSE: {best_val_mse:.4f}, Spearman: {best_val_spearman:.4f})")
         else:
             patience_counter += 1
 
         # Early stopping
         if patience_counter >= cfg.training.early_stopping_patience:
-            print(f"\nEarly stopping triggered after {epoch + 1} epochs")
+            if is_main_process(rank):
+                print(f"\nEarly stopping triggered after {epoch + 1} epochs")
             break
 
         # Regular checkpoint
-        if cfg.checkpoint.enabled and (epoch + 1) % cfg.checkpoint.get("save_interval", 10) == 0:
+        if cfg.checkpoint.enabled and is_main_process(rank) and (epoch + 1) % cfg.checkpoint.get("save_interval", 10) == 0:
+            model_to_save = model.module if hasattr(model, 'module') else model
             checkpoint_path = Path(cfg.checkpoint.save_dir) / cfg.experiment.name / f"epoch_{epoch+1}.pt"
-            save_checkpoint(model, optimizer, epoch, val_metrics, cfg, checkpoint_path)
+            save_checkpoint(model_to_save, optimizer, epoch, val_metrics, cfg, checkpoint_path)
 
-    # Final evaluation
-    print("\n" + "=" * 70)
-    print("Training complete!")
-    print(f"Best validation MSE: {best_val_mse:.4f}")
-    print(f"Best validation Spearman: {best_val_spearman:.4f}")
-    if metric_name == 'mse':
-        print(f"Baseline MSE: {baseline_mse_val:.4f}")
-        print(f"MSE Improvement: {(1 - best_val_mse / baseline_mse_val) * 100:.1f}%")
-    print(f"Baseline Spearman: {baseline_spearman_val:.4f}")
-    print(f"Spearman Improvement: {(best_val_spearman - baseline_spearman_val) / baseline_spearman_val * 100:.1f}%")
-    print("=" * 70)
+    # Final evaluation (rank 0 only)
+    if is_main_process(rank):
+        print("\n" + "=" * 70)
+        print("Training complete!")
+        print(f"Best validation MSE: {best_val_mse:.4f}")
+        print(f"Best validation Spearman: {best_val_spearman:.4f}")
+        if metric_name == 'mse':
+            print(f"Baseline MSE: {baseline_mse_val:.4f}")
+            print(f"MSE Improvement: {(1 - best_val_mse / baseline_mse_val) * 100:.1f}%")
+        print(f"Baseline Spearman: {baseline_spearman_val:.4f}")
+        print(f"Spearman Improvement: {(best_val_spearman - baseline_spearman_val) / baseline_spearman_val * 100:.1f}%")
+        print("=" * 70)
 
-    # Plot training curves
-    if cfg.checkpoint.enabled:
-        plot_dir = Path(cfg.checkpoint.save_dir) / cfg.experiment.name
-        plot_training_curves(
-            train_losses=train_losses,
-            val_losses=val_losses,
-            val_mses=val_mses,
-            val_maes=val_maes,
-            val_r2s=val_r2s,
-            val_spearmans=val_spearmans,
-            learning_rates=learning_rates,
-            save_dir=plot_dir,
-            cfg=cfg
-        )
+        # Plot training curves
+        if cfg.checkpoint.enabled:
+            plot_dir = Path(cfg.checkpoint.save_dir) / cfg.experiment.name
+            plot_training_curves(
+                train_losses=train_losses,
+                val_losses=val_losses,
+                val_mses=val_mses,
+                val_maes=val_maes,
+                val_r2s=val_r2s,
+                val_spearmans=val_spearmans,
+                learning_rates=learning_rates,
+                save_dir=plot_dir,
+                cfg=cfg
+            )
+
+    # Clean up DDP
+    cleanup_ddp()
 
 
 if __name__ == "__main__":
