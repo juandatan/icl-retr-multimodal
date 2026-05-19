@@ -19,6 +19,35 @@ import clip
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
+class CLIPPatchExtractor(nn.Module):
+    """Lightweight CLIP patch feature extractor (no trainable parameters)."""
+
+    def __init__(self, clip_model_name: str = "ViT-B/32"):
+        super().__init__()
+        self.clip_model, _ = clip.load(clip_model_name, device="cpu")
+        for param in self.clip_model.parameters():
+            param.requires_grad = False
+
+    @torch.no_grad()
+    def extract_patch_features(self, images: torch.Tensor) -> torch.Tensor:
+        """Extract patch-level features from CLIP ViT (before pooling)."""
+        x = self.clip_model.visual.conv1(images)
+        x = x.reshape(x.shape[0], x.shape[1], -1)
+        x = x.permute(0, 2, 1)
+        x = torch.cat([
+            self.clip_model.visual.class_embedding.to(x.dtype) + torch.zeros(
+                x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device
+            ),
+            x
+        ], dim=1)
+        x = x + self.clip_model.visual.positional_embedding.to(x.dtype)
+        x = self.clip_model.visual.ln_pre(x)
+        x = x.permute(1, 0, 2)
+        x = self.clip_model.visual.transformer(x)
+        x = x.permute(1, 0, 2)
+        return x
+
+
 class PatchCrossAttentionReranker(nn.Module):
     """
     Cross-attention reranker operating on image patches.
@@ -159,24 +188,30 @@ class PatchCrossAttentionReranker(nn.Module):
 
     def forward(
         self,
-        query_images: torch.Tensor,
-        example_images: torch.Tensor,
+        query_input: torch.Tensor,
+        example_input: torch.Tensor,
         similarity: torch.Tensor
     ) -> torch.Tensor:
         """
         Forward pass with patch-level cross-attention.
 
         Args:
-            query_images: Query images, shape (batch, 3, H, W)
-            example_images: Example images, shape (batch, 3, H, W)
+            query_input: Either query images (batch, 3, H, W) or pre-extracted
+                         patch features (batch, num_patches, embed_dim)
+            example_input: Either example images (batch, 3, H, W) or pre-extracted
+                           patch features (batch, num_patches, embed_dim)
             similarity: CLIP similarity scores, shape (batch, 1)
 
         Returns:
             Predicted utilities, shape (batch, 1)
         """
-        # Extract patch features
-        query_patches = self.extract_patch_features(query_images)
-        example_patches = self.extract_patch_features(example_images)
+        # Detect if input is images (4D) or pre-extracted patches (3D)
+        if query_input.dim() == 4:
+            query_patches = self.extract_patch_features(query_input)
+            example_patches = self.extract_patch_features(example_input)
+        else:
+            query_patches = query_input
+            example_patches = example_input
 
         # Project to hidden dimension
         query_hidden = self.query_projection(query_patches)

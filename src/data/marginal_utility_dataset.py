@@ -12,8 +12,6 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from unittest import result
-
 import numpy as np
 import torch
 from torch.utils.data import Dataset

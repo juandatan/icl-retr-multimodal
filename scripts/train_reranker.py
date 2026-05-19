@@ -35,12 +35,12 @@ from src.data.marginal_utility_dataset import (
     MarginalUtilityDataset,
     PairwiseMarginalUtilityDataset,
 )
-from src.data.marginal_utility_image_dataset import MarginalUtilityImageDataset
+from src.data.marginal_utility_image_dataset import MarginalUtilityImageDataset, CachedPatchFeatureDataset
 from src.data.stanford_cars import StanfordCarsDataset
 from src.data.mini_imagenet import MiniImageNetDataset
 from src.models.mlp_reranker import MLPReranker
 from src.models.cross_attention_reranker import CrossAttentionReranker
-from src.models.patch_cross_attention_reranker import PatchCrossAttentionReranker
+from src.models.patch_cross_attention_reranker import PatchCrossAttentionReranker, CLIPPatchExtractor
 from src.utils.kaggle_utils import is_kaggle_environment, resolve_data_paths
 
 
@@ -645,7 +645,8 @@ def main(cfg: DictConfig):
 
     if use_patch_model:
         # Load base dataset for images
-        print(f"\nLoading base dataset for images...")
+        if is_main_process(rank):
+            print(f"\nLoading base dataset for images...")
         dataset_name = cfg.data.get('dataset_name', 'stanford_cars')
 
         if dataset_name == 'stanford_cars':
@@ -655,30 +656,66 @@ def main(cfg: DictConfig):
         else:
             raise ValueError(f"Unknown dataset: {dataset_name}")
 
-        print(f"✓ Loaded {dataset_name} dataset with {len(base_dataset)} examples")
+        if is_main_process(rank):
+            print(f"✓ Loaded {dataset_name} dataset with {len(base_dataset)} examples")
 
-        # Load image datasets
-        print(f"\nLoading image datasets...")
+        # Build a lightweight extractor (only CLIP, no cross-attention layers)
+        if is_main_process(rank):
+            print(f"\nPre-extracting CLIP patch features (one-time cost)...")
+        extract_model = CLIPPatchExtractor(
+            clip_model_name=cfg.model.get('clip_model_name', 'ViT-B/32')
+        ).to(device)
+
         normalize_utilities = loss_type == 'bce' or cfg.training.get('normalize_utilities', False)
-        image_size = cfg.model.get('image_size', 224)
+        cache_dir = cfg.checkpoint.get('save_dir', 'outputs/reranker_checkpoints')
 
-        train_dataset = MarginalUtilityImageDataset(
-            results_path=results_path,
-            base_dataset=base_dataset,
+        # Load results once and split (avoids redundant pickle loading)
+        import pickle as _pickle
+        if is_main_process(rank):
+            print(f"  Loading marginal utility results...")
+        with open(results_path, 'rb') as f:
+            all_results = _pickle.load(f)['results']
+
+        utility_min = utility_max = None
+        if normalize_utilities:
+            all_utilities = np.array([r['marginal_utility'] if isinstance(r, dict) else r.marginal_utility for r in all_results])
+            utility_min, utility_max = float(all_utilities.min()), float(all_utilities.max())
+
+        train_results, val_results, _ = MarginalUtilityImageDataset.split_by_query(
+            all_results, seed=cfg.experiment.seed
+        )
+
+        # Extract features once for all unique images across both splits
+        train_dataset = CachedPatchFeatureDataset(
+            results=train_results,
             split='train',
-            seed=cfg.experiment.seed,
-            image_size=image_size,
-            normalize_utilities=normalize_utilities
+            base_dataset=base_dataset,
+            patch_model=extract_model,
+            normalize_utilities=normalize_utilities,
+            utility_min=utility_min,
+            utility_max=utility_max,
+            cache_path=f"{cache_dir}/{cfg.experiment.name}/patch_cache_train.pt",
+            extraction_batch_size=cfg.training.get('extraction_batch_size', 64),
+            device=device
         )
 
-        val_dataset = MarginalUtilityImageDataset(
-            results_path=results_path,
-            base_dataset=base_dataset,
+        val_dataset = CachedPatchFeatureDataset(
+            results=val_results,
             split='val',
-            seed=cfg.experiment.seed,
-            image_size=image_size,
-            normalize_utilities=normalize_utilities
+            base_dataset=base_dataset,
+            patch_model=extract_model,
+            normalize_utilities=normalize_utilities,
+            utility_min=utility_min,
+            utility_max=utility_max,
+            cache_path=f"{cache_dir}/{cfg.experiment.name}/patch_cache_val.pt",
+            extraction_batch_size=cfg.training.get('extraction_batch_size', 64),
+            device=device
         )
+
+        # Free extraction model memory
+        del extract_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     else:
         # Use embedding-based datasets (original behavior)

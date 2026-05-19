@@ -24,6 +24,19 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from data.dataclasses import MarginalUtilityResult
 
 
+def clip_transform(image_size: int = 224) -> transforms.Compose:
+    """Standard CLIP image preprocessing transform."""
+    return transforms.Compose([
+        transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(image_size),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.48145466, 0.4578275, 0.40821073],
+            std=[0.26862954, 0.26130258, 0.27577711]
+        )
+    ])
+
+
 class MarginalUtilityImageDataset(Dataset):
     """
     Image-based dataset for training reranker to predict marginal utilities.
@@ -105,16 +118,7 @@ class MarginalUtilityImageDataset(Dataset):
         print(f"✓ {split.upper()} split: {len(self.results)} pairs from "
               f"{len(set(query_indices))} queries")
 
-        # Setup image transforms (CLIP preprocessing)
-        self.transform = transforms.Compose([
-            transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(image_size),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.48145466, 0.4578275, 0.40821073],  # CLIP mean
-                std=[0.26862954, 0.26130258, 0.27577711]   # CLIP std
-            )
-        ])
+        self.transform = clip_transform(image_size)
 
     @staticmethod
     def _get_attr(obj, key):
@@ -254,6 +258,156 @@ class MarginalUtilityImageDataset(Dataset):
 
         spearman_corr, _ = spearmanr(similarities, utilities)
         return float(spearman_corr)
+
+
+class CachedPatchFeatureDataset(Dataset):
+    """
+    Dataset that serves pre-extracted CLIP patch features.
+
+    Extracts patch features for all images once at initialization, then serves
+    them as tensors during training. This avoids repeated CLIP forward passes
+    and HuggingFace dataset access during training, enabling safe multi-GPU use.
+    """
+
+    def __init__(
+        self,
+        results: List,
+        split: str,
+        base_dataset,
+        patch_model,
+        normalize_utilities: bool = False,
+        utility_min: Optional[float] = None,
+        utility_max: Optional[float] = None,
+        cache_path: Optional[str] = None,
+        extraction_batch_size: int = 64,
+        device: str = 'cuda',
+        feature_cache: Optional[Dict] = None,
+    ):
+        """
+        Args:
+            results: Pre-split list of result dicts/objects for this split.
+            split: Split name (for logging only).
+            base_dataset: Dataset providing images by index.
+            patch_model: Model with extract_patch_features() method.
+            normalize_utilities: Whether to normalize utilities to [0, 1].
+            utility_min: Pre-computed min utility (required if normalize_utilities).
+            utility_max: Pre-computed max utility (required if normalize_utilities).
+            cache_path: Path to save/load cached features.
+            extraction_batch_size: Batch size for feature extraction.
+            device: Device for feature extraction.
+            feature_cache: Pre-computed feature cache dict (skips extraction if provided).
+        """
+        self.split = split
+        self.results = results
+        self.normalize_utilities = normalize_utilities
+        self.utility_min = utility_min
+        self.utility_max = utility_max
+        self.utility_range = (utility_max - utility_min) if utility_min is not None and utility_max is not None else None
+
+        query_indices = [self._get_attr(r, 'query_idx') for r in self.results]
+        print(f"✓ {split.upper()} split: {len(self.results)} pairs from "
+              f"{len(set(query_indices))} queries")
+
+        # Use provided cache or extract features
+        if feature_cache is not None:
+            self.feature_cache = feature_cache
+        else:
+            self._extract_and_cache_features(
+                base_dataset, patch_model, cache_path, extraction_batch_size, device
+            )
+
+    def _extract_and_cache_features(self, base_dataset, patch_model, cache_path, batch_size, device):
+        """Extract CLIP patch features for all unique images used in this split."""
+        import os
+        from tqdm import tqdm
+
+        # Find all unique image indices
+        all_indices = set()
+        for r in self.results:
+            all_indices.add(self._get_attr(r, 'query_idx'))
+            all_indices.add(self._get_attr(r, 'example_idx'))
+        unique_indices = sorted(all_indices)
+        print(f"  Extracting patch features for {len(unique_indices)} unique images...")
+
+        # Check for cache
+        if cache_path and os.path.exists(cache_path):
+            print(f"  Loading cached features from {cache_path}")
+            self.feature_cache = torch.load(cache_path, map_location='cpu')
+            print(f"  ✓ Loaded {len(self.feature_cache)} cached features")
+            return
+
+        transform = clip_transform(224)
+
+        # Extract features in batches
+        patch_model.eval()
+        self.feature_cache = {}
+
+        with torch.no_grad():
+            for batch_start in tqdm(range(0, len(unique_indices), batch_size),
+                                     desc=f"  Extracting patches ({self.split})"):
+                batch_indices = unique_indices[batch_start:batch_start + batch_size]
+                images = []
+
+                for idx in batch_indices:
+                    try:
+                        _, img = base_dataset[idx]
+                        images.append(transform(img.convert('RGB')))
+                    except Exception as e:
+                        # Fallback grey image
+                        images.append(torch.zeros(3, 224, 224))
+
+                image_batch = torch.stack(images).to(device)
+                features = patch_model.extract_patch_features(image_batch)
+                features = features.cpu().half()  # Store as float16 to save memory
+
+                for i, idx in enumerate(batch_indices):
+                    self.feature_cache[idx] = features[i]
+
+        print(f"  ✓ Cached {len(self.feature_cache)} patch feature tensors")
+
+        # Save cache if path provided
+        if cache_path:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            torch.save(self.feature_cache, cache_path)
+            print(f"  ✓ Saved cache to {cache_path}")
+
+    @staticmethod
+    def _get_attr(obj, key):
+        if isinstance(obj, dict):
+            return obj[key]
+        return getattr(obj, key)
+
+    def __len__(self):
+        return len(self.results)
+
+    def __getitem__(self, idx):
+        result = self.results[idx]
+        query_idx = self._get_attr(result, 'query_idx')
+        example_idx = self._get_attr(result, 'example_idx')
+        similarity_score = self._get_attr(result, 'similarity_score')
+        marginal_utility = self._get_attr(result, 'marginal_utility')
+
+        query_features = self.feature_cache[query_idx].float()
+        example_features = self.feature_cache[example_idx].float()
+        similarity = torch.tensor([similarity_score], dtype=torch.float32)
+
+        if self.normalize_utilities and self.utility_range and self.utility_range > 0:
+            marginal_utility = (marginal_utility - self.utility_min) / self.utility_range
+        utility = torch.tensor([marginal_utility], dtype=torch.float32)
+
+        return query_features, example_features, similarity, utility
+
+    def compute_baseline_mse(self) -> float:
+        utilities = np.array([self._get_attr(r, 'marginal_utility') for r in self.results])
+        similarities = np.array([self._get_attr(r, 'similarity_score') for r in self.results])
+        return float(np.mean((utilities - similarities) ** 2))
+
+    def compute_baseline_spearman(self) -> float:
+        from scipy.stats import spearmanr
+        utilities = np.array([self._get_attr(r, 'marginal_utility') for r in self.results])
+        similarities = np.array([self._get_attr(r, 'similarity_score') for r in self.results])
+        corr, _ = spearmanr(similarities, utilities)
+        return float(corr)
 
 
 if __name__ == "__main__":
