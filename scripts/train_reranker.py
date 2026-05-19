@@ -425,9 +425,10 @@ def save_checkpoint(
     epoch: int,
     metrics: dict,
     cfg: DictConfig,
-    filepath: Path
+    filepath: Path,
+    upload_to_kaggle: bool = False
 ):
-    """Save model checkpoint."""
+    """Save model checkpoint and optionally upload to Kaggle."""
     filepath.parent.mkdir(parents=True, exist_ok=True)
 
     checkpoint = {
@@ -439,6 +440,68 @@ def save_checkpoint(
     }
 
     torch.save(checkpoint, filepath)
+
+    if upload_to_kaggle and is_kaggle_environment():
+        kaggle_dataset = os.environ.get('KAGGLE_MODEL_DATASET', '')
+        if kaggle_dataset:
+            _upload_model_to_kaggle(filepath.parent, kaggle_dataset, cfg.experiment.name)
+
+
+def _upload_model_to_kaggle(checkpoint_dir: Path, dataset_name: str, experiment_name: str):
+    """Upload model checkpoints to a Kaggle dataset."""
+    import tempfile
+    import shutil
+    import subprocess
+    import json
+
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+
+            # Copy all .pt files from checkpoint dir
+            pt_files = sorted(checkpoint_dir.glob("*.pt"))
+            if not pt_files:
+                return
+
+            for pt_file in pt_files:
+                shutil.copy(pt_file, temp_path / pt_file.name)
+
+            # Create metadata
+            username, dataset_slug = dataset_name.split('/')
+            metadata = {
+                "title": f"{experiment_name} Model Checkpoints",
+                "id": f"{username}/{dataset_slug}",
+                "licenses": [{"name": "CC0-1.0"}]
+            }
+            with open(temp_path / "dataset-metadata.json", 'w') as f:
+                json.dump(metadata, f, indent=2)
+
+            # Check if dataset exists
+            result = subprocess.run(
+                ['kaggle', 'datasets', 'status', dataset_name],
+                capture_output=True, text=True
+            )
+            dataset_exists = result.returncode == 0
+
+            if dataset_exists:
+                result = subprocess.run(
+                    ['kaggle', 'datasets', 'version', '-p', str(temp_path),
+                     '-m', f'Epoch update: {pt_files[-1].name}', '--dir-mode', 'zip'],
+                    capture_output=True, text=True, timeout=300
+                )
+            else:
+                result = subprocess.run(
+                    ['kaggle', 'datasets', 'create', '-p', str(temp_path), '--dir-mode', 'zip'],
+                    capture_output=True, text=True, timeout=300
+                )
+
+            if result.returncode == 0:
+                print(f"  ✓ Uploaded model checkpoint to Kaggle ({dataset_name})")
+            else:
+                print(f"  ⚠️  Kaggle upload failed: {result.stderr[:100]}")
+
+    except Exception as e:
+        print(f"  ⚠️  Kaggle upload error: {e}")
 
 
 def plot_training_curves(
@@ -1031,7 +1094,7 @@ def main(cfg: DictConfig):
                 # Save unwrapped model state for DDP/DataParallel
                 model_to_save = model.module if hasattr(model, 'module') else model
                 checkpoint_path = Path(cfg.checkpoint.save_dir) / cfg.experiment.name / "best_model.pt"
-                save_checkpoint(model_to_save, optimizer, epoch, val_metrics, cfg, checkpoint_path)
+                save_checkpoint(model_to_save, optimizer, epoch, val_metrics, cfg, checkpoint_path, upload_to_kaggle=True)
                 print(f"  ✓ Saved best model (MSE: {best_val_mse:.4f}, Spearman: {best_val_spearman:.4f})")
         else:
             patience_counter += 1
@@ -1046,7 +1109,7 @@ def main(cfg: DictConfig):
         if cfg.checkpoint.enabled and is_main_process(rank) and (epoch + 1) % cfg.checkpoint.get("save_interval", 10) == 0:
             model_to_save = model.module if hasattr(model, 'module') else model
             checkpoint_path = Path(cfg.checkpoint.save_dir) / cfg.experiment.name / f"epoch_{epoch+1}.pt"
-            save_checkpoint(model_to_save, optimizer, epoch, val_metrics, cfg, checkpoint_path)
+            save_checkpoint(model_to_save, optimizer, epoch, val_metrics, cfg, checkpoint_path, upload_to_kaggle=True)
 
     # Final evaluation (rank 0 only)
     if is_main_process(rank):
