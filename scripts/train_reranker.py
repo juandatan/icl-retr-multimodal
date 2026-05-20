@@ -12,7 +12,7 @@ Usage:
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import hydra
 import matplotlib.pyplot as plt
@@ -419,6 +419,57 @@ def evaluate(
     return metrics
 
 
+def _find_resume_checkpoint(cfg: DictConfig) -> Optional[Path]:
+    """Find the latest checkpoint to resume from. Downloads from Kaggle if needed."""
+    checkpoint_dir = Path(cfg.checkpoint.save_dir) / cfg.experiment.name
+
+    # If no local checkpoint, try downloading from Kaggle
+    has_local = checkpoint_dir.exists() and next(checkpoint_dir.glob("*.pt"), None) is not None
+    if not has_local and is_kaggle_environment():
+        kaggle_dataset = os.environ.get('KAGGLE_MODEL_DATASET', '')
+        if kaggle_dataset:
+            _download_checkpoint_from_kaggle(checkpoint_dir, kaggle_dataset)
+
+    if not checkpoint_dir.exists():
+        return None
+
+    # Prefer latest.pt (saved every epoch)
+    latest_path = checkpoint_dir / "latest.pt"
+    if latest_path.exists():
+        return latest_path
+
+    # Fall back to best_model.pt
+    best_path = checkpoint_dir / "best_model.pt"
+    if best_path.exists():
+        return best_path
+
+    return None
+
+
+def _download_checkpoint_from_kaggle(checkpoint_dir: Path, dataset_name: str):
+    """Load model checkpoints from Kaggle mounted input or local filesystem."""
+    import shutil
+
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # Try mounted Kaggle input path (/kaggle/input/datasets/<username>/<slug>)
+    kaggle_input_path = Path(f"/kaggle/input/datasets/{dataset_name}")
+    if kaggle_input_path.exists():
+        pt_files = [
+            f for f in kaggle_input_path.glob("*.pt")
+            if not f.name.startswith("patch_cache")
+        ]
+        for pt_file in pt_files:
+            shutil.copy(pt_file, checkpoint_dir / pt_file.name)
+        if pt_files:
+            print(f"  ✓ Copied {len(pt_files)} checkpoint(s) from {kaggle_input_path}")
+        else:
+            print(f"  ⚠️  No model .pt files at {kaggle_input_path}")
+        return
+
+    print(f"  ⚠️  Kaggle input not found at {kaggle_input_path}")
+
+
 def save_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -426,7 +477,9 @@ def save_checkpoint(
     metrics: dict,
     cfg: DictConfig,
     filepath: Path,
-    upload_to_kaggle: bool = False
+    upload_to_kaggle: bool = False,
+    scheduler=None,
+    best_metrics: Optional[dict] = None
 ):
     """Save model checkpoint and optionally upload to Kaggle."""
     filepath.parent.mkdir(parents=True, exist_ok=True)
@@ -438,6 +491,10 @@ def save_checkpoint(
         'metrics': metrics,
         'config': OmegaConf.to_container(cfg, resolve=True)
     }
+    if scheduler is not None:
+        checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+    if best_metrics is not None:
+        checkpoint['best_metrics'] = best_metrics
 
     torch.save(checkpoint, filepath)
 
@@ -458,8 +515,11 @@ def _upload_model_to_kaggle(checkpoint_dir: Path, dataset_name: str, experiment_
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
 
-            # Copy all .pt files from checkpoint dir
-            pt_files = sorted(checkpoint_dir.glob("*.pt"))
+            # Copy model checkpoint .pt files (exclude large cache files)
+            pt_files = sorted(
+                f for f in checkpoint_dir.glob("*.pt")
+                if not f.name.startswith("patch_cache")
+            )
             if not pt_files:
                 return
 
@@ -502,6 +562,46 @@ def _upload_model_to_kaggle(checkpoint_dir: Path, dataset_name: str, experiment_
 
     except Exception as e:
         print(f"  ⚠️  Kaggle upload error: {e}")
+
+
+def _upload_patch_caches_to_kaggle(
+    train_cache: Dict,
+    val_cache: Dict,
+    dataset_name: str,
+):
+    """Upload patch feature caches to Kaggle dataset (one file at a time to save disk)."""
+    import tempfile
+    import subprocess
+    import json
+
+    print(f"  Uploading patch caches to Kaggle ({dataset_name})...")
+    username, dataset_slug = dataset_name.split('/')
+
+    for cache, filename in [(train_cache, "patch_cache_train.pt"), (val_cache, "patch_cache_val.pt")]:
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                torch.save(cache, temp_path / filename)
+
+                metadata = {
+                    "title": "Reranker Model Checkpoints",
+                    "id": f"{username}/{dataset_slug}",
+                    "licenses": [{"name": "CC0-1.0"}]
+                }
+                with open(temp_path / "dataset-metadata.json", 'w') as f:
+                    json.dump(metadata, f, indent=2)
+
+                result = subprocess.run(
+                    ['kaggle', 'datasets', 'version', '-p', str(temp_path),
+                     '-m', f'Add {filename}', '--dir-mode', 'zip'],
+                    capture_output=True, text=True, timeout=600
+                )
+                if result.returncode == 0:
+                    print(f"  ✓ Uploaded {filename} to Kaggle")
+                else:
+                    print(f"  ⚠️  Upload of {filename} failed: {result.stderr[:200]}")
+        except Exception as e:
+            print(f"  ⚠️  Upload error for {filename}: {e}")
 
 
 def plot_training_curves(
@@ -730,7 +830,6 @@ def main(cfg: DictConfig):
         ).to(device)
 
         normalize_utilities = loss_type == 'bce' or cfg.training.get('normalize_utilities', False)
-        cache_dir = cfg.checkpoint.get('save_dir', 'outputs/reranker_checkpoints')
 
         # Load results once and split (avoids redundant pickle loading)
         import pickle as _pickle
@@ -748,7 +847,23 @@ def main(cfg: DictConfig):
             all_results, seed=cfg.experiment.seed
         )
 
-        # Extract features once for all unique images across both splits
+        # Try loading patch caches from mounted Kaggle input
+        kaggle_model_dataset = os.environ.get('KAGGLE_MODEL_DATASET', '')
+        kaggle_cache_dir = Path(f"/kaggle/input/datasets/{kaggle_model_dataset}") if kaggle_model_dataset else None
+        caches_from_kaggle = False
+
+        if (kaggle_cache_dir
+            and (kaggle_cache_dir / "patch_cache_train.pt").exists()
+            and (kaggle_cache_dir / "patch_cache_val.pt").exists()):
+            if is_main_process(rank):
+                print(f"  Loading patch caches from Kaggle input: {kaggle_cache_dir}")
+            caches_from_kaggle = True
+
+        # Build datasets sequentially to reduce peak memory
+        train_cache = None
+        if caches_from_kaggle:
+            assert kaggle_cache_dir is not None
+            train_cache = torch.load(kaggle_cache_dir / "patch_cache_train.pt", map_location='cpu', weights_only=True)
         train_dataset = CachedPatchFeatureDataset(
             results=train_results,
             split='train',
@@ -757,11 +872,17 @@ def main(cfg: DictConfig):
             normalize_utilities=normalize_utilities,
             utility_min=utility_min,
             utility_max=utility_max,
-            cache_path=f"{cache_dir}/{cfg.experiment.name}/patch_cache_train.pt",
+            cache_path=None,
             extraction_batch_size=cfg.training.get('extraction_batch_size', 64),
-            device=device
+            device=device,
+            feature_cache=train_cache,
         )
+        del train_cache
 
+        val_cache = None
+        if caches_from_kaggle:
+            assert kaggle_cache_dir is not None
+            val_cache = torch.load(kaggle_cache_dir / "patch_cache_val.pt", map_location='cpu', weights_only=True)
         val_dataset = CachedPatchFeatureDataset(
             results=val_results,
             split='val',
@@ -770,10 +891,20 @@ def main(cfg: DictConfig):
             normalize_utilities=normalize_utilities,
             utility_min=utility_min,
             utility_max=utility_max,
-            cache_path=f"{cache_dir}/{cfg.experiment.name}/patch_cache_val.pt",
+            cache_path=None,
             extraction_batch_size=cfg.training.get('extraction_batch_size', 64),
-            device=device
+            device=device,
+            feature_cache=val_cache,
         )
+        del val_cache
+
+        # Upload patch caches to Kaggle if they were freshly extracted
+        if not caches_from_kaggle and kaggle_model_dataset and is_kaggle_environment() and is_main_process(rank):
+            _upload_patch_caches_to_kaggle(
+                train_dataset.feature_cache,
+                val_dataset.feature_cache,
+                kaggle_model_dataset,
+            )
 
         # Free extraction model memory
         del extract_model
@@ -958,6 +1089,40 @@ def main(cfg: DictConfig):
         eta_min=cfg.training.learning_rate * 0.01
     )
 
+    # Resume from checkpoint if available
+    start_epoch = 0
+    best_val_mse = float('inf')
+    best_val_spearman = float('-inf')
+
+    resume_path = _find_resume_checkpoint(cfg)
+    if resume_path:
+        if is_main_process(rank):
+            print(f"\nResuming from checkpoint: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+
+        model_to_load = model.module if hasattr(model, 'module') else model
+        model_to_load.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        else:
+            # Legacy checkpoints without scheduler state
+            for _ in range(start_epoch):
+                scheduler.step()
+
+        # Restore best-so-far metrics (not just current epoch metrics)
+        if 'best_metrics' in checkpoint:
+            best_val_mse = checkpoint['best_metrics'].get('mse', float('inf'))
+            best_val_spearman = checkpoint['best_metrics'].get('spearman', float('-inf'))
+        elif 'metrics' in checkpoint:
+            best_val_mse = checkpoint['metrics'].get('mse', float('inf'))
+            best_val_spearman = checkpoint['metrics'].get('spearman', float('-inf'))
+
+        if is_main_process(rank):
+            print(f"  Resumed at epoch {start_epoch + 1}, best MSE: {best_val_mse:.4f}, best Spearman: {best_val_spearman:.4f}")
+
     # Training loop
     if is_main_process(rank):
         print(f"\nStarting training for {cfg.training.num_epochs} epochs...")
@@ -965,15 +1130,11 @@ def main(cfg: DictConfig):
 
     # Choose early stopping metric based on loss type
     if loss_type in ['bce', 'ranking']:
-        best_val_mse = float('inf')
-        best_val_spearman = float('-inf')
         metric_name = 'spearman'
         metric_mode = 'max'
         if is_main_process(rank):
             print(f"Early stopping based on: Spearman correlation (maximize)\n")
     else:
-        best_val_mse = float('inf')
-        best_val_spearman = float('-inf')
         metric_name = 'mse'
         metric_mode = 'min'
         if is_main_process(rank):
@@ -995,7 +1156,7 @@ def main(cfg: DictConfig):
     # Detect if using patch model
     is_patch_model_flag = _is_patch_model(model)
 
-    for epoch in range(cfg.training.num_epochs):
+    for epoch in range(start_epoch, cfg.training.num_epochs):
         # Set epoch on sampler for proper shuffling in DDP
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -1091,10 +1252,13 @@ def main(cfg: DictConfig):
             patience_counter = 0
 
             if cfg.checkpoint.enabled and is_main_process(rank):
-                # Save unwrapped model state for DDP/DataParallel
                 model_to_save = model.module if hasattr(model, 'module') else model
                 checkpoint_path = Path(cfg.checkpoint.save_dir) / cfg.experiment.name / "best_model.pt"
-                save_checkpoint(model_to_save, optimizer, epoch, val_metrics, cfg, checkpoint_path, upload_to_kaggle=True)
+                save_checkpoint(
+                    model_to_save, optimizer, epoch, val_metrics, cfg, checkpoint_path,
+                    scheduler=scheduler,
+                    best_metrics={'mse': best_val_mse, 'spearman': best_val_spearman}
+                )
                 print(f"  ✓ Saved best model (MSE: {best_val_mse:.4f}, Spearman: {best_val_spearman:.4f})")
         else:
             patience_counter += 1
@@ -1105,11 +1269,16 @@ def main(cfg: DictConfig):
                 print(f"\nEarly stopping triggered after {epoch + 1} epochs")
             break
 
-        # Regular checkpoint
-        if cfg.checkpoint.enabled and is_main_process(rank) and (epoch + 1) % cfg.checkpoint.get("save_interval", 10) == 0:
+        # Save latest checkpoint every epoch (for resume)
+        if cfg.checkpoint.enabled and is_main_process(rank):
             model_to_save = model.module if hasattr(model, 'module') else model
-            checkpoint_path = Path(cfg.checkpoint.save_dir) / cfg.experiment.name / f"epoch_{epoch+1}.pt"
-            save_checkpoint(model_to_save, optimizer, epoch, val_metrics, cfg, checkpoint_path, upload_to_kaggle=True)
+            latest_path = Path(cfg.checkpoint.save_dir) / cfg.experiment.name / "latest.pt"
+            save_checkpoint(
+                model_to_save, optimizer, epoch, val_metrics, cfg, latest_path,
+                upload_to_kaggle=True,
+                scheduler=scheduler,
+                best_metrics={'mse': best_val_mse, 'spearman': best_val_spearman}
+            )
 
     # Final evaluation (rank 0 only)
     if is_main_process(rank):

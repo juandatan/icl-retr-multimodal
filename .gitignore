@@ -22,29 +22,16 @@ env/
 *.swo
 *~
 
-# Data directories (large datasets)
-# Exclude HuggingFace cache (6.6GB - will auto-download)
-data/*/hf_cache/
-data/*/raw/
-data/*/*.tar
-data/*/*.zip
+# Data directories
+data/
 
-# Optionally include small preprocessed files (uncomment if you want to commit them)
-# These will auto-generate on first run if missing, but including them saves time
-# !data/stanford_cars/clip_embeddings_*.pkl
-# !data/stanford_cars/baseline_probs_*.pkl
-# !data/stanford_cars/class_splits.json
+# Outputs (checkpoints, results, etc.)
+outputs/
 
-# Model checkpoints and outputs (experiment results)
-outputs/*/checkpoints/
-outputs/*/wandb/
+# Model weights
 *.pth
 *.pt
 *.ckpt
-
-# Keep output config and result files
-!outputs/*/*.yaml
-!outputs/*/*.json
 
 # Logs
 logs/
@@ -75,8 +62,5 @@ htmlcov/
 !docs/*.jpg
 
 # Hydra
-# outputs/  # Commented out to allow specific output files
-outputs/**/checkpoints/
-outputs/**/wandb/
 multirun/
 .hydra/
