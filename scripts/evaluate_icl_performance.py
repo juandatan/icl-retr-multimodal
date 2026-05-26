@@ -47,9 +47,20 @@ from data.mini_imagenet import MiniImageNetDataset
 from data.marginal_utility_dataset import InteractionFeaturesConfig
 from data.base_dataset import ClassificationExample
 from models.mlp_reranker import MLPReranker
+from models.patch_cross_attention_reranker import PatchCrossAttentionReranker
 from models.idefics2_wrapper import Idefics2Wrapper
+from data.marginal_utility_image_dataset import clip_transform
 from utils.multigpu_utils import MultiGPUManager, merge_dict_results
 from utils.imagenet_names import get_readable_name, get_synset_id, IMAGENET_SYNSET_TO_NAME
+
+_CLIP_TRANSFORM = clip_transform(224)
+
+
+def top_k_by_score(scores: np.ndarray, k: int) -> np.ndarray:
+    """Return indices of the top-k scores, sorted descending. O(n) via argpartition."""
+    k = min(k, len(scores))
+    partition_idx = np.argpartition(scores, -k)[-k:]
+    return partition_idx[np.argsort(scores[partition_idx])[::-1]]
 
 
 class CombinedDataset:
@@ -251,9 +262,11 @@ def download_from_kaggle_dataset(kaggle_dataset: str, filename: str, cache_dir: 
     return cache_path
 
 
-def load_reranker(checkpoint_path: str, device: str, kaggle_dataset: str = None, force_refresh: bool = False) -> MLPReranker:
+def load_reranker(checkpoint_path: str, device: str, kaggle_dataset: str = None, force_refresh: bool = False):
     """
     Load trained reranker model from checkpoint.
+
+    Supports both MLP and patch cross-attention architectures.
 
     Args:
         checkpoint_path: Local path or filename of checkpoint
@@ -262,7 +275,9 @@ def load_reranker(checkpoint_path: str, device: str, kaggle_dataset: str = None,
         force_refresh: If True, re-download from Kaggle even if cached
 
     Returns:
-        Tuple of (model, interaction_features)
+        Tuple of (model, interaction_features_or_None)
+        For MLP: (MLPReranker, InteractionFeaturesConfig)
+        For patch cross-attention: (PatchCrossAttentionReranker, None)
     """
     # Handle Kaggle dataset download
     if kaggle_dataset:
@@ -273,11 +288,17 @@ def load_reranker(checkpoint_path: str, device: str, kaggle_dataset: str = None,
             print(f"Force refresh: removing cached file {cache_path}")
             cache_path.unlink()
 
-        checkpoint_path = download_from_kaggle_dataset(
-            kaggle_dataset=kaggle_dataset,
-            filename=Path(checkpoint_path).name,
-            cache_dir=cache_dir
-        )
+        # Also check mounted Kaggle input
+        kaggle_input_path = Path(f"/kaggle/input/datasets/{kaggle_dataset}") / Path(checkpoint_path).name
+        if kaggle_input_path.exists():
+            checkpoint_path = str(kaggle_input_path)
+            print(f"✓ Using mounted Kaggle input: {checkpoint_path}")
+        else:
+            checkpoint_path = str(download_from_kaggle_dataset(
+                kaggle_dataset=kaggle_dataset,
+                filename=Path(checkpoint_path).name,
+                cache_dir=cache_dir
+            ))
 
     checkpoint_path = Path(checkpoint_path)
     print(f"\nLoading reranker from {checkpoint_path}...")
@@ -289,29 +310,44 @@ def load_reranker(checkpoint_path: str, device: str, kaggle_dataset: str = None,
     config = checkpoint['config']
     model_config = config['model']
 
-    # Create interaction features config
-    interaction_features = InteractionFeaturesConfig(
-        use_product=model_config.get('use_product', False),
-        use_difference=model_config.get('use_difference', False),
-        use_l2_distance=model_config.get('use_l2_distance', False)
-    )
+    # Detect architecture
+    architecture = model_config.get('architecture', 'mlp')
+    print(f"  Architecture: {architecture}")
 
-    # Initialize model
-    model = MLPReranker(
-        embedding_dim=model_config['embedding_dim'],
-        hidden_dims=model_config['hidden_dims'],
-        dropout=model_config.get('dropout', 0.1),
-        interaction_features=interaction_features,
-        use_sigmoid=model_config.get('use_sigmoid', False)
-    )
+    if architecture in ('cross_attention', 'patch_attention'):
+        model = PatchCrossAttentionReranker(
+            clip_model_name=model_config.get('clip_model_name', 'ViT-B/32'),
+            hidden_dim=model_config.get('hidden_dim', 256),
+            num_attention_heads=model_config.get('num_attention_heads', 8),
+            num_attention_layers=model_config.get('num_attention_layers', 2),
+            feedforward_dims=model_config.get('feedforward_dims', [256, 128]),
+            dropout=model_config.get('dropout', 0.1),
+            use_sigmoid=model_config.get('use_sigmoid', False),
+            freeze_clip=True,
+            pooling_method=model_config.get('pooling_method', 'cls')
+        )
+        interaction_features = None
+    else:
+        interaction_features = InteractionFeaturesConfig(
+            use_product=model_config.get('use_product', False),
+            use_difference=model_config.get('use_difference', False),
+            use_l2_distance=model_config.get('use_l2_distance', False)
+        )
+        model = MLPReranker(
+            embedding_dim=model_config['embedding_dim'],
+            hidden_dims=model_config['hidden_dims'],
+            dropout=model_config.get('dropout', 0.1),
+            interaction_features=interaction_features,
+            use_sigmoid=model_config.get('use_sigmoid', False)
+        )
 
-    # Load weights
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
     model.eval()
 
-    print(f"✓ Loaded model with {model.get_num_parameters():,} parameters")
-    print(f"✓ Interaction features: {interaction_features}")
+    print(f"✓ Loaded {architecture} model with {model.get_num_parameters():,} parameters")
+    if interaction_features:
+        print(f"✓ Interaction features: {interaction_features}")
 
     return model, interaction_features
 
@@ -352,8 +388,7 @@ def retrieve_by_clip(
             if 0 <= idx < len(similarities):
                 similarities[idx] = -np.inf
 
-    # Get top-K
-    top_k_indices = np.argsort(similarities)[-k:][::-1]
+    top_k_indices = top_k_by_score(similarities, k)
 
     return top_k_indices.tolist()
 
@@ -420,8 +455,138 @@ def retrieve_by_reranker(
             if 0 <= idx < len(utilities):
                 utilities[idx] = -np.inf
 
-    # Get top-K
-    top_k_indices = np.argsort(utilities)[-k:][::-1]
+    top_k_indices = top_k_by_score(utilities, k)
+
+    return top_k_indices.tolist()
+
+
+def extract_patch_features_for_dataset(
+    dataset,
+    reranker: PatchCrossAttentionReranker,
+    device: str,
+    batch_size: int = 64
+) -> torch.Tensor:
+    """Pre-extract patch features for all images in a dataset.
+
+    Args:
+        dataset: Dataset supporting __getitem__ returning (example, image) and __len__
+        reranker: Model with extract_patch_features method
+        device: Device for extraction
+        batch_size: Batch size for extraction
+
+    Returns:
+        Tensor of shape (N, num_patches, embed_dim) on CPU
+    """
+    n = len(dataset)
+    if n == 0:
+        raise ValueError("Cannot extract patch features from empty dataset")
+
+    # Probe shape from first image
+    _, first_img = dataset[0]
+    with torch.no_grad():
+        probe = reranker.extract_patch_features(
+            _CLIP_TRANSFORM(first_img.convert('RGB')).unsqueeze(0).to(device)
+        )
+    num_patches, embed_dim = probe.shape[1], probe.shape[2]
+
+    # Pre-allocate output tensor to avoid double memory peak from list + cat
+    result = torch.empty(n, num_patches, embed_dim)
+
+    print(f"  Pre-extracting patch features for {n} images...")
+    for batch_start in tqdm(range(0, n, batch_size), desc="Extracting patches"):
+        batch_end = min(batch_start + batch_size, n)
+        batch_images = []
+        for idx in range(batch_start, batch_end):
+            _, img = dataset[idx]
+            batch_images.append(_CLIP_TRANSFORM(img.convert('RGB')))
+
+        batch_tensor = torch.stack(batch_images).to(device)
+        with torch.no_grad():
+            features = reranker.extract_patch_features(batch_tensor)
+            result[batch_start:batch_end] = features.cpu()
+
+    print(f"  ✓ Extracted patch features: {result.shape}")
+    return result
+
+
+def retrieve_by_patch_reranker(
+    query_image,
+    query_emb: np.ndarray,
+    train_dataset,
+    reranker: PatchCrossAttentionReranker,
+    device: str,
+    k: int,
+    exclude_indices: Optional[List[int]] = None,
+    prefilter_n: int = 50,
+    batch_size: int = 32,
+    candidate_patch_features: Optional[torch.Tensor] = None
+) -> List[int]:
+    """Retrieve top-K examples using patch cross-attention reranker.
+
+    Uses CLIP similarity to pre-filter candidates, then reranks with
+    the cross-attention model using patch-level features.
+
+    Args:
+        query_image: Query PIL image
+        query_emb: Query CLIP embedding (for pre-filtering)
+        train_dataset: Dataset to retrieve from
+        reranker: Trained patch cross-attention model
+        device: Device to run on
+        k: Number of examples to retrieve
+        exclude_indices: Indices to exclude from retrieval
+        prefilter_n: Number of candidates to pre-filter with CLIP before reranking
+        batch_size: Batch size for reranker scoring
+        candidate_patch_features: Pre-extracted patch features for the retrieval dataset
+            (shape: N x num_patches x embed_dim). If None, extracts on the fly.
+    """
+    candidate_embs = train_dataset.clip_embeddings
+
+    # Step 1: Pre-filter with CLIP similarity using argpartition (O(n) vs O(n log n))
+    similarities = compute_similarity(query_emb, candidate_embs)
+
+    if exclude_indices:
+        for idx in exclude_indices:
+            if 0 <= idx < len(similarities):
+                similarities[idx] = -np.inf
+
+    prefilter_indices = top_k_by_score(similarities, prefilter_n)
+    prefilter_similarities = similarities[prefilter_indices]
+
+    # Step 2: Extract query patch features
+    query_tensor = _CLIP_TRANSFORM(query_image.convert('RGB')).unsqueeze(0).to(device)
+    with torch.no_grad():
+        query_patches = reranker.extract_patch_features(query_tensor)  # (1, num_patches, embed_dim)
+
+    # Step 3: Score candidates in batches
+    all_utilities = []
+
+    for batch_start in range(0, len(prefilter_indices), batch_size):
+        batch_indices = prefilter_indices[batch_start:batch_start + batch_size]
+        batch_sims = prefilter_similarities[batch_start:batch_start + batch_size]
+
+        # Get candidate patch features (pre-extracted or on-the-fly)
+        if candidate_patch_features is not None:
+            candidate_patches = candidate_patch_features[batch_indices].to(device)
+        else:
+            candidate_images = []
+            for idx in batch_indices:
+                _, img = train_dataset[idx]
+                candidate_images.append(_CLIP_TRANSFORM(img.convert('RGB')))
+            candidate_batch = torch.stack(candidate_images).to(device)
+            with torch.no_grad():
+                candidate_patches = reranker.extract_patch_features(candidate_batch)
+
+        with torch.no_grad():
+            query_patches_expanded = query_patches.expand(len(batch_indices), -1, -1)
+            sim_tensor = torch.from_numpy(batch_sims).float().unsqueeze(1).to(device)
+            utilities = reranker(query_patches_expanded, candidate_patches, sim_tensor)
+            all_utilities.append(utilities.squeeze(1).cpu().numpy())
+
+    all_utilities = np.concatenate(all_utilities)
+
+    # Step 4: Return top-K by utility
+    top_k_local = top_k_by_score(all_utilities, k)
+    top_k_indices = prefilter_indices[top_k_local]
 
     return top_k_indices.tolist()
 
@@ -581,7 +746,7 @@ def _evaluate_queries(
             exclude_indices = [query_idx] if test_dataset is retrieval_dataset else None
 
             # Retrieve candidate_pool_size candidates and rerank them
-            all_candidate_indices = retrieval_fn(query_emb, retrieval_dataset, candidate_pool_size, exclude_indices=exclude_indices)
+            all_candidate_indices = retrieval_fn(query_emb, retrieval_dataset, candidate_pool_size, exclude_indices=exclude_indices, query_image=query_image)
 
             # Take only top k for the ICL prompt
             example_indices = all_candidate_indices[:k]
@@ -793,9 +958,29 @@ def evaluate_icl_worker(
             clip_text_features = clip_model.encode_text(text_tokens)
             clip_text_features = clip_text_features / clip_text_features.norm(dim=-1, keepdim=True)
 
+    # Pre-extract patch features for retrieval dataset if using patch model
+    is_patch_model = isinstance(reranker, PatchCrossAttentionReranker) if reranker else False
+    candidate_patch_features = None
+    if is_patch_model:
+        candidate_patch_features = extract_patch_features_for_dataset(
+            retrieval_dataset, reranker, device, batch_size=64
+        )
+
     # Create retrieval function
-    def retrieval_fn(query_emb, dataset, k_examples, exclude_indices=None):
-        if use_reranker:
+    def retrieval_fn(query_emb, dataset, k_examples, exclude_indices=None, query_image=None):
+        if use_reranker and is_patch_model:
+            return retrieve_by_patch_reranker(
+                query_image=query_image,
+                query_emb=query_emb,
+                train_dataset=dataset,
+                reranker=reranker,
+                device=device,
+                k=k_examples,
+                exclude_indices=exclude_indices,
+                prefilter_n=candidate_pool_size,
+                candidate_patch_features=candidate_patch_features
+            )
+        elif use_reranker:
             return retrieve_by_reranker(query_emb, dataset, reranker, interaction_features, device, k_examples, exclude_indices)
         else:
             return retrieve_by_clip(query_emb, dataset, k_examples, exclude_indices)
@@ -944,7 +1129,8 @@ def evaluate_icl(
     prefilter_topk: Optional[int] = None,
     device: str = "cuda",
     candidate_batch_size: int = 8,
-    all_classes_label_mapping: Optional[Dict] = None
+    all_classes_label_mapping: Optional[Dict] = None,
+    candidate_pool_size: int = 50
 ) -> Dict:
     """
     Evaluate ICL performance using a given retrieval method.
@@ -995,7 +1181,7 @@ def evaluate_icl(
         llava_model=llava_model,
         retrieval_fn=retrieval_fn,
         k=k,
-        candidate_pool_size=args.candidate_pool_size,
+        candidate_pool_size=candidate_pool_size,
         use_generative=use_generative,
         prefilter_topk=prefilter_topk,
         clip_model=clip_model,
@@ -1244,7 +1430,7 @@ def main():
             print("EVALUATING: CLIP Similarity Baseline")
             print("="*70)
 
-            def clip_retrieval_fn(query_emb, retr_ds, k, exclude_indices=None):
+            def clip_retrieval_fn(query_emb, retr_ds, k, exclude_indices=None, query_image=None):
                 return retrieve_by_clip(query_emb, retr_ds, k, exclude_indices)
 
             clip_results = evaluate_icl(
@@ -1260,7 +1446,8 @@ def main():
                 prefilter_topk=args.prefilter_topk,
                 device=device,
                 candidate_batch_size=args.candidate_batch_size,
-                all_classes_label_mapping=all_classes_label_mapping
+                all_classes_label_mapping=all_classes_label_mapping,
+                candidate_pool_size=args.candidate_pool_size
             )
 
             # Save to cache if requested
@@ -1326,10 +1513,30 @@ def main():
                 print("EVALUATING: Learned Reranker")
                 print("="*70)
 
-                def reranker_retrieval_fn(query_emb, retr_ds, k, exclude_indices=None):
-                    return retrieve_by_reranker(
-                        query_emb, retr_ds, reranker, interaction_features, device, k, exclude_indices
+                is_patch_model = isinstance(reranker, PatchCrossAttentionReranker)
+                candidate_patch_features = None
+                if is_patch_model:
+                    candidate_patch_features = extract_patch_features_for_dataset(
+                        retrieval_dataset, reranker, device, batch_size=64
                     )
+
+                def reranker_retrieval_fn(query_emb, retr_ds, k, exclude_indices=None, query_image=None):
+                    if is_patch_model:
+                        return retrieve_by_patch_reranker(
+                            query_image=query_image,
+                            query_emb=query_emb,
+                            train_dataset=retr_ds,
+                            reranker=reranker,
+                            device=device,
+                            k=k,
+                            exclude_indices=exclude_indices,
+                            prefilter_n=args.candidate_pool_size,
+                            candidate_patch_features=candidate_patch_features
+                        )
+                    else:
+                        return retrieve_by_reranker(
+                            query_emb, retr_ds, reranker, interaction_features, device, k, exclude_indices
+                        )
 
                 reranker_results = evaluate_icl(
                     test_dataset=test_dataset,
@@ -1344,7 +1551,8 @@ def main():
                     prefilter_topk=args.prefilter_topk,
                     device=device,
                     candidate_batch_size=args.candidate_batch_size,
-                    all_classes_label_mapping=all_classes_label_mapping
+                    all_classes_label_mapping=all_classes_label_mapping,
+                    candidate_pool_size=args.candidate_pool_size
                 )
 
             # Save to cache if requested
