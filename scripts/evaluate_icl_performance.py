@@ -210,6 +210,36 @@ def load_dataset(dataset_name: str, split: str = "test"):
     return dataset
 
 
+def load_eval_datasets(dataset_name: str, eval_split: str, retrieval_split: str):
+    """Load and return (test_dataset, retrieval_dataset), reusing objects where splits overlap."""
+    if eval_split == "val+test":
+        test_dataset = CombinedDataset([
+            load_dataset(dataset_name, split="val"),
+            load_dataset(dataset_name, split="test"),
+        ])
+    else:
+        test_dataset = load_dataset(dataset_name, split=eval_split)
+
+    if retrieval_split == eval_split and eval_split != "val+test":
+        retrieval_dataset = test_dataset
+    else:
+        retrieval_dataset = load_dataset(dataset_name, split=retrieval_split)
+
+    return test_dataset, retrieval_dataset
+
+
+def build_all_classes_label_mapping(dataset_name: str, preloaded: Dict = None) -> Dict:
+    """Build label_name -> label mapping from all splits, reusing any pre-loaded datasets."""
+    preloaded = preloaded or {}
+    mapping = {}
+    for split in ("train", "val", "test"):
+        ds = preloaded.get(split) or load_dataset(dataset_name, split=split)
+        for ex in ds.examples:
+            if ex.label_name not in mapping:
+                mapping[ex.label_name] = ex.label
+    return mapping
+
+
 def download_from_kaggle_dataset(kaggle_dataset: str, filename: str, cache_dir: str = "./cache") -> Path:
     """
     Download a file from Kaggle dataset, with local caching.
@@ -824,6 +854,10 @@ def _evaluate_queries(
         # Mark as completed
         completed_queries.add(query_idx)
 
+        # Free activation memory between queries
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
         # Save incrementally every N queries
         if cache_path and len(completed_queries) % save_frequency == 0:
             intermediate_results = {
@@ -871,58 +905,43 @@ def evaluate_icl_worker(
     prefilter_topk: Optional[int] = None,
     candidate_batch_size: int = 8,
     cache_path_base: Optional[str] = None,
-    use_all_classes: bool = False
+    use_all_classes: bool = False,
+    test_dataset=None,
+    retrieval_dataset=None,
+    all_classes_label_mapping: Optional[Dict] = None,
+    do_image_splitting: bool = False,
+    worker_id: Optional[int] = None,
 ) -> Dict:
+    """Worker function for multi-GPU evaluation. Runs on a single GPU and evaluates a subset of queries.
+
+    test_dataset, retrieval_dataset, and all_classes_label_mapping can be pre-loaded by the
+    main process and passed here to avoid HuggingFace Arrow cache deadlocks from concurrent reads.
+
+    worker_id: stable identifier for logging and cache paths. When CUDA_VISIBLE_DEVICES isolates
+               each process to a single GPU, gpu_id is always 0 but worker_id preserves the
+               original worker index for unique cache filenames.
     """
-    Worker function for multi-GPU evaluation.
-    Runs on a single GPU and evaluates a subset of queries.
-    """
-    # Set device for this worker
+    worker_id = worker_id if worker_id is not None else gpu_id
     device = f"cuda:{gpu_id}"
 
     # Determine retrieval split
     retrieval_split = determine_retrieval_split(eval_split, retrieval_split)
-    print(f"[GPU {gpu_id}] Queries from {eval_split}, candidates from {retrieval_split}")
+    print(f"[Worker {worker_id}] Queries from {eval_split}, candidates from {retrieval_split}")
 
-    # Build complete label mapping if use_all_classes is True
-    all_classes_label_mapping = None
-    if use_all_classes:
-        print(f"[GPU {gpu_id}] Building complete label mapping from all splits...")
-        all_splits_datasets = [
-            load_dataset(dataset_name, split="train"),
-            load_dataset(dataset_name, split="val"),
-            load_dataset(dataset_name, split="test")
-        ]
-        all_classes_label_mapping = {}
-        for ds in all_splits_datasets:
-            for ex in ds.examples:
-                if ex.label_name not in all_classes_label_mapping:
-                    all_classes_label_mapping[ex.label_name] = ex.label
-        print(f"[GPU {gpu_id}] Using {len(all_classes_label_mapping)} classes as candidates")
+    # Load datasets if not pre-loaded by main process (single-GPU path)
+    if test_dataset is None or retrieval_dataset is None:
+        test_dataset, retrieval_dataset = load_eval_datasets(dataset_name, eval_split, retrieval_split)
 
-    # Load eval dataset
-    if eval_split == "val+test":
-        datasets_to_combine = [
-            load_dataset(dataset_name, split="val"),
-            load_dataset(dataset_name, split="test")
-        ]
-    else:
-        datasets_to_combine = [load_dataset(dataset_name, split=eval_split)]
+        if use_all_classes and all_classes_label_mapping is None:
+            print(f"[Worker {worker_id}] Building complete label mapping from all splits...")
+            preloaded = {}
+            if eval_split != "val+test":
+                preloaded[eval_split] = test_dataset
+            preloaded[retrieval_split] = retrieval_dataset
+            all_classes_label_mapping = build_all_classes_label_mapping(dataset_name, preloaded)
+            print(f"[Worker {worker_id}] Using {len(all_classes_label_mapping)} classes as candidates")
 
-    # Combine if needed
-    if len(datasets_to_combine) > 1:
-        test_dataset = CombinedDataset(datasets_to_combine)
-        print(f"[GPU {gpu_id}] Combined dataset has {len(test_dataset)} examples from {len(set(ex.label for ex in test_dataset.examples))} classes")
-    else:
-        # Single split, no need to combine
-        test_dataset = datasets_to_combine[0]
-        print(f"[GPU {gpu_id}] Using {eval_split} split with {len(test_dataset)} examples from {len(set(ex.label for ex in test_dataset.examples))} classes")
-
-    # Load retrieval dataset separately if different
-    if retrieval_split == eval_split and eval_split != "val+test":
-        retrieval_dataset = test_dataset
-    else:
-        retrieval_dataset = load_dataset(dataset_name, split=retrieval_split)
+    print(f"[Worker {worker_id}] {len(test_dataset)} eval examples, {len(retrieval_dataset)} retrieval examples")
 
     # Load reranker if needed
     reranker = None
@@ -939,7 +958,8 @@ def evaluate_icl_worker(
     llava_model = Idefics2Wrapper(
         model_name=llava_model_name,
         device=device,
-        load_in_8bit=load_in_8bit
+        load_in_8bit=load_in_8bit,
+        do_image_splitting=do_image_splitting
     )
 
     # Initialize CLIP for oracle pre-filtering if needed
@@ -947,7 +967,7 @@ def evaluate_icl_worker(
     clip_preprocess = None
     clip_text_features = None
     if prefilter_topk is not None and use_generative:
-        print(f"GPU {gpu_id}: Loading CLIP for oracle pre-filtering (top-{prefilter_topk})...")
+        print(f"[Worker {worker_id}] Loading CLIP for oracle pre-filtering (top-{prefilter_topk})...")
         clip_model, clip_preprocess = clip.load("ViT-B/32", device=device)
         clip_model.eval()
 
@@ -985,12 +1005,12 @@ def evaluate_icl_worker(
         else:
             return retrieve_by_clip(query_emb, dataset, k_examples, exclude_indices)
 
-    print(f"GPU {gpu_id}: Evaluating {len(query_indices)} queries...")
+    print(f"[Worker {worker_id}] Evaluating {len(query_indices)} queries...")
 
-    # Create GPU-specific cache path if base path provided
+    # Create worker-specific cache path if base path provided
     cache_path = None
     if cache_path_base:
-        cache_path = Path(f"{cache_path_base}.gpu{gpu_id}")
+        cache_path = Path(f"{cache_path_base}.worker{worker_id}")
 
     # Use shared evaluation logic
     return _evaluate_queries(
@@ -1035,12 +1055,14 @@ def evaluate_icl_multigpu(
     prefilter_topk: Optional[int] = None,
     candidate_batch_size: int = 8,
     cache_path: Optional[Path] = None,
-    use_all_classes: bool = False
+    use_all_classes: bool = False,
+    do_image_splitting: bool = True,
 ) -> Dict:
     """
     Evaluate ICL performance using multiple GPUs in parallel.
 
-    Note: Workers load their own dataset copies to avoid memory duplication in main process.
+    Datasets are pre-loaded in the main process and passed to workers to avoid
+    HuggingFace Arrow cache deadlocks from concurrent reads.
     """
     random.seed(seed)
 
@@ -1049,6 +1071,25 @@ def evaluate_icl_multigpu(
     total_queries = num_queries if num_queries is not None else test_dataset_size
     if total_queries < test_dataset_size:
         query_indices = random.sample(query_indices, total_queries)
+
+    # Pre-load datasets once in the main process to avoid HF Arrow cache deadlocks in workers
+    retrieval_split = determine_retrieval_split(eval_split, retrieval_split)
+    print("Pre-loading datasets in main process...")
+
+    test_dataset, retrieval_dataset = load_eval_datasets(dataset_name, eval_split, retrieval_split)
+
+    all_classes_label_mapping = None
+    if use_all_classes:
+        print("Building complete label mapping from all splits...")
+        # Pass pre-loaded datasets to avoid redundant reloads
+        preloaded = {}
+        if eval_split != "val+test":
+            preloaded[eval_split] = test_dataset
+        preloaded[retrieval_split] = retrieval_dataset
+        all_classes_label_mapping = build_all_classes_label_mapping(dataset_name, preloaded)
+        print(f"✓ Using {len(all_classes_label_mapping)} classes as candidates")
+
+    print(f"✓ {len(test_dataset)} eval examples, {len(retrieval_dataset)} retrieval examples")
 
     # Use MultiGPUManager to handle parallel execution
     with MultiGPUManager(num_gpus=num_gpus, verbose=True) as mgr:
@@ -1073,7 +1114,11 @@ def evaluate_icl_multigpu(
                 'prefilter_topk': prefilter_topk,
                 'candidate_batch_size': candidate_batch_size,
                 'cache_path_base': str(cache_path) if cache_path else None,
-                'use_all_classes': use_all_classes
+                'use_all_classes': use_all_classes,
+                'test_dataset': test_dataset,
+                'retrieval_dataset': retrieval_dataset,
+                'all_classes_label_mapping': all_classes_label_mapping,
+                'do_image_splitting': do_image_splitting,
             }
         )
 
@@ -1221,6 +1266,26 @@ def evaluate_icl(
     return results
 
 
+def _count_gpus_without_cuda_init() -> int:
+    """Count available GPUs using nvidia-smi, avoiding CUDA runtime initialization.
+
+    Calling torch.cuda.is_available() or device_count() in the parent process
+    initializes CUDA, which is inherited by forked children and prevents
+    CUDA_VISIBLE_DEVICES from taking effect in those children.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            return len([l for l in result.stdout.strip().splitlines() if l.strip()])
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate ICL performance with different retrieval methods")
     parser.add_argument("--dataset", type=str, required=True, choices=["stanford_cars", "mini_imagenet"],
@@ -1268,16 +1333,18 @@ def main():
 
     args = parser.parse_args()
 
-    # Set device and detect GPUs
-    if torch.cuda.is_available():
+    # Detect GPU count via nvidia-smi to avoid initializing the CUDA runtime in the
+    # parent process. If CUDA is initialized before fork, CUDA_VISIBLE_DEVICES set in
+    # worker bodies has no effect and both workers land on the same physical GPU.
+    num_available_gpus = _count_gpus_without_cuda_init()
+    if num_available_gpus > 0:
         device = "cuda"
-        num_available_gpus = torch.cuda.device_count()
         num_gpus = args.num_gpus if args.num_gpus is not None else num_available_gpus
-        num_gpus = min(num_gpus, num_available_gpus)  # Cap at available
+        num_gpus = min(num_gpus, num_available_gpus)
         print(f"Using device: {device}")
         print(f"Available GPUs: {num_available_gpus}")
         print(f"Using GPUs: {num_gpus}")
-    elif torch.backends.mps.is_available():
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
         device = "mps"
         num_gpus = 1
         print(f"Using device: {device}")
@@ -1652,24 +1719,65 @@ def main():
             'both_correct_diff_examples': both_correct_diff_examples
         }
 
-    # Save results
+    # Auto-save results to outputs/evals/<method>/
+    import json
+
+    def _save_eval_results(method: str, results: Dict, extra: Dict = None):
+        run_id = (
+            f"{args.dataset}"
+            f"_k{args.k}"
+            f"_pool{args.candidate_pool_size}"
+            f"_n{args.num_queries or test_dataset_size}"
+            f"_seed{args.seed}"
+            f"_{'generative' if args.use_generative else 'discriminative'}"
+        )
+        out_dir = Path("outputs/evals") / method
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        payload = {'run_id': run_id, 'method': method, 'results': results, 'args': vars(args)}
+        if extra:
+            payload.update(extra)
+        with open(out_dir / f"{run_id}.pkl", 'wb') as f:
+            pickle.dump(payload, f)
+
+        summary = {
+            'run_id': run_id,
+            'method': method,
+            'accuracy': results['accuracy'],
+            'mean_per_class_accuracy': results['mean_per_class_accuracy'],
+            'correct': results['correct'],
+            'total': results['total'],
+            'args': vars(args)
+        }
+        with open(out_dir / f"{run_id}.json", 'w') as f:
+            json.dump(summary, f, indent=2)
+
+        print(f"\n✓ {method} results saved to {out_dir}/{run_id}{{.pkl,.json}}")
+
+    _save_eval_results('clip', clip_results)
+    if reranker_results:
+        ckpt_stem = Path(args.reranker_checkpoint).stem if args.reranker_checkpoint else 'reranker'
+        _save_eval_results(f'reranker_{ckpt_stem}', reranker_results,
+                           extra={'comparison': reranker_results.get('comparison')})
+
+    # Save combined results to --output if explicitly requested
     if args.output:
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        results = {
+        combined = {
             'dataset': args.dataset,
             'k': args.k,
-            'num_queries': args.num_queries or len(test_dataset),
+            'num_queries': args.num_queries or test_dataset_size,
             'clip_results': clip_results,
             'reranker_results': reranker_results,
             'args': vars(args)
         }
 
         with open(output_path, 'wb') as f:
-            pickle.dump(results, f)
+            pickle.dump(combined, f)
 
-        print(f"\n✓ Results saved to {output_path}")
+        print(f"\n✓ Combined results saved to {output_path}")
 
 
 if __name__ == "__main__":

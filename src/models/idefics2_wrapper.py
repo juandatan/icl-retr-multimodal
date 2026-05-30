@@ -36,12 +36,13 @@ class Idefics2Wrapper:
     def __init__(
         self,
         model_name: str = "HuggingFaceM4/idefics2-8b",
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        device: Optional[str] = None,
         load_in_8bit: bool = False,
         load_in_4bit: bool = False,
         use_cache: bool = False,  # Disabled for discriminative evaluation (no token-by-token generation)
         cache_vision_embeddings: bool = False,  # Disabled by default for Idefics2
         max_vision_cache_size: int = 5000,
+        do_image_splitting: bool = False,
     ):
         """
         Initialize Idefics2 model.
@@ -56,8 +57,10 @@ class Idefics2Wrapper:
             max_vision_cache_size: Maximum number of images to cache (0 = unlimited)
         """
         self.model_name = model_name
-        self.device = device
+        self.device = device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
+        device = self.device
         self.load_in_8bit = load_in_8bit
+        self.do_image_splitting = do_image_splitting
         self.load_in_4bit = load_in_4bit
         self.use_cache = use_cache
         self.cache_vision_embeddings = cache_vision_embeddings
@@ -73,8 +76,8 @@ class Idefics2Wrapper:
         elif load_in_4bit:
             print("Using 4-bit quantization")
 
-        # Load processor
         self.processor = AutoProcessor.from_pretrained(model_name)
+        self.processor.image_processor.do_image_splitting = do_image_splitting
 
         # Configure model loading
         model_kwargs = {}
@@ -94,7 +97,9 @@ class Idefics2Wrapper:
                 model_kwargs['device_map'] = "auto"
         else:
             model_kwargs['torch_dtype'] = torch.float16 if device.startswith("cuda") else torch.float32
-            if device.startswith("cuda"):
+            if device.startswith("cuda:"):
+                model_kwargs['device_map'] = {"": device}
+            elif device.startswith("cuda"):
                 model_kwargs['device_map'] = "auto"
 
         # Load Idefics2 model
@@ -225,9 +230,7 @@ class Idefics2Wrapper:
             )
             all_prompt_inputs.append(prompt_input)
 
-        # Stack the inputs (simple approach for now - could optimize later)
-        # For now, process one at a time to avoid complex batching logic
-        prompt_inputs = all_prompt_inputs[0] if batch_size == 1 else None
+        prompt_inputs = all_prompt_inputs[0]
 
         if batch_size > 1:
             # For batch processing, we need to pad and stack
@@ -461,6 +464,21 @@ class Idefics2Wrapper:
                 )
 
         return image_hidden_states
+
+    def _get_image_features_multi(self, images: List[Image.Image]) -> torch.Tensor:
+        """
+        Extract vision features for a list of images, one image at a time.
+
+        Processes each image independently through _get_image_features to keep
+        peak activation memory bounded to a single image, then concatenates.
+
+        Returns image_hidden_states of shape (1, N, num_visual_tokens, hidden_size)
+        where N = len(images), matching the format expected by
+        _compute_label_probabilities_batch_with_features.
+        """
+        per_image_features = [self._get_image_features(img) for img in images]
+        # Each is (1, 1, num_tokens, hidden); cat along dim=1 → (1, N, num_tokens, hidden)
+        return torch.cat(per_image_features, dim=1)
 
     def compute_marginal_utilities_batch_cached(
         self,
@@ -764,18 +782,19 @@ class Idefics2Wrapper:
         # Prepare images: context images + query image
         images = [img for img, _ in context_examples] + [query_image]
 
+        # Encode images once and reuse the hidden states across all candidate chunks.
+        # This avoids re-running the vision encoder once per candidate label.
+        image_hidden_states = self._get_image_features_multi(images)
+
         # Process candidates in chunks to avoid OOM with many classes
         all_log_probs = []
         for i in range(0, len(candidate_labels), batch_size):
             chunk_labels = candidate_labels[i:i + batch_size]
+            chunk_size = len(chunk_labels)
 
-            # Batch compute log probabilities for this chunk
-            batch_images = [images] * len(chunk_labels)
-            batch_prompts = [prompt] * len(chunk_labels)
-
-            chunk_log_probs = self._compute_label_probabilities_batch(
-                images=batch_images,
-                prompts=batch_prompts,
+            chunk_log_probs = self._compute_label_probabilities_batch_with_features(
+                image_hidden_states_list=[image_hidden_states] * chunk_size,
+                prompts=[prompt] * chunk_size,
                 labels=chunk_labels
             )
             all_log_probs.extend(chunk_log_probs)

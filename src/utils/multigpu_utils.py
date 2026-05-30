@@ -8,7 +8,12 @@ Provides reusable patterns for:
 """
 
 import multiprocessing as mp
-from functools import partial
+import os
+import pickle
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 from typing import List, Callable, Any, Dict, Optional
 import torch
 
@@ -97,18 +102,47 @@ def run_parallel_on_gpus(
     for i, items in enumerate(work_splits):
         print(f"  GPU {i}: {len(items)} items")
 
-    # Use spawn method for CUDA compatibility
-    ctx = mp.get_context('spawn')
+    # Launch each worker as a fresh subprocess with CUDA_VISIBLE_DEVICES set in the
+    # OS environment before Python starts — the only reliable way to isolate CUDA
+    # when the parent process has already (or may have already) touched CUDA.
+    worker_script = Path(__file__).parent.parent.parent / "scripts" / "evaluate_icl_single_gpu_worker.py"
 
-    # Create partial function with fixed kwargs
-    worker_fn_partial = partial(worker_fn, **worker_kwargs)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
 
-    # Run workers in parallel
-    with ctx.Pool(processes=num_gpus) as pool:
-        results = pool.starmap(
-            worker_fn_partial,
-            [(i, items) for i, items in enumerate(work_splits)]
-        )
+        # Write shared config once; each worker gets its own queries and output file.
+        config_path = tmp / "worker_kwargs.pkl"
+        with open(config_path, 'wb') as f:
+            pickle.dump(worker_kwargs, f)
+
+        processes = []
+        for gpu_id, items in enumerate(work_splits):
+            queries_path = tmp / f"queries_{gpu_id}.pkl"
+            output_path = tmp / f"result_{gpu_id}.pkl"
+
+            with open(queries_path, 'wb') as f:
+                pickle.dump(items, f)
+
+            env = {**os.environ, 'CUDA_VISIBLE_DEVICES': str(gpu_id)}
+            cmd = [
+                sys.executable,
+                str(worker_script),
+                "--worker-id", str(gpu_id),
+                "--config-path", str(config_path),
+                "--queries-path", str(queries_path),
+                "--output-path", str(output_path),
+            ]
+            p = subprocess.Popen(cmd, env=env)
+            processes.append((gpu_id, p, output_path))
+
+        # Wait for all workers and collect results
+        results = [None] * num_gpus
+        for gpu_id, p, output_path in processes:
+            p.wait()
+            if p.returncode != 0:
+                raise RuntimeError(f"Worker GPU {gpu_id} exited with code {p.returncode}")
+            with open(output_path, 'rb') as f:
+                results[gpu_id] = pickle.load(f)
 
     return results
 
