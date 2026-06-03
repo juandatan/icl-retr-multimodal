@@ -182,9 +182,14 @@ class BaseUtilityDataset(Dataset, ABC):
             print(f"Loading cached CLIP embeddings from {cache_path}")
             with open(cache_path, 'rb') as f:
                 cache_data = pickle.load(f)
-                self.clip_embeddings = cache_data['embeddings']
-                self.clip_model_name = cache_data['model_name']
-                return True
+            current_ids = [ex.image_path for ex in self.examples]
+            cached_ids = cache_data.get('example_ids')
+            if cached_ids is not None and cached_ids != current_ids:
+                print(f"⚠️  Cached embeddings are for a different split — skipping.")
+                return False
+            self.clip_embeddings = cache_data['embeddings']
+            self.clip_model_name = cache_data['model_name']
+            return True
         return False
 
     def build_clip_embeddings(
@@ -216,6 +221,11 @@ class BaseUtilityDataset(Dataset, ABC):
             print(f"Loading cached CLIP embeddings from {cache_path}")
             with open(cache_path, 'rb') as f:
                 cache_data = pickle.load(f)
+            current_ids = [ex.image_path for ex in self.examples]
+            cached_ids = cache_data.get('example_ids')
+            if cached_ids is not None and cached_ids != current_ids:
+                print(f"⚠️  Cached embeddings are for a different split — recomputing.")
+            else:
                 self.clip_embeddings = cache_data['embeddings']
                 self.clip_model_name = cache_data['model_name']
                 return self.clip_embeddings
@@ -256,6 +266,7 @@ class BaseUtilityDataset(Dataset, ABC):
             pickle.dump({
                 'embeddings': self.clip_embeddings,
                 'model_name': self.clip_model_name,
+                'example_ids': [ex.image_path for ex in self.examples],
             }, f)
 
         return self.clip_embeddings

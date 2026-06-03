@@ -1,29 +1,23 @@
 """
-Evaluate In-Context Learning (ICL) performance using different retrieval methods.
+Evaluate ICL performance with a learned reranker.
 
-This script compares:
-1. CLIP similarity baseline: retrieve top-K examples by cosine similarity
-2. Learned reranker: retrieve top-K examples by predicted marginal utility
-
-For each method, we:
-- Select K in-context examples for each test query
-- Query Idefics2 for classification
-- Measure accuracy
+Retrieves K in-context examples per query using the reranker model and measures
+Idefics2 classification accuracy.  For 0-shot and CLIP-retrieval baselines on
+Stanford Cars, see evaluate_stanford_cars_baselines.py.
 
 Usage:
-    # Mini-ImageNet with k=1
-    python scripts/evaluate_icl_performance.py \
-        --dataset mini_imagenet \
-        --reranker-checkpoint outputs/reranker_checkpoints/reranker_mini_imagenet_v2/best_model.pt \
-        --k 1 \
-        --num-queries 100
-
-    # Stanford Cars with k=1
+    # Stanford Cars with image-level split
     python scripts/evaluate_icl_performance.py \
         --dataset stanford_cars \
-        --reranker-checkpoint outputs/reranker_checkpoints/reranker_stanford_cars/best_model.pt \
-        --k 1 \
-        --num-queries 100
+        --reranker-checkpoint outputs/reranker_checkpoints/best_model.pt \
+        --image-split-path data/stanford_cars/image_split.json \
+        --k 1
+
+    # Mini-ImageNet
+    python scripts/evaluate_icl_performance.py \
+        --dataset mini_imagenet \
+        --reranker-checkpoint outputs/reranker_checkpoints/best_model.pt \
+        --k 1
 """
 
 import sys
@@ -52,6 +46,7 @@ from models.idefics2_wrapper import Idefics2Wrapper
 from data.marginal_utility_image_dataset import clip_transform
 from utils.multigpu_utils import MultiGPUManager, merge_dict_results
 from utils.imagenet_names import get_readable_name, get_synset_id, IMAGENET_SYNSET_TO_NAME
+from utils.eval_utils import save_eval_results
 
 _CLIP_TRANSFORM = clip_transform(224)
 
@@ -176,7 +171,8 @@ def save_cached_results(cache_path: Path, results: Dict):
     print(f"✓ Cached results saved to {cache_path}")
 
 
-def load_dataset(dataset_name: str, split: str = "test"):
+def load_dataset(dataset_name: str, split: str = "test",
+                 image_split_path: Optional[str] = None):
     """Load dataset for evaluation."""
     print(f"\nLoading {dataset_name} dataset ({split} split)...")
 
@@ -184,7 +180,8 @@ def load_dataset(dataset_name: str, split: str = "test"):
         dataset = StanfordCarsDataset(
             split=split,
             data_dir="data/stanford_cars",
-            class_split_seed=42
+            class_split_seed=42,
+            image_split_path=image_split_path,
         )
     elif dataset_name == "mini_imagenet":
         dataset = MiniImageNetDataset(
@@ -210,30 +207,35 @@ def load_dataset(dataset_name: str, split: str = "test"):
     return dataset
 
 
-def load_eval_datasets(dataset_name: str, eval_split: str, retrieval_split: str):
+def load_eval_datasets(dataset_name: str, eval_split: str, retrieval_split: str,
+                       image_split_path: Optional[str] = None):
     """Load and return (test_dataset, retrieval_dataset), reusing objects where splits overlap."""
     if eval_split == "val+test":
         test_dataset = CombinedDataset([
-            load_dataset(dataset_name, split="val"),
-            load_dataset(dataset_name, split="test"),
+            load_dataset(dataset_name, split="val", image_split_path=image_split_path),
+            load_dataset(dataset_name, split="test", image_split_path=image_split_path),
         ])
     else:
-        test_dataset = load_dataset(dataset_name, split=eval_split)
+        test_dataset = load_dataset(dataset_name, split=eval_split,
+                                    image_split_path=image_split_path)
 
     if retrieval_split == eval_split and eval_split != "val+test":
         retrieval_dataset = test_dataset
     else:
-        retrieval_dataset = load_dataset(dataset_name, split=retrieval_split)
+        retrieval_dataset = load_dataset(dataset_name, split=retrieval_split,
+                                         image_split_path=image_split_path)
 
     return test_dataset, retrieval_dataset
 
 
-def build_all_classes_label_mapping(dataset_name: str, preloaded: Dict = None) -> Dict:
+def build_all_classes_label_mapping(dataset_name: str, preloaded: Dict = None,
+                                    image_split_path: Optional[str] = None) -> Dict:
     """Build label_name -> label mapping from all splits, reusing any pre-loaded datasets."""
     preloaded = preloaded or {}
     mapping = {}
     for split in ("train", "val", "test"):
-        ds = preloaded.get(split) or load_dataset(dataset_name, split=split)
+        ds = preloaded.get(split) or load_dataset(dataset_name, split=split,
+                                                   image_split_path=image_split_path)
         for ex in ds.examples:
             if ex.label_name not in mapping:
                 mapping[ex.label_name] = ex.label
@@ -911,6 +913,7 @@ def evaluate_icl_worker(
     all_classes_label_mapping: Optional[Dict] = None,
     do_image_splitting: bool = False,
     worker_id: Optional[int] = None,
+    image_split_path: Optional[str] = None,
 ) -> Dict:
     """Worker function for multi-GPU evaluation. Runs on a single GPU and evaluates a subset of queries.
 
@@ -930,7 +933,10 @@ def evaluate_icl_worker(
 
     # Load datasets if not pre-loaded by main process (single-GPU path)
     if test_dataset is None or retrieval_dataset is None:
-        test_dataset, retrieval_dataset = load_eval_datasets(dataset_name, eval_split, retrieval_split)
+        test_dataset, retrieval_dataset = load_eval_datasets(
+            dataset_name, eval_split, retrieval_split,
+            image_split_path=image_split_path,
+        )
 
         if use_all_classes and all_classes_label_mapping is None:
             print(f"[Worker {worker_id}] Building complete label mapping from all splits...")
@@ -938,7 +944,9 @@ def evaluate_icl_worker(
             if eval_split != "val+test":
                 preloaded[eval_split] = test_dataset
             preloaded[retrieval_split] = retrieval_dataset
-            all_classes_label_mapping = build_all_classes_label_mapping(dataset_name, preloaded)
+            all_classes_label_mapping = build_all_classes_label_mapping(
+                dataset_name, preloaded, image_split_path=image_split_path,
+            )
             print(f"[Worker {worker_id}] Using {len(all_classes_label_mapping)} classes as candidates")
 
     print(f"[Worker {worker_id}] {len(test_dataset)} eval examples, {len(retrieval_dataset)} retrieval examples")
@@ -1057,6 +1065,7 @@ def evaluate_icl_multigpu(
     cache_path: Optional[Path] = None,
     use_all_classes: bool = False,
     do_image_splitting: bool = True,
+    image_split_path: Optional[str] = None,
 ) -> Dict:
     """
     Evaluate ICL performance using multiple GPUs in parallel.
@@ -1076,17 +1085,21 @@ def evaluate_icl_multigpu(
     retrieval_split = determine_retrieval_split(eval_split, retrieval_split)
     print("Pre-loading datasets in main process...")
 
-    test_dataset, retrieval_dataset = load_eval_datasets(dataset_name, eval_split, retrieval_split)
+    test_dataset, retrieval_dataset = load_eval_datasets(
+        dataset_name, eval_split, retrieval_split,
+        image_split_path=image_split_path,
+    )
 
     all_classes_label_mapping = None
     if use_all_classes:
         print("Building complete label mapping from all splits...")
-        # Pass pre-loaded datasets to avoid redundant reloads
         preloaded = {}
         if eval_split != "val+test":
             preloaded[eval_split] = test_dataset
         preloaded[retrieval_split] = retrieval_dataset
-        all_classes_label_mapping = build_all_classes_label_mapping(dataset_name, preloaded)
+        all_classes_label_mapping = build_all_classes_label_mapping(
+            dataset_name, preloaded, image_split_path=image_split_path,
+        )
         print(f"✓ Using {len(all_classes_label_mapping)} classes as candidates")
 
     print(f"✓ {len(test_dataset)} eval examples, {len(retrieval_dataset)} retrieval examples")
@@ -1119,6 +1132,7 @@ def evaluate_icl_multigpu(
                 'retrieval_dataset': retrieval_dataset,
                 'all_classes_label_mapping': all_classes_label_mapping,
                 'do_image_splitting': do_image_splitting,
+                'image_split_path': image_split_path,
             }
         )
 
@@ -1286,26 +1300,53 @@ def _count_gpus_without_cuda_init() -> int:
     return 0
 
 
+def _setup_device(num_gpus_requested: Optional[int] = None):
+    """Detect device and GPU count without initialising the CUDA runtime.
+
+    Returns (device, num_gpus, use_multi_gpu).  Uses nvidia-smi so that
+    CUDA_VISIBLE_DEVICES set on worker subprocesses still takes effect.
+    """
+    num_available = _count_gpus_without_cuda_init()
+    if num_available > 0:
+        device = "cuda"
+        num_gpus = min(
+            num_gpus_requested if num_gpus_requested is not None else num_available,
+            num_available,
+        )
+        print(f"Using device: {device}, GPUs: {num_gpus}/{num_available}")
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = "mps"
+        num_gpus = 1
+        print(f"Using device: {device}")
+    else:
+        device = "cpu"
+        num_gpus = 1
+        print(f"Using device: {device}")
+    return device, num_gpus, num_gpus > 1 and device == "cuda"
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate ICL performance with different retrieval methods")
+    parser = argparse.ArgumentParser(description="Evaluate ICL performance with a learned reranker")
     parser.add_argument("--dataset", type=str, required=True, choices=["stanford_cars", "mini_imagenet"],
                         help="Dataset to evaluate on")
-    parser.add_argument("--eval-split", type=str, default="val+test",
+    parser.add_argument("--eval-split", type=str, default="test",
                         choices=["train", "val", "test", "val+test"],
-                        help="Which split(s) to evaluate on (default: val+test for 20 classes)")
+                        help="Which split(s) to evaluate on (default: test)")
     parser.add_argument("--retrieval-split", type=str, default=None,
                         choices=["train", "val", "test"],
-                        help="Which split to retrieve ICL examples from (default: auto - uses train if eval-split is test, otherwise same as eval-split)")
-    parser.add_argument("--reranker-checkpoint", type=str, default=None,
+                        help="Which split to retrieve ICL examples from (default: auto)")
+    parser.add_argument("--reranker-checkpoint", type=str, required=True,
                         help="Path to trained reranker checkpoint (local path or filename if using --kaggle-dataset)")
     parser.add_argument("--kaggle-dataset", type=str, default=None,
                         help="Kaggle dataset containing checkpoint (username/dataset-name)")
     parser.add_argument("--force-refresh", action="store_true",
                         help="Force re-download from Kaggle even if cached")
+    parser.add_argument("--image-split-path", type=str, default=None,
+                        help="Path to image-level split JSON (for within-distribution Stanford Cars eval)")
     parser.add_argument("--k", type=int, default=1,
                         help="Number of in-context examples to include in prompt")
     parser.add_argument("--candidate-pool-size", type=int, default=50,
-                        help="Number of candidates to retrieve and rerank (default: 50, aligned with paper)")
+                        help="Number of candidates to retrieve and rerank (default: 50)")
     parser.add_argument("--num-queries", type=int, default=None,
                         help="Number of test queries to evaluate (default: all)")
     parser.add_argument("--llava-model", type=str, default="HuggingFaceM4/idefics2-8b",
@@ -1315,7 +1356,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     parser.add_argument("--output", type=str, default=None,
-                        help="Output path to save results")
+                        help="Output path to save results (.pkl)")
     parser.add_argument("--num-gpus", type=int, default=None,
                         help="Number of GPUs to use (default: auto-detect all available)")
     parser.add_argument("--use-cache", action="store_true",
@@ -1323,134 +1364,99 @@ def main():
     parser.add_argument("--force-recompute", action="store_true",
                         help="Force recompute even if cache exists")
     parser.add_argument("--use-generative", action="store_true",
-                        help="Use generative evaluation (free-form generation + matching) instead of discriminative (probability-based)")
+                        help="Use generative evaluation instead of discriminative (probability-based)")
     parser.add_argument("--prefilter-topk", type=int, default=None,
-                        help="For generative evaluation: Use CLIP to pre-filter to top-K candidates (with oracle guarantee that true label is included)")
+                        help="For generative evaluation: CLIP pre-filter to top-K candidates")
     parser.add_argument("--candidate-batch-size", type=int, default=8,
-                        help="Number of candidate labels to process in parallel (default: 8). Lower this if you get OOM errors with many classes.")
+                        help="Number of candidate labels to process in parallel (default: 8)")
     parser.add_argument("--use-all-classes", action="store_true",
-                        help="Use all 100 dataset classes as candidates (instead of only classes in eval split). Only applicable for discriminative evaluation.")
+                        help="Use all dataset classes as candidates (discriminative only)")
 
     args = parser.parse_args()
 
-    # Detect GPU count via nvidia-smi to avoid initializing the CUDA runtime in the
-    # parent process. If CUDA is initialized before fork, CUDA_VISIBLE_DEVICES set in
-    # worker bodies has no effect and both workers land on the same physical GPU.
-    num_available_gpus = _count_gpus_without_cuda_init()
-    if num_available_gpus > 0:
-        device = "cuda"
-        num_gpus = args.num_gpus if args.num_gpus is not None else num_available_gpus
-        num_gpus = min(num_gpus, num_available_gpus)
-        print(f"Using device: {device}")
-        print(f"Available GPUs: {num_available_gpus}")
-        print(f"Using GPUs: {num_gpus}")
-    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        device = "mps"
-        num_gpus = 1
-        print(f"Using device: {device}")
-    else:
-        device = "cpu"
-        num_gpus = 1
-        print(f"Using device: {device}")
+    device, num_gpus, use_multi_gpu = _setup_device(args.num_gpus)
 
-    # Determine if we should use multi-GPU
-    use_multi_gpu = num_gpus > 1 and device == "cuda"
-
-    # Determine retrieval split
-    retrieval_split = determine_retrieval_split(args.eval_split, getattr(args, 'retrieval_split', None))
+    retrieval_split = determine_retrieval_split(args.eval_split, args.retrieval_split)
+    eval_mode = "generative" if args.use_generative else "discriminative"
     print(f"\nEvaluation setup:")
     print(f"  Queries from: {args.eval_split}")
     print(f"  ICL candidates from: {retrieval_split}")
+    print(f"  Evaluation mode: {eval_mode}")
+    if args.image_split_path:
+        print(f"  Image split: {args.image_split_path}")
 
-    # Print evaluation mode
-    eval_mode = "Generative" if args.use_generative else "Discriminative (probability-based)"
-    print(f"Evaluation mode: {eval_mode}")
-
-    # Get dataset size for num_queries calculation
-    # Load the specified evaluation split(s)
     print(f"\nLoading {args.eval_split} split(s) for evaluation...")
-
     if args.eval_split == "val+test":
         temp_datasets = [
-            load_dataset(args.dataset, split="val"),
-            load_dataset(args.dataset, split="test")
+            load_dataset(args.dataset, split="val", image_split_path=args.image_split_path),
+            load_dataset(args.dataset, split="test", image_split_path=args.image_split_path),
         ]
         test_dataset_size = sum(len(ds) for ds in temp_datasets)
         print(f"Combined val+test dataset size: {test_dataset_size} examples")
     else:
-        temp_datasets = [load_dataset(args.dataset, split=args.eval_split)]
+        temp_datasets = [load_dataset(args.dataset, split=args.eval_split, image_split_path=args.image_split_path)]
         test_dataset_size = len(temp_datasets[0])
         print(f"{args.eval_split} split size: {test_dataset_size} examples")
 
-    # For multi-GPU, free the datasets immediately to save memory
-    # Workers will load their own copies
     if use_multi_gpu:
         del temp_datasets
         test_dataset = None
     else:
-        # For single-GPU, combine and keep the loaded datasets
         if len(temp_datasets) > 1:
-            print(f"\nCombining {args.eval_split} splits for single-GPU evaluation...")
             test_dataset = CombinedDataset(temp_datasets)
-            print(f"Combined dataset has {len(test_dataset)} examples from {len(set(ex.label for ex in test_dataset.examples))} classes")
+            print(f"Combined dataset: {len(test_dataset)} examples, "
+                  f"{len(set(ex.label for ex in test_dataset.examples))} classes")
         else:
-            # Single split, no need to combine
             test_dataset = temp_datasets[0]
-            print(f"Using {args.eval_split} split with {len(test_dataset)} examples from {len(set(ex.label for ex in test_dataset.examples))} classes")
-
-        # For retrieval, use the same dataset
+            print(f"{args.eval_split} split: {len(test_dataset)} examples, "
+                  f"{len(set(ex.label for ex in test_dataset.examples))} classes")
         retrieval_dataset = test_dataset
 
-        # Build complete label mapping if use_all_classes is True
         all_classes_label_mapping = None
         if args.use_all_classes and not args.use_generative:
             print("\nBuilding complete label mapping from all splits...")
             all_splits_datasets = [
-                load_dataset(args.dataset, split="train"),
-                load_dataset(args.dataset, split="val"),
-                load_dataset(args.dataset, split="test")
+                load_dataset(args.dataset, split=s, image_split_path=args.image_split_path)
+                for s in ("train", "val", "test")
             ]
             all_classes_label_mapping = {}
             for ds in all_splits_datasets:
                 for ex in ds.examples:
                     if ex.label_name not in all_classes_label_mapping:
                         all_classes_label_mapping[ex.label_name] = ex.label
-            print(f"✓ Using {len(all_classes_label_mapping)} classes as candidates (from all splits)")
+            print(f"✓ Using {len(all_classes_label_mapping)} classes as candidates")
 
-    # Check cache for CLIP results
-    clip_cache_path = get_cache_path(
+    # Reranker evaluation
+    reranker_cache_path = get_cache_path(
         dataset_name=args.dataset,
-        method="clip",
+        method="reranker",
         k=args.k,
         num_queries=args.num_queries or test_dataset_size,
         seed=args.seed,
+        reranker_checkpoint=args.reranker_checkpoint,
         use_generative=args.use_generative,
         prefilter_topk=args.prefilter_topk,
         use_all_classes=args.use_all_classes
     )
 
-    clip_results = None
+    reranker_results = None
     if args.use_cache and not args.force_recompute:
-        clip_results = load_cached_results(clip_cache_path)
+        reranker_results = load_cached_results(reranker_cache_path)
 
-    if clip_results is None:
+    if reranker_results is None:
+        print("\n" + "="*70)
+        print("EVALUATING: Learned Reranker")
+        print("="*70)
+
         if use_multi_gpu:
-            print(f"\n{'='*70}")
-            print(f"MULTI-GPU MODE: Using {num_gpus} GPUs in parallel")
-            print(f"{'='*70}")
-
-            # Evaluate CLIP similarity baseline
-            print("\n" + "="*70)
-            print("EVALUATING: CLIP Similarity Baseline")
-            print("="*70)
-
-            clip_results = evaluate_icl_multigpu(
+            print(f"MULTI-GPU MODE: {num_gpus} GPUs")
+            reranker_results = evaluate_icl_multigpu(
                 dataset_name=args.dataset,
                 test_dataset_size=test_dataset_size,
                 eval_split=args.eval_split,
                 retrieval_split=retrieval_split,
-                reranker_checkpoint=None,
-                kaggle_dataset=None,
+                reranker_checkpoint=args.reranker_checkpoint,
+                kaggle_dataset=args.kaggle_dataset,
                 llava_model_name=args.llava_model,
                 load_in_8bit=args.load_in_8bit,
                 k=args.k,
@@ -1458,33 +1464,24 @@ def main():
                 num_queries=args.num_queries or test_dataset_size,
                 seed=args.seed,
                 return_predictions=True,
-                use_reranker=False,
+                use_reranker=True,
                 num_gpus=num_gpus,
                 use_generative=args.use_generative,
                 prefilter_topk=args.prefilter_topk,
                 candidate_batch_size=args.candidate_batch_size,
-                cache_path=clip_cache_path,
-                use_all_classes=args.use_all_classes
+                cache_path=reranker_cache_path,
+                use_all_classes=args.use_all_classes,
+                image_split_path=args.image_split_path,
+            )
+        else:
+            reranker, interaction_features = load_reranker(
+                checkpoint_path=args.reranker_checkpoint,
+                device=device,
+                kaggle_dataset=args.kaggle_dataset,
+                force_refresh=args.force_refresh
             )
 
-            # Save to cache if requested
-            if args.use_cache:
-                save_cached_results(clip_cache_path, clip_results)
-        else:
-            # Single GPU/CPU mode
-            # Load reranker if provided
-            reranker = None
-            interaction_features = None
-            if args.reranker_checkpoint:
-                reranker, interaction_features = load_reranker(
-                    checkpoint_path=args.reranker_checkpoint,
-                    device=device,
-                    kaggle_dataset=args.kaggle_dataset,
-                    force_refresh=args.force_refresh
-                )
-
-            # Initialize Idefics2
-            print(f"\nInitializing Idefics2 model: {args.llava_model}")
+            print(f"\nInitializing Idefics2: {args.llava_model}")
             llava_model = Idefics2Wrapper(
                 model_name=args.llava_model,
                 device=device,
@@ -1492,19 +1489,36 @@ def main():
             )
             print("✓ Idefics2 model loaded")
 
-            # Evaluate CLIP similarity baseline
-            print("\n" + "="*70)
-            print("EVALUATING: CLIP Similarity Baseline")
-            print("="*70)
+            is_patch_model = isinstance(reranker, PatchCrossAttentionReranker)
+            candidate_patch_features = None
+            if is_patch_model:
+                candidate_patch_features = extract_patch_features_for_dataset(
+                    retrieval_dataset, reranker, device, batch_size=64
+                )
 
-            def clip_retrieval_fn(query_emb, retr_ds, k, exclude_indices=None, query_image=None):
-                return retrieve_by_clip(query_emb, retr_ds, k, exclude_indices)
+            def reranker_retrieval_fn(query_emb, retr_ds, k, exclude_indices=None, query_image=None):
+                if is_patch_model:
+                    return retrieve_by_patch_reranker(
+                        query_image=query_image,
+                        query_emb=query_emb,
+                        train_dataset=retr_ds,
+                        reranker=reranker,
+                        device=device,
+                        k=k,
+                        exclude_indices=exclude_indices,
+                        prefilter_n=args.candidate_pool_size,
+                        candidate_patch_features=candidate_patch_features
+                    )
+                else:
+                    return retrieve_by_reranker(
+                        query_emb, retr_ds, reranker, interaction_features, device, k, exclude_indices
+                    )
 
-            clip_results = evaluate_icl(
+            reranker_results = evaluate_icl(
                 test_dataset=test_dataset,
                 retrieval_dataset=retrieval_dataset,
                 llava_model=llava_model,
-                retrieval_fn=clip_retrieval_fn,
+                retrieval_fn=reranker_retrieval_fn,
                 k=args.k,
                 num_queries=args.num_queries,
                 seed=args.seed,
@@ -1517,267 +1531,35 @@ def main():
                 candidate_pool_size=args.candidate_pool_size
             )
 
-            # Save to cache if requested
-            if args.use_cache:
-                save_cached_results(clip_cache_path, clip_results)
+        if args.use_cache:
+            save_cached_results(reranker_cache_path, reranker_results)
 
-    print(f"\nCLIP Baseline Results:")
-    print(f"  Accuracy: {clip_results['accuracy']:.2%}")
-    print(f"  Mean per-class accuracy: {clip_results['mean_per_class_accuracy']:.2%}")
-    print(f"  Correct: {clip_results['correct']}/{clip_results['total']}")
+    print(f"\nReranker Results:")
+    print(f"  Accuracy:              {reranker_results['accuracy']:.2%}")
+    print(f"  Mean per-class acc:    {reranker_results['mean_per_class_accuracy']:.2%}")
+    print(f"  Correct:               {reranker_results['correct']}/{reranker_results['total']}")
 
-    # Evaluate reranker if provided
-    reranker_results = None
-    if args.reranker_checkpoint:
-        # Check cache for reranker results
-        reranker_cache_path = get_cache_path(
-            dataset_name=args.dataset,
-            method="reranker",
-            k=args.k,
-            num_queries=args.num_queries or test_dataset_size,
-            seed=args.seed,
-            reranker_checkpoint=args.reranker_checkpoint,
-            use_generative=args.use_generative,
-            prefilter_topk=args.prefilter_topk,
-            use_all_classes=args.use_all_classes
-        )
+    ckpt_stem = Path(args.reranker_checkpoint).stem
+    save_eval_results(
+        method=f"reranker_{ckpt_stem}",
+        results=reranker_results,
+        run_id_parts={
+            "dataset": args.dataset,
+            "k": args.k,
+            "pool": args.candidate_pool_size,
+            "n": args.num_queries or test_dataset_size,
+            "seed": args.seed,
+            "mode": eval_mode,
+        },
+        args=vars(args),
+    )
 
-        if args.use_cache and not args.force_recompute:
-            reranker_results = load_cached_results(reranker_cache_path)
-
-        if reranker_results is None:
-            if use_multi_gpu:
-                # Multi-GPU mode for reranker
-                print("\n" + "="*70)
-                print("EVALUATING: Learned Reranker")
-                print("="*70)
-
-                reranker_results = evaluate_icl_multigpu(
-                    dataset_name=args.dataset,
-                    test_dataset_size=test_dataset_size,
-                    eval_split=args.eval_split,
-                    retrieval_split=retrieval_split,
-                    reranker_checkpoint=args.reranker_checkpoint,
-                    kaggle_dataset=args.kaggle_dataset,
-                    llava_model_name=args.llava_model,
-                    load_in_8bit=args.load_in_8bit,
-                    k=args.k,
-                    candidate_pool_size=args.candidate_pool_size,
-                    num_queries=args.num_queries or test_dataset_size,
-                    seed=args.seed,
-                    return_predictions=True,
-                    use_reranker=True,
-                    num_gpus=num_gpus,
-                    use_generative=args.use_generative,
-                    prefilter_topk=args.prefilter_topk,
-                    candidate_batch_size=args.candidate_batch_size,
-                    cache_path=reranker_cache_path,
-                    use_all_classes=args.use_all_classes
-                )
-            else:
-                # Single GPU mode for reranker
-                print("\n" + "="*70)
-                print("EVALUATING: Learned Reranker")
-                print("="*70)
-
-                is_patch_model = isinstance(reranker, PatchCrossAttentionReranker)
-                candidate_patch_features = None
-                if is_patch_model:
-                    candidate_patch_features = extract_patch_features_for_dataset(
-                        retrieval_dataset, reranker, device, batch_size=64
-                    )
-
-                def reranker_retrieval_fn(query_emb, retr_ds, k, exclude_indices=None, query_image=None):
-                    if is_patch_model:
-                        return retrieve_by_patch_reranker(
-                            query_image=query_image,
-                            query_emb=query_emb,
-                            train_dataset=retr_ds,
-                            reranker=reranker,
-                            device=device,
-                            k=k,
-                            exclude_indices=exclude_indices,
-                            prefilter_n=args.candidate_pool_size,
-                            candidate_patch_features=candidate_patch_features
-                        )
-                    else:
-                        return retrieve_by_reranker(
-                            query_emb, retr_ds, reranker, interaction_features, device, k, exclude_indices
-                        )
-
-                reranker_results = evaluate_icl(
-                    test_dataset=test_dataset,
-                    retrieval_dataset=retrieval_dataset,
-                    llava_model=llava_model,
-                    retrieval_fn=reranker_retrieval_fn,
-                    k=args.k,
-                    num_queries=args.num_queries,
-                    seed=args.seed,
-                    return_predictions=True,
-                    use_generative=args.use_generative,
-                    prefilter_topk=args.prefilter_topk,
-                    device=device,
-                    candidate_batch_size=args.candidate_batch_size,
-                    all_classes_label_mapping=all_classes_label_mapping,
-                    candidate_pool_size=args.candidate_pool_size
-                )
-
-            # Save to cache if requested
-            if args.use_cache:
-                save_cached_results(reranker_cache_path, reranker_results)
-
-    if reranker_results:
-        print(f"\nReranker Results:")
-        print(f"  Accuracy: {reranker_results['accuracy']:.2%}")
-        print(f"  Mean per-class accuracy: {reranker_results['mean_per_class_accuracy']:.2%}")
-        print(f"  Correct: {reranker_results['correct']}/{reranker_results['total']}")
-
-        # Compute improvement
-        improvement = reranker_results['accuracy'] - clip_results['accuracy']
-        relative_improvement = (improvement / clip_results['accuracy']) * 100 if clip_results['accuracy'] > 0 else 0
-
-        print(f"\n" + "="*70)
-        print("COMPARISON")
-        print("="*70)
-        print(f"Absolute improvement: {improvement:+.2%}")
-        print(f"Relative improvement: {relative_improvement:+.1f}%")
-
-        # Detailed comparison analysis
-        print(f"\n" + "="*70)
-        print("DETAILED COMPARISON")
-        print("="*70)
-
-        clip_preds = clip_results['predictions']
-        reranker_preds = reranker_results['predictions']
-
-        # Track comparison categories
-        reranker_wins = 0  # Reranker correct, CLIP wrong
-        clip_wins = 0      # CLIP correct, reranker wrong
-        both_correct = 0   # Both correct
-        both_wrong = 0     # Both wrong
-
-        # Track when both correct but selected different examples
-        both_correct_diff_examples = []
-
-        for clip_pred, reranker_pred in zip(clip_preds, reranker_preds):
-            assert clip_pred['query_idx'] == reranker_pred['query_idx']
-
-            clip_correct = clip_pred['is_correct']
-            reranker_correct = reranker_pred['is_correct']
-
-            if reranker_correct and not clip_correct:
-                reranker_wins += 1
-            elif clip_correct and not reranker_correct:
-                clip_wins += 1
-            elif clip_correct and reranker_correct:
-                both_correct += 1
-                # Check if they selected different examples
-                if clip_pred['example_indices'] != reranker_pred['example_indices']:
-                    both_correct_diff_examples.append({
-                        'query_idx': clip_pred['query_idx'],
-                        'clip_examples': clip_pred['example_indices'],
-                        'reranker_examples': reranker_pred['example_indices']
-                    })
-            else:
-                both_wrong += 1
-
-        total_queries = len(clip_preds)
-
-        print(f"\nOutcome Categories:")
-        print(f"  Reranker wins (reranker ✓, CLIP ✗):     {reranker_wins:4d} ({reranker_wins/total_queries:6.2%})")
-        print(f"  CLIP wins (CLIP ✓, reranker ✗):         {clip_wins:4d} ({clip_wins/total_queries:6.2%})")
-        print(f"  Both correct:                            {both_correct:4d} ({both_correct/total_queries:6.2%})")
-        print(f"  Both wrong:                              {both_wrong:4d} ({both_wrong/total_queries:6.2%})")
-        print(f"  Total:                                   {total_queries:4d}")
-
-        print(f"\nNet gain from reranker: {reranker_wins - clip_wins:+d} queries")
-
-        print(f"\nWhen both methods are correct:")
-        print(f"  Same examples selected:    {both_correct - len(both_correct_diff_examples):4d}")
-        print(f"  Different examples:        {len(both_correct_diff_examples):4d}")
-
-        if len(both_correct_diff_examples) > 0:
-            print(f"\n  Note: Even when both are correct, reranker selects different")
-            print(f"        examples in {len(both_correct_diff_examples)/both_correct:.1%} of cases")
-
-        # Analyze example selection overlap
-        if args.k == 1:
-            same_examples = sum(
-                1 for cp, rp in zip(clip_preds, reranker_preds)
-                if cp['example_indices'] == rp['example_indices']
-            )
-            print(f"\nExample Selection Overlap:")
-            print(f"  Same top-1 example selected: {same_examples}/{total_queries} ({same_examples/total_queries:.2%})")
-            print(f"  Different top-1 selected:    {total_queries - same_examples}/{total_queries} ({(total_queries - same_examples)/total_queries:.2%})")
-
-        # Store comparison details in results
-        reranker_results['comparison'] = {
-            'reranker_wins': reranker_wins,
-            'clip_wins': clip_wins,
-            'both_correct': both_correct,
-            'both_wrong': both_wrong,
-            'both_correct_diff_examples': both_correct_diff_examples
-        }
-
-    # Auto-save results to outputs/evals/<method>/
-    import json
-
-    def _save_eval_results(method: str, results: Dict, extra: Dict = None):
-        run_id = (
-            f"{args.dataset}"
-            f"_k{args.k}"
-            f"_pool{args.candidate_pool_size}"
-            f"_n{args.num_queries or test_dataset_size}"
-            f"_seed{args.seed}"
-            f"_{'generative' if args.use_generative else 'discriminative'}"
-        )
-        out_dir = Path("outputs/evals") / method
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        payload = {'run_id': run_id, 'method': method, 'results': results, 'args': vars(args)}
-        if extra:
-            payload.update(extra)
-        with open(out_dir / f"{run_id}.pkl", 'wb') as f:
-            pickle.dump(payload, f)
-
-        summary = {
-            'run_id': run_id,
-            'method': method,
-            'accuracy': results['accuracy'],
-            'mean_per_class_accuracy': results['mean_per_class_accuracy'],
-            'correct': results['correct'],
-            'total': results['total'],
-            'args': vars(args)
-        }
-        with open(out_dir / f"{run_id}.json", 'w') as f:
-            json.dump(summary, f, indent=2)
-
-        print(f"\n✓ {method} results saved to {out_dir}/{run_id}{{.pkl,.json}}")
-
-    _save_eval_results('clip', clip_results)
-    if reranker_results:
-        ckpt_stem = Path(args.reranker_checkpoint).stem if args.reranker_checkpoint else 'reranker'
-        _save_eval_results(f'reranker_{ckpt_stem}', reranker_results,
-                           extra={'comparison': reranker_results.get('comparison')})
-
-    # Save combined results to --output if explicitly requested
     if args.output:
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        combined = {
-            'dataset': args.dataset,
-            'k': args.k,
-            'num_queries': args.num_queries or test_dataset_size,
-            'clip_results': clip_results,
-            'reranker_results': reranker_results,
-            'args': vars(args)
-        }
-
         with open(output_path, 'wb') as f:
-            pickle.dump(combined, f)
-
-        print(f"\n✓ Combined results saved to {output_path}")
+            pickle.dump({'results': reranker_results, 'args': vars(args)}, f)
+        print(f"\n✓ Results saved to {output_path}")
 
 
 if __name__ == "__main__":
