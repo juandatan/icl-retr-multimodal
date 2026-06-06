@@ -23,8 +23,16 @@ def is_kaggle_environment() -> bool:
     return os.path.exists('/kaggle')
 
 
-def get_kaggle_checkpoint_dataset() -> str:
-    """Get Kaggle checkpoint dataset name from environment variable."""
+def get_kaggle_checkpoint_dataset(cfg=None) -> str:
+    """Get Kaggle checkpoint dataset name from config or environment variable.
+
+    Config takes precedence so each experiment uses its own dataset without
+    relying on environment variable state across runs.
+    """
+    if cfg is not None:
+        from_cfg = cfg.get('checkpoint', {}).get('kaggle_dataset', '')
+        if from_cfg:
+            return from_cfg
     return os.environ.get('KAGGLE_CHECKPOINT_DATASET', '')
 
 

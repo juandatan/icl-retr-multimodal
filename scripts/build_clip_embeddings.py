@@ -9,10 +9,20 @@ Usage:
     python scripts/build_clip_embeddings.py --dataset stanford_cars --splits train val test
     python scripts/build_clip_embeddings.py --dataset mini_imagenet --splits train
     python scripts/build_clip_embeddings.py --dataset stanford_cars --model ViT-L/14
+
+    # With image-level split (Stanford Cars within-distribution eval)
+    python scripts/build_clip_embeddings.py \
+        --dataset stanford_cars \
+        --image-split-path data/stanford_cars/image_split.json \
+        --kaggle-dataset juandatan/stanford-cars-clip
 """
 
 import argparse
+import json
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import torch
@@ -23,6 +33,47 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from src.data.stanford_cars import StanfordCarsDataset
 from src.data.mini_imagenet import MiniImageNetDataset
+
+
+def _upload_embeddings_to_kaggle(data_dir: Path, splits: list, kaggle_dataset: str):
+    """Upload clip_embeddings_{split}.pkl files to a Kaggle dataset."""
+    username, slug = kaggle_dataset.split('/')
+    title = slug.replace('-', ' ').title()
+
+    embedding_files = [data_dir / f'clip_embeddings_{s}.pkl' for s in splits]
+    missing = [f for f in embedding_files if not f.exists()]
+    if missing:
+        print(f"✗ Missing embedding files: {missing}")
+        return
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for f in embedding_files:
+            shutil.copy(f, tmp / f.name)
+
+        metadata = {
+            "title": title,
+            "id": f"{username}/{slug}",
+            "licenses": [{"name": "CC0-1.0"}],
+        }
+        (tmp / "dataset-metadata.json").write_text(json.dumps(metadata, indent=2))
+
+        exists = subprocess.run(
+            ["kaggle", "datasets", "status", kaggle_dataset],
+            capture_output=True,
+        ).returncode == 0
+
+        if exists:
+            cmd = ["kaggle", "datasets", "version", "-p", str(tmp),
+                   "-m", f"Update embeddings: {', '.join(splits)}", "--dir-mode", "zip"]
+        else:
+            cmd = ["kaggle", "datasets", "create", "-p", str(tmp), "--dir-mode", "zip"]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"✓ Uploaded embeddings to https://www.kaggle.com/datasets/{kaggle_dataset}")
+        else:
+            print(f"✗ Upload failed: {result.stderr}")
 
 
 def main():
@@ -76,6 +127,18 @@ def main():
         default=42,
         help='Random seed for class splits (default: 42)'
     )
+    parser.add_argument(
+        '--image-split-path',
+        type=str,
+        default=None,
+        help='Path to image-level split JSON (for Stanford Cars within-distribution eval)'
+    )
+    parser.add_argument(
+        '--kaggle-dataset',
+        type=str,
+        default=None,
+        help='Kaggle dataset to upload embeddings to (username/dataset-slug)'
+    )
 
     args = parser.parse_args()
 
@@ -114,6 +177,8 @@ def main():
     print(f"  Batch Size: {args.batch_size}")
     print(f"  Splits: {', '.join(args.splits)}")
     print(f"  Data Directory: {args.data_dir}")
+    if args.image_split_path:
+        print(f"  Image Split: {args.image_split_path}")
     print(f"\n{'='*70}\n")
 
     # Load CLIP model
@@ -129,11 +194,10 @@ def main():
         print(f"{'='*70}\n")
 
         # Load dataset
-        dataset = DatasetClass(
-            split=split,
-            data_dir=args.data_dir,
-            class_split_seed=args.class_split_seed,
-        )
+        kwargs = dict(split=split, data_dir=args.data_dir, class_split_seed=args.class_split_seed)
+        if args.dataset == 'stanford_cars' and args.image_split_path:
+            kwargs['image_split_path'] = args.image_split_path
+        dataset = DatasetClass(**kwargs)
 
         print(f"Loaded {len(dataset)} examples\n")
 
@@ -177,11 +241,10 @@ def main():
     print(f"{'='*70}\n")
 
     # Use train split to save class split info
-    train_dataset = DatasetClass(
-        split='train',
-        data_dir=args.data_dir,
-        class_split_seed=args.class_split_seed,
-    )
+    train_kwargs = dict(split='train', data_dir=args.data_dir, class_split_seed=args.class_split_seed)
+    if args.dataset == 'stanford_cars' and args.image_split_path:
+        train_kwargs['image_split_path'] = args.image_split_path
+    train_dataset = DatasetClass(**train_kwargs)
     train_dataset.save_split_info()
 
     # Final summary
@@ -204,6 +267,13 @@ def main():
     print(f"\nEmbeddings cached in: {args.data_dir}/")
     print(f"  Format: clip_embeddings_{{split}}.pkl")
     print(f"\n✓ All embeddings generated successfully!")
+
+    if args.kaggle_dataset:
+        _upload_embeddings_to_kaggle(
+            data_dir=Path(args.data_dir),
+            splits=args.splits,
+            kaggle_dataset=args.kaggle_dataset,
+        )
 
 
 if __name__ == "__main__":

@@ -27,8 +27,7 @@ from compute_marginal_utilities_multigpu import (
     load_clip_embeddings,
     initialize_model,
     load_baseline_probs,
-    retrieve_candidates,
-    compute_utilities_for_query,
+    retrieve_and_compute_contrastive,
     load_gpu_checkpoint,
     save_gpu_checkpoint,
     is_kaggle_environment
@@ -79,23 +78,15 @@ def main():
     # Process queries
     for query_idx in tqdm(range(resume_start, args.query_end), desc=f"GPU {gpu_id}"):
         try:
-            # Retrieve candidates
-            candidate_indices, similarities = retrieve_candidates(
+            # Retrieve candidates and compute utilities, expanding beyond top_k only
+            # if needed to achieve a contrastive set (both positive and negative utility).
+            query_results = retrieve_and_compute_contrastive(
                 dataset=dataset,
                 query_idx=query_idx,
                 top_k=cfg.retrieval.top_k,
-                cfg=cfg
-            )
-
-            # Compute utilities
-            query_results = compute_utilities_for_query(
+                cfg=cfg,
                 model=model,
-                dataset=dataset,
-                query_idx=query_idx,
-                candidate_indices=candidate_indices,
-                similarity_scores=similarities,
                 baseline_probs=baseline_probs,
-                cfg=cfg
             )
 
             all_results.extend(query_results)

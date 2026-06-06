@@ -64,6 +64,16 @@ class MarginalUtilityDataset(Dataset):
     returning (query_emb, example_emb, similarity, utility) tuples.
 
     Key design: Query-based splitting to test generalization to new queries.
+
+    Data volume ablation: Use `top_k` to simulate training on n=10/20/etc from a
+    larger collected dataset (e.g. n=50), without re-running LLaVA inference.
+    Filtering is by per-query similarity rank, so the top-k most similar candidates
+    are retained for each query independently.
+
+    Contrastiveness: A query is "contrastive" if its candidate set contains both
+    helpful (utility > 0) and harmful (utility <= 0) examples. Use `contrastive_mode`
+    to guarantee contrastiveness within the top-k by swapping in the nearest
+    opposite-sign candidate from outside the top-k when needed.
     """
 
     def __init__(
@@ -73,7 +83,9 @@ class MarginalUtilityDataset(Dataset):
         split: str = 'train',
         seed: int = 42,
         interaction_features: Optional[InteractionFeaturesConfig] = None,
-        normalize_utilities: bool = False
+        normalize_utilities: bool = False,
+        top_k: Optional[int] = None,
+        contrastive_mode: str = 'none',
     ):
         """
         Initialize dataset.
@@ -85,13 +97,29 @@ class MarginalUtilityDataset(Dataset):
             seed: Random seed for reproducible splitting
             interaction_features: Configuration for interaction features to compute
             normalize_utilities: If True, normalize utilities to [0, 1] range using min-max scaling
+            top_k: If set, retain only the top-k candidates per query by similarity rank.
+                Used for data volume ablations: generate data at n=50, then train at
+                n=10/20/etc without re-running inference.
+            contrastive_mode: How to select candidates per query.
+                'none'         — top-k by similarity, no contrastiveness constraint (default)
+                'contrastive'  — top-k by similarity, but guarantee both positive and negative
+                                 utility examples are present by swapping in the nearest
+                                 opposite-sign candidate from outside the top-k if needed.
+                                 Requires top_k to be set, and that the data was generated
+                                 with retrieval.contrastive_max_pool set in the data generation
+                                 config, so every query has both signs available in the full pool.
         """
+        if contrastive_mode not in ('none', 'contrastive'):
+            raise ValueError(f"contrastive_mode must be 'none' or 'contrastive', got {contrastive_mode!r}")
+
         self.results_path = results_path
         self.embeddings_path = embeddings_path
         self.split = split
         self.seed = seed
         self.interaction_features = interaction_features or InteractionFeaturesConfig()
         self.normalize_utilities = normalize_utilities
+        self.top_k = top_k
+        self.contrastive_mode = contrastive_mode
 
         # Load data
         print(f"Loading marginal utility results from {results_path}...")
@@ -100,7 +128,8 @@ class MarginalUtilityDataset(Dataset):
         all_results = data['results']
         print(f"✓ Loaded {len(all_results)} result pairs")
 
-        # Compute normalization statistics from ALL data (before splitting)
+        # Compute normalization statistics from ALL data (before any filtering) so
+        # that stats are consistent across different top_k / contrastive_mode settings.
         if self.normalize_utilities:
             all_utilities = np.array([self._get_attr(r, 'marginal_utility') for r in all_results])
             self.utility_min = float(np.min(all_utilities))
@@ -135,6 +164,15 @@ class MarginalUtilityDataset(Dataset):
         else:
             raise ValueError(f"Invalid split: {split}. Must be 'train', 'val', or 'test'")
 
+        # Apply top-k or contrastive top-k filtering.
+        # 'contrastive' mode subsumes top-k filtering (it also selects top_k per query).
+        if self.contrastive_mode == 'contrastive':
+            if self.top_k is None:
+                raise ValueError("top_k must be set when contrastive_mode='contrastive'")
+            self.results = self._apply_contrastive_mode(self.results, self.top_k)
+        elif self.top_k is not None:
+            self.results = self._apply_top_k(self.results, self.top_k)
+
         query_indices = [self._get_attr(r, 'query_idx') for r in self.results]
         print(f"✓ {split.upper()} split: {len(self.results)} pairs from "
               f"{len(set(query_indices))} queries")
@@ -164,6 +202,97 @@ class MarginalUtilityDataset(Dataset):
             return 0.5  # All utilities are the same
 
         return (utility - self.utility_min) / self.utility_range
+
+    @staticmethod
+    def _group_by_query(results: List) -> Dict[int, List]:
+        """Group results by query_idx. Handles both dataclass and dict result objects."""
+        groups: Dict[int, List] = defaultdict(list)
+        for r in results:
+            groups[MarginalUtilityDataset._get_attr(r, 'query_idx')].append(r)
+        return groups
+
+    @staticmethod
+    def _apply_top_k(results: List, top_k: int) -> List:
+        """
+        Retain only the top-k candidates per query ranked by similarity score.
+
+        Enables data volume ablations: generate once at n=50, then instantiate
+        datasets at n=10, n=20, etc. without re-running inference.
+        """
+        query_groups = MarginalUtilityDataset._group_by_query(results)
+
+        filtered = []
+        for group in query_groups.values():
+            sorted_group = sorted(
+                group,
+                key=lambda r: MarginalUtilityDataset._get_attr(r, 'similarity_score'),
+                reverse=True
+            )
+            filtered.extend(sorted_group[:top_k])
+
+        print(f"  top_k={top_k}: {len(filtered)} pairs retained from {len(query_groups)} queries "
+              f"(was {len(results)})")
+        return filtered
+
+    @staticmethod
+    def _apply_contrastive_mode(results: List, top_k: int) -> List:
+        """
+        Build a contrastive top-k candidate set for each query.
+
+        Requires that data was generated with retrieval.contrastive_max_pool set,
+        so every query has both positive and negative utility examples available
+        in the full stored pool.
+
+        For each query:
+          1. Sort all candidates by similarity (descending).
+          2. Take the top-k by similarity.
+          3. If top-k is already contrastive, keep it as-is.
+          4. Otherwise, swap the lowest-similarity majority-sign example in top-k
+             with the highest-similarity opposite-sign candidate from the remainder.
+        """
+        get_attr = MarginalUtilityDataset._get_attr
+        query_groups = MarginalUtilityDataset._group_by_query(results)
+
+        output = []
+        n_swapped = 0
+
+        for group in query_groups.values():
+            sorted_group = sorted(
+                group,
+                key=lambda r: get_attr(r, 'similarity_score'),
+                reverse=True
+            )
+            selected = sorted_group[:top_k]
+            pool = sorted_group[top_k:]
+
+            has_positive = any(get_attr(r, 'marginal_utility') > 0 for r in selected)
+            has_negative = any(get_attr(r, 'marginal_utility') <= 0 for r in selected)
+
+            if not (has_positive and has_negative) and pool:
+                need_positive = not has_positive
+                inject = None
+                for pool_r in pool:  # pool is similarity-sorted descending
+                    u = get_attr(pool_r, 'marginal_utility')
+                    if (need_positive and u > 0) or (not need_positive and u <= 0):
+                        inject = pool_r
+                        break
+
+                if inject is not None:
+                    # Replace the lowest-similarity majority-sign element in selected.
+                    # selected is similarity-sorted descending, so scan from the end.
+                    for i in range(len(selected) - 1, -1, -1):
+                        u = get_attr(selected[i], 'marginal_utility')
+                        is_majority = (not need_positive and u > 0) or (need_positive and u <= 0)
+                        if is_majority:
+                            selected[i] = inject
+                            n_swapped += 1
+                            break
+
+            output.extend(selected)
+
+        print(f"  contrastive top-k={top_k}: {n_swapped}/{len(query_groups)} queries needed a swap, "
+              f"{len(output)} pairs total")
+        return output
 
     @staticmethod
     def split_by_query(
@@ -356,7 +485,9 @@ class PairwiseMarginalUtilityDataset(MarginalUtilityDataset):
         seed: int = 42,
         interaction_features: Optional[InteractionFeaturesConfig] = None,
         pairs_per_query: int = 10,
-        normalize_utilities: bool = False
+        normalize_utilities: bool = False,
+        top_k: Optional[int] = None,
+        contrastive_mode: str = 'none',
     ):
         """
         Initialize pairwise dataset.
@@ -369,8 +500,11 @@ class PairwiseMarginalUtilityDataset(MarginalUtilityDataset):
             interaction_features: Configuration for interaction features to compute
             pairs_per_query: Number of pairs to sample per query
             normalize_utilities: If True, normalize utilities to [0, 1] range
+            top_k: If set, retain only top-k candidates per query by similarity rank
+            contrastive_mode: 'none' or 'contrastive'
         """
-        super().__init__(results_path, embeddings_path, split, seed, interaction_features, normalize_utilities)
+        super().__init__(results_path, embeddings_path, split, seed, interaction_features,
+                         normalize_utilities, top_k, contrastive_mode)
 
         self.pairs_per_query = pairs_per_query
         self.rng = random.Random(seed)

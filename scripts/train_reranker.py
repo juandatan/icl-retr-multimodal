@@ -928,13 +928,22 @@ def main(cfg: DictConfig):
         normalize_utilities = loss_type == 'bce' or cfg.training.get('normalize_utilities', False)
         print(f"  Normalize utilities: {normalize_utilities}")
 
+        top_k = cfg.data.get('top_k', None)
+        contrastive_mode = cfg.data.get('contrastive_mode', 'none')
+        if top_k is not None:
+            print(f"  Data volume ablation: top_k={top_k} candidates per query")
+        if contrastive_mode != 'none':
+            print(f"  Contrastive mode: {contrastive_mode}")
+
         train_dataset_kwargs = {
             'results_path': results_path,
             'embeddings_path': embeddings_path,
             'split': 'train',
             'seed': cfg.experiment.seed,
             'interaction_features': interaction_features,
-            'normalize_utilities': normalize_utilities
+            'normalize_utilities': normalize_utilities,
+            'top_k': top_k,
+            'contrastive_mode': contrastive_mode,
         }
 
         # Add pairs_per_query for pairwise ranking dataset
@@ -943,14 +952,17 @@ def main(cfg: DictConfig):
 
         train_dataset = train_dataset_class(**train_dataset_kwargs)
 
-        # Validation always uses regular dataset (for MSE/Spearman metrics)
+        # Validation uses the same top_k so the candidate distribution matches training,
+        # but no contrastive mode — always evaluate on the unmodified top-k slice.
         val_dataset = MarginalUtilityDataset(
             results_path=results_path,
             embeddings_path=embeddings_path,
             split='val',
             seed=cfg.experiment.seed,
             interaction_features=interaction_features,
-            normalize_utilities=normalize_utilities
+            normalize_utilities=normalize_utilities,
+            top_k=top_k,
+            contrastive_mode='none',
         )
 
     # Compute baseline

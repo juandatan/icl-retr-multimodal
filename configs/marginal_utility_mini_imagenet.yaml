@@ -67,6 +67,7 @@ checkpoint:
   save_dir: "outputs/marginal_utilities"
   save_interval: 100  # Save checkpoint every N queries
   resume_from: null  # Path to checkpoint to resume from (null = start fresh)
+  kaggle_dataset: "juandatan/mini-imagenet-utility-checkpoints-idefics2"  # Kaggle dataset for checkpoint persistence
 
 # Output configuration
 output:

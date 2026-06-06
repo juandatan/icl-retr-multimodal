@@ -18,15 +18,15 @@ from omegaconf import DictConfig
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from utils.multigpu_utils import get_available_gpus, split_work_across_gpus
+from compute_marginal_utilities_multigpu import load_dataset, load_clip_embeddings
 
 
 def get_total_queries(cfg: DictConfig) -> int:
-    """Determine total number of queries to process."""
     if cfg.limits.max_queries:
         return cfg.limits.max_queries
-
-    # Would need to load dataset to get actual size, for now estimate
-    return 40000  # Mini-ImageNet train split size
+    dataset = load_dataset(cfg)
+    load_clip_embeddings(dataset, cfg)
+    return len(dataset)
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="marginal_utility_mini_imagenet")

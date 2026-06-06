@@ -26,6 +26,22 @@ data:
   val_ratio: 0.1
   test_ratio: 0.1
 
+  # Data volume ablation: if utility data was generated at n=50, set top_k=10 or
+  # top_k=20 to train on a smaller candidate set without re-running LLaVA inference.
+  # Candidates are ranked by per-query similarity, so top_k=10 gives the 10 most
+  # similar examples per query. null = use all candidates in the file.
+  top_k: null
+
+  # Contrastive training mode. Requires top_k to be set, and that data was generated
+  # with the contrastive collection strategy (retrieval.contrastive_max_pool in the
+  # data generation config), which guarantees every query has both positive and
+  # negative utility examples in its full candidate pool.
+  # Options:
+  #   'none'         — top-k by similarity only, no contrastiveness guarantee (default)
+  #   'contrastive'  — top-k by similarity, but swap in the nearest opposite-sign
+  #                    candidate when the top-k is entirely one sign
+  contrastive_mode: "none"
+
 # Model configuration
 model:
   # Architecture type: "mlp" or "cross_attention"

@@ -1,11 +1,14 @@
-# GPU-Optimized Marginal Utility Computation Configuration
-# Use this config when running on GPU (CUDA) for much faster inference
+# Marginal Utility Computation Configuration - Stanford Cars
+# Fine-grained classification dataset with 196 car model classes.
+# Generates contrastive candidate sets (both positive and negative utility)
+# per query, up to contrastive_max_pool, to support data volume ablations
+# and contrastive/non-contrastive training splits from a single dataset.
 
 # Experiment metadata
 experiment:
   name: "marginal_utility_stanford_cars"
-  description: "GPU-optimized marginal utility computation"
-  tags: ["icl", "marginal_utility", "stanford_cars", "gpu"]
+  description: "Compute marginal utility scores for Stanford Cars (196 fine-grained classes)"
+  tags: ["icl", "marginal_utility", "stanford_cars"]
   seed: 42
 
 # Dataset configuration
@@ -30,34 +33,22 @@ retrieval:
   # is stored as-is with a warning. Set to top_k * 5 as a safe default.
   contrastive_max_pool: 250
 
-  # Stratified sampling configuration
-  use_stratified_sampling: true  # Enable stratified sampling by similarity ranges
-  pool_size: 500  # Size of candidate pool to sample from (larger = better coverage)
-
-  # Define sampling strategy across similarity percentiles
-  # Percentiles are based on similarity ranking (0 = most similar, 100 = least similar among top pool_size)
-  # sample_ratio: proportion of top_k to sample from this range (should sum to ~1.0)
-  stratification:
-    - percentile: [0, 20]      # Top 20% most similar
-      sample_ratio: 0.33       # ~33% of samples from this range
-    - percentile: [20, 60]     # Middle 40%
-      sample_ratio: 0.40       # ~40% of samples from this range
-    - percentile: [60, 100]    # Bottom 40%
-      sample_ratio: 0.27       # ~27% of samples from this range
-  # With top_k=30: 10 from top-20%, 12 from middle-40%, 8 from bottom-40%
+  # Disable stratified sampling — contrastive collection already ensures
+  # diversity of utility signs; stratification by similarity is not needed.
+  use_stratified_sampling: false
 
 # Model configuration
 model:
-  name: "llava-hf/llava-1.5-7b-hf"
+  name: "HuggingFaceM4/idefics2-8b"
   load_in_8bit: false  # Set to true if GPU memory < 16GB
   load_in_4bit: false  # Set to true if GPU memory < 12GB
   device_map: "auto"
-  torch_dtype: "float16"  # Use fp16 for GPU efficiency
+  torch_dtype: "float16"
 
-# Computation configuration - GPU OPTIMIZED
+# Computation configuration
 computation:
-  batch_size: 4  # Reduced from 20 to avoid CUDA OOM with 8-bit quantization
-  baseline_batch_size: 8  # Reduced from 32 to be conservative
+  batch_size: 5
+  baseline_batch_size: 8
   num_workers: 0
   cache_baselines: true
   baseline_cache_path: "data/stanford_cars/baseline_probs_{split}.pkl"
@@ -68,6 +59,7 @@ checkpoint:
   save_dir: "outputs/marginal_utilities"
   save_interval: 100
   resume_from: null
+  kaggle_dataset: "juandatan/stanford-cars-utility-checkpoints"  # Kaggle dataset for checkpoint persistence
 
 # Output configuration
 output:
@@ -78,15 +70,15 @@ output:
 
 # Logging configuration
 logging:
-  use_wandb: false  # Disable for faster iteration
+  use_wandb: true
   wandb_project: "icl-retrieval-multimodal"
   wandb_entity: null
-  wandb_mode: "offline"
+  wandb_mode: "online"
   log_frequency: 10
-  save_artifacts: false
+  save_artifacts: true
 
 # Resource limits
 limits:
-  max_queries: null  # Process all queries
+  max_queries: null
   timeout_per_query: 300
   memory_limit_gb: null

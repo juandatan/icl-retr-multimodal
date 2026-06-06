@@ -158,6 +158,77 @@ def retrieve_candidates(dataset, query_idx: int, top_k: int, cfg: DictConfig) ->
     return similar_indices, similarities
 
 
+def retrieve_and_compute_contrastive(
+    dataset,
+    query_idx: int,
+    top_k: int,
+    cfg: DictConfig,
+    model,
+    baseline_probs: Dict,
+) -> List:
+    """
+    Retrieve and compute utilities for a query, expanding beyond top_k until the
+    candidate set is contrastive (contains both positive and negative marginal
+    utility examples), up to retrieval.contrastive_max_pool.
+
+    The stored candidate set has size min(n_needed_for_contrastiveness, max_pool),
+    which equals top_k for already-contrastive queries. This lets a single dataset
+    support both contrastive and non-contrastive training splits at inference time:
+      - top_k filter alone  → non-contrastive top-k subset per query
+      - top_k + contrastive_mode='contrastive' → contrastive top-k subset per query
+
+    Candidates are retrieved in similarity order (one CLIP call up front), and
+    LLaVA inference runs in batches stopping as soon as top_k is reached AND
+    both utility signs are present.
+    """
+    max_pool = cfg.retrieval.get('contrastive_max_pool', top_k * 5)
+
+    # One CLIP call to get the full ranked pool
+    all_indices, all_similarities = dataset.get_top_k_similar(
+        query_idx=query_idx,
+        k=min(max_pool, len(dataset) - 1),
+        exclude_query=True,
+        exclude_same_class=cfg.retrieval.exclude_same_class
+    )
+
+    results_so_far = []
+    has_positive = False
+    has_negative = False
+    batch_size = cfg.computation.batch_size
+
+    for batch_start in range(0, len(all_indices), batch_size):
+        batch_end = min(batch_start + batch_size, len(all_indices))
+        batch_indices = all_indices[batch_start:batch_end]
+        batch_sims = all_similarities[batch_start:batch_end]
+
+        batch_results = compute_utilities_for_query(
+            model=model,
+            dataset=dataset,
+            query_idx=query_idx,
+            candidate_indices=batch_indices,
+            similarity_scores=batch_sims,
+            baseline_probs=baseline_probs,
+            cfg=cfg
+        )
+        results_so_far.extend(batch_results)
+
+        for r in batch_results:
+            u = r.marginal_utility if hasattr(r, 'marginal_utility') else r['marginal_utility']
+            if u > 0:
+                has_positive = True
+            else:
+                has_negative = True
+
+        # Stop as soon as we have top_k candidates and both signs are represented
+        if len(results_so_far) >= top_k and has_positive and has_negative:
+            break
+
+    if not (has_positive and has_negative):
+        print(f"  [query {query_idx}] ⚠️  Non-contrastive after {len(results_so_far)} candidates")
+
+    return results_so_far
+
+
 def compute_utilities_for_query(
     model,
     dataset,
@@ -276,7 +347,7 @@ def save_gpu_checkpoint(
     # Upload to Kaggle if requested
     # Use lock to prevent concurrent uploads from multiple GPUs
     if upload_to_kaggle and is_kaggle_environment():
-        kaggle_dataset = get_kaggle_checkpoint_dataset()
+        kaggle_dataset = get_kaggle_checkpoint_dataset(cfg)
         if kaggle_dataset:
             if checkpoint_lock:
                 with checkpoint_lock:
@@ -304,7 +375,7 @@ def load_gpu_checkpoint(gpu_id: int, cfg: DictConfig, query_start: int, query_en
     """
     Load checkpoint for a specific GPU if it exists.
 
-    If running in Kaggle and KAGGLE_CHECKPOINT_DATASET is set,
+    If running in Kaggle and checkpoint.kaggle_dataset is set in config,
     downloads checkpoints from Kaggle dataset first (only GPU 0 downloads to avoid race conditions).
 
     Args:
@@ -325,7 +396,7 @@ def load_gpu_checkpoint(gpu_id: int, cfg: DictConfig, query_start: int, query_en
     # Download checkpoints from Kaggle if configured
     # Only GPU 0 downloads to avoid race conditions
     if gpu_id == 0 and is_kaggle_environment():
-        kaggle_dataset = get_kaggle_checkpoint_dataset()
+        kaggle_dataset = get_kaggle_checkpoint_dataset(cfg)
         if kaggle_dataset:
             if checkpoint_lock:
                 with checkpoint_lock:
@@ -473,23 +544,15 @@ def process_query_range(
             tqdm_kwargs['position'] = original_gpu_id
 
         for query_idx in tqdm(range(resume_start, query_end), **tqdm_kwargs):
-            # Retrieve candidates
-            candidate_indices, similarities = retrieve_candidates(
+            # Retrieve candidates and compute utilities, expanding beyond top_k only
+            # if needed to achieve a contrastive set (both positive and negative utility).
+            query_results = retrieve_and_compute_contrastive(
                 dataset=dataset,
                 query_idx=query_idx,
                 top_k=cfg.retrieval.top_k,
-                cfg=cfg
-            )
-
-            # Compute utilities
-            query_results = compute_utilities_for_query(
+                cfg=cfg,
                 model=model,
-                dataset=dataset,
-                query_idx=query_idx,
-                candidate_indices=candidate_indices,
-                similarity_scores=similarities,
                 baseline_probs=baseline_probs,
-                cfg=cfg
             )
 
             all_results.extend(query_results)
