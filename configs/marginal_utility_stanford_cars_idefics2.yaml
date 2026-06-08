@@ -6,7 +6,7 @@
 
 # Experiment metadata
 experiment:
-  name: "marginal_utility_stanford_cars"
+  name: "marginal_utility_stanford_cars_idefics2"
   description: "Compute marginal utility scores for Stanford Cars (196 fine-grained classes)"
   tags: ["icl", "marginal_utility", "stanford_cars"]
   seed: 42
@@ -17,6 +17,7 @@ dataset:
   split: "train"
   class_split_seed: 42
   cache_dir: "data/stanford_cars"
+  image_split_path: "data/stanford_cars/image_split.json"  # Image-level splits (all 196 classes in every split)
 
 # Retrieval configuration
 retrieval:
@@ -59,7 +60,7 @@ checkpoint:
   save_dir: "outputs/marginal_utilities"
   save_interval: 100
   resume_from: null
-  kaggle_dataset: "juandatan/stanford-cars-utility-checkpoints"  # Kaggle dataset for checkpoint persistence
+  kaggle_dataset: "juandatan/stanford-cars-utility-checkpoints-idefics2"  # Kaggle dataset for checkpoint persistence
 
 # Output configuration
 output:

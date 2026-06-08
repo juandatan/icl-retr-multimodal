@@ -184,10 +184,14 @@ class BaseUtilityDataset(Dataset, ABC):
                 cache_data = pickle.load(f)
             current_ids = [ex.image_path for ex in self.examples]
             cached_ids = cache_data.get('example_ids')
+            embeddings = cache_data['embeddings']
             if cached_ids is not None and cached_ids != current_ids:
                 print(f"⚠️  Cached embeddings are for a different split — skipping.")
                 return False
-            self.clip_embeddings = cache_data['embeddings']
+            if len(embeddings) != len(self.examples):
+                print(f"⚠️  Cached embeddings size ({len(embeddings)}) != dataset size ({len(self.examples)}) — skipping.")
+                return False
+            self.clip_embeddings = embeddings
             self.clip_model_name = cache_data['model_name']
             return True
         return False
@@ -223,10 +227,11 @@ class BaseUtilityDataset(Dataset, ABC):
                 cache_data = pickle.load(f)
             current_ids = [ex.image_path for ex in self.examples]
             cached_ids = cache_data.get('example_ids')
-            if cached_ids is not None and cached_ids != current_ids:
+            embeddings = cache_data['embeddings']
+            if (cached_ids is not None and cached_ids != current_ids) or len(embeddings) != len(self.examples):
                 print(f"⚠️  Cached embeddings are for a different split — recomputing.")
             else:
-                self.clip_embeddings = cache_data['embeddings']
+                self.clip_embeddings = embeddings
                 self.clip_model_name = cache_data['model_name']
                 return self.clip_embeddings
 

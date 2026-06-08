@@ -55,7 +55,8 @@ def load_dataset(cfg: DictConfig):
         dataset = StanfordCarsDataset(
             split=cfg.dataset.split,
             data_dir=cfg.dataset.cache_dir,
-            class_split_seed=cfg.dataset.class_split_seed
+            class_split_seed=cfg.dataset.class_split_seed,
+            image_split_path=cfg.dataset.get('image_split_path', None)
         )
     elif cfg.dataset.name == "mini_imagenet":
         # Disable local caching in Kaggle to save disk space

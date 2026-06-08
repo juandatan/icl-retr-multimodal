@@ -18,15 +18,13 @@ from omegaconf import DictConfig
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from utils.multigpu_utils import get_available_gpus, split_work_across_gpus
-from compute_marginal_utilities_multigpu import load_dataset, load_clip_embeddings
+from compute_marginal_utilities_multigpu import load_dataset
 
 
 def get_total_queries(cfg: DictConfig) -> int:
     if cfg.limits.max_queries:
         return cfg.limits.max_queries
-    dataset = load_dataset(cfg)
-    load_clip_embeddings(dataset, cfg)
-    return len(dataset)
+    return len(load_dataset(cfg))
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="marginal_utility_mini_imagenet")
