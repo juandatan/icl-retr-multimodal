@@ -113,29 +113,28 @@ def get_cache_path(
     reranker_checkpoint: str = None,
     use_generative: bool = False,
     prefilter_topk: Optional[int] = None,
-    use_all_classes: bool = False
+    use_all_classes: bool = False,
+    candidate_pool_size: Optional[int] = None,
 ) -> Path:
     """Generate cache path for evaluation results."""
     cache_dir = Path("outputs/icl_evaluation_cache")
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create a unique identifier for this evaluation configuration
     config_id = f"{dataset_name}_{method}_k{k}_n{num_queries}_seed{seed}"
 
     if reranker_checkpoint and method == "reranker":
-        # Add checkpoint name to cache key
         ckpt_name = Path(reranker_checkpoint).stem
         config_id += f"_{ckpt_name}"
 
-    # Add evaluation method to cache key
+    if candidate_pool_size is not None:
+        config_id += f"_pool{candidate_pool_size}"
+
     if use_generative:
         config_id += "_generative"
 
-    # Add prefilter setting to cache key
     if prefilter_topk is not None:
         config_id += f"_prefilter{prefilter_topk}"
 
-    # Add use_all_classes setting to cache key
     if use_all_classes:
         config_id += "_allclasses"
 
@@ -687,7 +686,8 @@ def _evaluate_queries(
     candidate_batch_size: int = 8,
     cache_path: Optional[Path] = None,
     save_frequency: int = 50,
-    all_classes_label_mapping: Optional[Dict] = None
+    all_classes_label_mapping: Optional[Dict] = None,
+    force_recompute: bool = False,
 ) -> Dict:
     """
     Shared evaluation logic for both single-GPU and multi-GPU modes.
@@ -709,13 +709,14 @@ def _evaluate_queries(
         return_predictions: Whether to return detailed predictions
         progress_desc: Description for progress bar
         all_classes_label_mapping: Optional complete label_name -> label mapping for all classes
+        force_recompute: If True, ignore existing cache and recompute from scratch
 
     Returns:
         Dictionary with evaluation results
     """
     # Load existing cache if available
     completed_queries = set()
-    if cache_path and cache_path.exists():
+    if not force_recompute and cache_path and cache_path.exists():
         cached = load_cached_results(cache_path)
         if cached:
             completed_queries = cached.get('completed_queries', set())
@@ -914,6 +915,7 @@ def evaluate_icl_worker(
     do_image_splitting: bool = False,
     worker_id: Optional[int] = None,
     image_split_path: Optional[str] = None,
+    force_recompute: bool = False,
 ) -> Dict:
     """Worker function for multi-GPU evaluation. Runs on a single GPU and evaluates a subset of queries.
 
@@ -1039,7 +1041,8 @@ def evaluate_icl_worker(
         progress_desc=f"GPU {gpu_id}",
         candidate_batch_size=candidate_batch_size,
         cache_path=cache_path,
-        all_classes_label_mapping=all_classes_label_mapping
+        all_classes_label_mapping=all_classes_label_mapping,
+        force_recompute=force_recompute,
     )
 
 
@@ -1066,6 +1069,7 @@ def evaluate_icl_multigpu(
     use_all_classes: bool = False,
     do_image_splitting: bool = True,
     image_split_path: Optional[str] = None,
+    force_recompute: bool = False,
 ) -> Dict:
     """
     Evaluate ICL performance using multiple GPUs in parallel.
@@ -1133,6 +1137,7 @@ def evaluate_icl_multigpu(
                 'all_classes_label_mapping': all_classes_label_mapping,
                 'do_image_splitting': do_image_splitting,
                 'image_split_path': image_split_path,
+                'force_recompute': force_recompute,
             }
         )
 
@@ -1436,7 +1441,8 @@ def main():
         reranker_checkpoint=args.reranker_checkpoint,
         use_generative=args.use_generative,
         prefilter_topk=args.prefilter_topk,
-        use_all_classes=args.use_all_classes
+        use_all_classes=args.use_all_classes,
+        candidate_pool_size=args.candidate_pool_size,
     )
 
     reranker_results = None
@@ -1472,6 +1478,7 @@ def main():
                 cache_path=reranker_cache_path,
                 use_all_classes=args.use_all_classes,
                 image_split_path=args.image_split_path,
+                force_recompute=args.force_recompute,
             )
         else:
             reranker, interaction_features = load_reranker(

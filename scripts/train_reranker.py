@@ -34,8 +34,9 @@ from src.data.marginal_utility_dataset import (
     InteractionFeaturesConfig,
     MarginalUtilityDataset,
     PairwiseMarginalUtilityDataset,
+    QuerySplitConfig,
 )
-from src.data.marginal_utility_image_dataset import MarginalUtilityImageDataset, CachedPatchFeatureDataset
+from src.data.marginal_utility_image_dataset import MarginalUtilityImageDataset, CachedPatchFeatureDataset, PairwiseCachedPatchFeatureDataset
 from src.data.stanford_cars import StanfordCarsDataset
 from src.data.mini_imagenet import MiniImageNetDataset
 from src.models.mlp_reranker import MLPReranker
@@ -92,7 +93,8 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: str,
     interaction_features: InteractionFeaturesConfig,
-    grad_clip: float = 1.0
+    grad_clip: float = 1.0,
+    scheduler=None,
 ) -> float:
     """Train for one epoch."""
     model.train()
@@ -123,6 +125,8 @@ def train_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         total_loss += loss.item()
         num_batches += 1
@@ -143,7 +147,8 @@ def train_epoch_patch(
     optimizer: torch.optim.Optimizer,
     device: str,
     grad_clip: float = 1.0,
-    rank: int = 0
+    rank: int = 0,
+    scheduler=None,
 ) -> float:
     """Train for one epoch with patch-based model."""
     model.train()
@@ -177,6 +182,8 @@ def train_epoch_patch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         total_loss += loss.item()
         num_batches += 1
@@ -200,6 +207,9 @@ def evaluate_patch(
     all_predictions = []
     all_targets = []
 
+    # MarginRankingLoss requires 3 args; use MSE for scalar val loss like the embedding ranking path
+    eval_criterion = nn.MSELoss() if isinstance(criterion, nn.MarginRankingLoss) else criterion
+
     iterator = tqdm(dataloader, desc="Evaluating (Patch)", leave=False, disable=(rank != 0))
 
     for batch in iterator:
@@ -216,7 +226,7 @@ def evaluate_patch(
         pred_utility = model(query_img, example_img, similarity)
 
         # Compute loss
-        loss = criterion(pred_utility, utility)
+        loss = eval_criterion(pred_utility, utility)
         total_loss += loss.item()
         num_batches += 1
 
@@ -246,6 +256,51 @@ def evaluate_patch(
         'r2': r2,
         'spearman': spearman_corr
     }
+
+
+def train_epoch_patch_ranking(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: str,
+    grad_clip: float = 1.0,
+    rank: int = 0,
+    scheduler=None,
+) -> float:
+    """Train for one epoch with patch-based model using pairwise ranking loss."""
+    model.train()
+    total_loss = 0.0
+    num_batches = 0
+
+    iterator = tqdm(dataloader, desc="Training (Patch Ranking)", leave=False, disable=(rank != 0))
+
+    for batch in iterator:
+        query_feat, better_feat, better_sim, worse_feat, worse_sim = batch
+        query_feat = query_feat.to(device)
+        better_feat = better_feat.to(device)
+        better_sim = better_sim.to(device)
+        worse_feat = worse_feat.to(device)
+        worse_sim = worse_sim.to(device)
+
+        pred_better = model(query_feat, better_feat, better_sim)
+        pred_worse = model(query_feat, worse_feat, worse_sim)
+
+        target = torch.ones_like(pred_better)
+        loss = criterion(pred_better, pred_worse, target)
+
+        optimizer.zero_grad()
+        loss.backward()
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+
+        total_loss += loss.item()
+        num_batches += 1
+
+    return total_loss / num_batches
 
 
 def _unpack_and_forward(
@@ -285,7 +340,8 @@ def train_epoch_ranking(
     optimizer: torch.optim.Optimizer,
     device: str,
     interaction_features: InteractionFeaturesConfig,
-    grad_clip: float = 1.0
+    grad_clip: float = 1.0,
+    scheduler=None,
 ) -> float:
     """Train for one epoch using pairwise ranking loss."""
     model.train()
@@ -329,6 +385,8 @@ def train_epoch_ranking(
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         total_loss += loss.item()
         num_batches += 1
@@ -421,6 +479,10 @@ def evaluate(
 
 def _find_resume_checkpoint(cfg: DictConfig) -> Optional[Path]:
     """Find the latest checkpoint to resume from. Downloads from Kaggle if needed."""
+    if cfg.checkpoint.get('overwrite', False):
+        print("  checkpoint.overwrite=true: ignoring any existing checkpoint")
+        return None
+
     checkpoint_dir = Path(cfg.checkpoint.save_dir) / cfg.experiment.name
 
     # If no local checkpoint, try downloading from Kaggle
@@ -626,8 +688,10 @@ def plot_training_curves(
     fig.suptitle(title, fontsize=16, fontweight='bold')
 
     # Add config details as subtitle
+    arch = cfg.model.get('architecture', 'mlp')
+    arch_detail = cfg.model.get('hidden_dims', cfg.model.get('hidden_dim', '?'))
     config_text = (
-        f"Architecture: {cfg.model.hidden_dims} | "
+        f"Architecture: {arch} {arch_detail} | "
         f"Dropout: {cfg.model.dropout} | "
         f"LR: {cfg.training.learning_rate} | "
         f"Batch: {cfg.training.batch_size} | "
@@ -699,7 +763,7 @@ def plot_training_curves(
 
     config_info = (
         f"Configuration:\n"
-        f"  Architecture: {cfg.model.hidden_dims}\n"
+        f"  Architecture: {arch} {arch_detail}\n"
         f"  Dropout: {cfg.model.dropout}\n"
         f"  Learning Rate: {cfg.training.learning_rate}\n"
         f"  Weight Decay: {cfg.training.weight_decay}\n"
@@ -836,15 +900,24 @@ def main(cfg: DictConfig):
         if is_main_process(rank):
             print(f"  Loading marginal utility results...")
         with open(results_path, 'rb') as f:
-            all_results = _pickle.load(f)['results']
+            raw = _pickle.load(f)
+        all_results = raw['results'] if isinstance(raw, dict) else raw
 
         utility_min = utility_max = None
         if normalize_utilities:
             all_utilities = np.array([r['marginal_utility'] if isinstance(r, dict) else r.marginal_utility for r in all_results])
             utility_min, utility_max = float(all_utilities.min()), float(all_utilities.max())
 
-        train_results, val_results, _ = MarginalUtilityImageDataset.split_by_query(
-            all_results, seed=cfg.experiment.seed
+        query_split = QuerySplitConfig(
+            train_ratio=cfg.data.get('train_ratio', 0.9),
+            val_ratio=cfg.data.get('val_ratio', 0.1),
+            test_ratio=cfg.data.get('test_ratio', 0.0),
+        )
+        top_k = cfg.data.get('top_k', None)
+        if top_k is not None and is_main_process(rank):
+            print(f"  Data volume ablation: top_k={top_k} candidates per query")
+        train_results, val_results, _ = MarginalUtilityImageDataset.prepare_splits(
+            all_results, query_split=query_split, top_k=top_k, seed=cfg.experiment.seed
         )
 
         # Try loading patch caches from mounted Kaggle input
@@ -864,7 +937,11 @@ def main(cfg: DictConfig):
         if caches_from_kaggle:
             assert kaggle_cache_dir is not None
             train_cache = torch.load(kaggle_cache_dir / "patch_cache_train.pt", map_location='cpu', weights_only=True)
-        train_dataset = CachedPatchFeatureDataset(
+        patch_dataset_class = (
+            PairwiseCachedPatchFeatureDataset if loss_type == 'ranking'
+            else CachedPatchFeatureDataset
+        )
+        patch_dataset_kwargs = dict(
             results=train_results,
             split='train',
             base_dataset=base_dataset,
@@ -877,6 +954,10 @@ def main(cfg: DictConfig):
             device=device,
             feature_cache=train_cache,
         )
+        if loss_type == 'ranking':
+            patch_dataset_kwargs['pairs_per_query'] = cfg.training.get('pairs_per_query', 10)
+            patch_dataset_kwargs['seed'] = cfg.experiment.seed
+        train_dataset = patch_dataset_class(**patch_dataset_kwargs)
         del train_cache
 
         val_cache = None
@@ -935,6 +1016,13 @@ def main(cfg: DictConfig):
         if contrastive_mode != 'none':
             print(f"  Contrastive mode: {contrastive_mode}")
 
+        query_split = QuerySplitConfig(
+            train_ratio=cfg.data.get('train_ratio', 0.9),
+            val_ratio=cfg.data.get('val_ratio', 0.1),
+            test_ratio=cfg.data.get('test_ratio', 0.0),
+        )
+        print(f"  Query split: {query_split.train_ratio:.0%}/{query_split.val_ratio:.0%}/{query_split.test_ratio:.0%}")
+
         train_dataset_kwargs = {
             'results_path': results_path,
             'embeddings_path': embeddings_path,
@@ -944,6 +1032,7 @@ def main(cfg: DictConfig):
             'normalize_utilities': normalize_utilities,
             'top_k': top_k,
             'contrastive_mode': contrastive_mode,
+            'query_split': query_split,
         }
 
         # Add pairs_per_query for pairwise ranking dataset
@@ -963,6 +1052,7 @@ def main(cfg: DictConfig):
             normalize_utilities=normalize_utilities,
             top_k=top_k,
             contrastive_mode='none',
+            query_split=query_split,
         )
 
     # Compute baseline
@@ -1095,11 +1185,23 @@ def main(cfg: DictConfig):
     )
 
     # Learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=cfg.training.num_epochs,
-        eta_min=cfg.training.learning_rate * 0.01
-    )
+    lr_scheduler_type = cfg.training.get('lr_scheduler', 'cosine')
+    if lr_scheduler_type == 'one_cycle':
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=cfg.training.get('max_lr', cfg.training.learning_rate * 10),
+            steps_per_epoch=len(train_loader),
+            epochs=cfg.training.num_epochs,
+            pct_start=cfg.training.get('warmup_pct', 0.1),
+            div_factor=cfg.training.get('div_factor', 25.0),
+            final_div_factor=cfg.training.get('final_div_factor', 1e4),
+        )
+    else:  # cosine (default)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=cfg.training.num_epochs,
+            eta_min=cfg.training.learning_rate * 0.01
+        )
 
     # Resume from checkpoint if available
     start_epoch = 0
@@ -1117,12 +1219,13 @@ def main(cfg: DictConfig):
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
 
-        if 'scheduler_state_dict' in checkpoint:
+        if 'scheduler_state_dict' in checkpoint and lr_scheduler_type != 'one_cycle':
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        else:
+        elif lr_scheduler_type != 'one_cycle':
             # Legacy checkpoints without scheduler state
             for _ in range(start_epoch):
                 scheduler.step()
+        # one_cycle cannot be meaningfully resumed — starts fresh from epoch 0 LR
 
         # Restore best-so-far metrics (not just current epoch metrics)
         if 'best_metrics' in checkpoint:
@@ -1176,23 +1279,29 @@ def main(cfg: DictConfig):
         if is_main_process(rank):
             print(f"\nEpoch {epoch + 1}/{cfg.training.num_epochs}")
 
-        # Train
-        if is_patch_model_flag:
+        # Train — for one_cycle the scheduler steps per batch inside the train fn
+        batch_scheduler = scheduler if lr_scheduler_type == 'one_cycle' else None
+        if is_patch_model_flag and loss_type == 'ranking':
+            train_loss = train_epoch_patch_ranking(
+                model, train_loader, criterion, optimizer, device,
+                grad_clip=cfg.training.gradient_clip, scheduler=batch_scheduler
+            )
+        elif is_patch_model_flag:
             train_loss = train_epoch_patch(
                 model, train_loader, criterion, optimizer, device,
-                grad_clip=cfg.training.gradient_clip
+                grad_clip=cfg.training.gradient_clip, scheduler=batch_scheduler
             )
         elif loss_type == 'ranking':
             train_loss = train_epoch_ranking(
                 model, train_loader, criterion, optimizer, device,
                 interaction_features=interaction_features,
-                grad_clip=cfg.training.gradient_clip
+                grad_clip=cfg.training.gradient_clip, scheduler=batch_scheduler
             )
         else:
             train_loss = train_epoch(
                 model, train_loader, criterion, optimizer, device,
                 interaction_features=interaction_features,
-                grad_clip=cfg.training.gradient_clip
+                grad_clip=cfg.training.gradient_clip, scheduler=batch_scheduler
             )
 
         # Validate
@@ -1201,8 +1310,9 @@ def main(cfg: DictConfig):
         else:
             val_metrics = evaluate(model, val_loader, criterion, device, interaction_features, use_bce=(loss_type == 'bce'))
 
-        # Update scheduler
-        scheduler.step()
+        # Update scheduler (per-epoch schedulers only; one_cycle steps per batch)
+        if lr_scheduler_type != 'one_cycle':
+            scheduler.step()
 
         # Track metrics for plotting
         train_losses.append(train_loss)

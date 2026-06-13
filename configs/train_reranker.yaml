@@ -86,7 +86,16 @@ training:
   pairs_per_query: 10  # Number of pairs per query for ranking loss
 
   # Utility normalization
-  normalize_utilities: false  # If true, normalize utilities to [0,1] via min-max scaling
+  normalize_utilities: false
+
+  # Learning rate scheduler
+  # "cosine": CosineAnnealingLR stepping per epoch (default, suits MLP)
+  # "one_cycle": OneCycleLR with warmup stepping per batch (suits transformers)
+  lr_scheduler: "cosine"
+  max_lr: 1e-3              # peak LR for one_cycle; ignored for cosine
+  warmup_pct: 0.1           # fraction of total steps for warmup; ignored for cosine
+  div_factor: 25.0          # initial_lr = max_lr / div_factor; PyTorch default
+  final_div_factor: 1e4     # final_lr = initial_lr / final_div_factor; PyTorch default  # If true, normalize utilities to [0,1] via min-max scaling
                               # Automatically enabled when loss_type="bce"
                               # Recommended for: BCE loss (required), ranking loss (optional)
 
@@ -100,6 +109,7 @@ checkpoint:
   save_dir: "outputs/reranker_checkpoints"
   save_best_only: false  # Also save periodic checkpoints
   save_interval: 10  # Save checkpoint every N epochs
+  overwrite: false  # If true, ignore any existing checkpoint and train from scratch
 
 # Logging configuration
 logging:

@@ -10,6 +10,7 @@ from pathlib import Path
 import pickle
 import tempfile
 import time
+import json
 
 import hydra
 from omegaconf import DictConfig
@@ -25,6 +26,43 @@ def get_total_queries(cfg: DictConfig) -> int:
     if cfg.limits.max_queries:
         return cfg.limits.max_queries
     return len(load_dataset(cfg))
+
+
+def _upload_merged_results_to_kaggle(output_path: Path, dataset_name: str, experiment_name: str):
+    """Upload the merged marginal_utilities.pkl to a Kaggle dataset."""
+    import shutil
+    print(f"\nUploading merged results to Kaggle ({dataset_name})...")
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            shutil.copy(output_path, temp_path / output_path.name)
+
+            username, dataset_slug = dataset_name.split('/')
+            metadata = {
+                "title": f"{experiment_name} Marginal Utilities",
+                "id": f"{username}/{dataset_slug}",
+                "licenses": [{"name": "CC0-1.0"}]
+            }
+            with open(temp_path / "dataset-metadata.json", 'w') as f:
+                json.dump(metadata, f, indent=2)
+
+            status = subprocess.run(
+                ['kaggle', 'datasets', 'status', dataset_name],
+                capture_output=True, text=True
+            )
+            if status.returncode == 0:
+                cmd = ['kaggle', 'datasets', 'version', '-p', str(temp_path),
+                       '-m', 'Add merged marginal_utilities.pkl', '--dir-mode', 'zip']
+            else:
+                cmd = ['kaggle', 'datasets', 'create', '-p', str(temp_path), '--dir-mode', 'zip']
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if result.returncode == 0:
+                print(f"✓ Uploaded marginal_utilities.pkl to {dataset_name}")
+            else:
+                print(f"⚠️  Upload failed: {result.stderr[:200]}")
+    except Exception as e:
+        print(f"⚠️  Upload error: {e}")
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="marginal_utility_mini_imagenet")
@@ -122,9 +160,14 @@ def main(cfg: DictConfig):
 
     output_path = output_dir / "marginal_utilities.pkl"
     with open(output_path, 'wb') as f:
-        pickle.dump(all_results, f)
+        pickle.dump({'results': all_results}, f)
 
     print(f"✓ Results saved to: {output_path}")
+
+    # Upload merged results to Kaggle if a dataset is configured
+    kaggle_dataset = cfg.get('checkpoint', {}).get('kaggle_dataset', '')
+    if kaggle_dataset:
+        _upload_merged_results_to_kaggle(output_path, kaggle_dataset, cfg.experiment.name)
 
     # Cleanup temp directory
     import shutil

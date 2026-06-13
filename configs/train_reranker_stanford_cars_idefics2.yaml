@@ -1,0 +1,66 @@
+# Reranker Training Configuration - Stanford Cars (Idefics2)
+# n=10 candidates per query, no contrastive augmentation
+
+experiment:
+  name: "reranker_stanford_cars_idefics2_n10"
+  description: "Patch cross-attention reranker for Stanford Cars Idefics2 marginal utilities, top-10 candidates"
+  seed: 42
+
+data:
+  dataset_name: "stanford_cars"
+  use_embeddings: false
+  results_path: "outputs/marginal_utilities/marginal_utility_stanford_cars_idefics2/marginal_utilities.pkl"
+
+  kaggle_results_path: "/kaggle/input/datasets/juandatan/stanford-cars-idefics2-marginal-utilities/marginal_utilities.pkl"
+
+  train_ratio: 0.9
+  val_ratio: 0.1
+  test_ratio: 0.0
+
+  top_k: 20
+  contrastive_mode: "none"
+
+model:
+  architecture: "patch_attention"
+  clip_model_name: "ViT-B/32"
+  hidden_dim: 256
+  num_attention_heads: 8
+  num_attention_layers: 2
+  feedforward_dims: [256, 128]
+  dropout: 0.2
+  freeze_clip: true
+  pooling_method: "cls"
+  use_sigmoid: false
+  image_size: 224
+
+training:
+  batch_size: 32
+  num_epochs: 50
+  learning_rate: 1e-5
+  weight_decay: 1e-4
+  gradient_clip: 1.0
+  early_stopping_patience: 20
+  loss_type: "ranking"
+  ranking_margin: 0.1
+  pairs_per_query: 10
+  normalize_utilities: false
+
+  lr_scheduler: "one_cycle"  # "cosine" or "one_cycle"
+  max_lr: 3e-5               # peak LR — 3x base; previous 1e-4 caused overfitting
+  warmup_pct: 0.2            # longer warmup to reach peak more gradually
+  div_factor: 3.0            # initial_lr = max_lr / div_factor = 1e-5 (matches base lr)
+  final_div_factor: 100.0    # final_lr = initial_lr / final_div_factor = 1e-7
+
+checkpoint:
+  enabled: true
+  save_dir: "outputs/reranker_checkpoints"
+  save_best_only: false
+  save_interval: 10
+  overwrite: false
+
+logging:
+  use_wandb: false
+  wandb_project: "icl-retrieval-multimodal"
+  log_interval: 10
+
+use_mps: true

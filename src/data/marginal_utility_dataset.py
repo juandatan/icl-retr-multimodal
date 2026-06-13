@@ -21,6 +21,19 @@ from .dataclasses import MarginalUtilityResult
 
 
 @dataclass
+class QuerySplitConfig:
+    """Fractions for train/val/test query splits. Must sum to <= 1.0."""
+    train_ratio: float = 0.9
+    val_ratio: float = 0.1
+    test_ratio: float = 0.0
+
+    def __post_init__(self):
+        total = self.train_ratio + self.val_ratio + self.test_ratio
+        if total > 1.0 + 1e-6:
+            raise ValueError(f"Split ratios sum to {total:.3f}, must be <= 1.0")
+
+
+@dataclass
 class InteractionFeaturesConfig:
     """Configuration for which interaction features to compute."""
     use_product: bool = False  # Element-wise product of embeddings
@@ -86,6 +99,7 @@ class MarginalUtilityDataset(Dataset):
         normalize_utilities: bool = False,
         top_k: Optional[int] = None,
         contrastive_mode: str = 'none',
+        query_split: Optional['QuerySplitConfig'] = None,
     ):
         """
         Initialize dataset.
@@ -108,6 +122,7 @@ class MarginalUtilityDataset(Dataset):
                                  Requires top_k to be set, and that the data was generated
                                  with retrieval.contrastive_max_pool set in the data generation
                                  config, so every query has both signs available in the full pool.
+            query_split: Train/val/test split fractions. Defaults to 90/10/0.
         """
         if contrastive_mode not in ('none', 'contrastive'):
             raise ValueError(f"contrastive_mode must be 'none' or 'contrastive', got {contrastive_mode!r}")
@@ -120,12 +135,13 @@ class MarginalUtilityDataset(Dataset):
         self.normalize_utilities = normalize_utilities
         self.top_k = top_k
         self.contrastive_mode = contrastive_mode
+        self.query_split = query_split or QuerySplitConfig()
 
         # Load data
         print(f"Loading marginal utility results from {results_path}...")
         with open(results_path, 'rb') as f:
             data = pickle.load(f)
-        all_results = data['results']
+        all_results = data['results'] if isinstance(data, dict) else data
         print(f"✓ Loaded {len(all_results)} result pairs")
 
         # Compute normalization statistics from ALL data (before any filtering) so
@@ -149,9 +165,11 @@ class MarginalUtilityDataset(Dataset):
         print(f"✓ Loaded embeddings: shape {self.embeddings.shape}")
 
         # Split by query
-        print(f"Splitting data by query (80/10/10)...")
+        qs = self.query_split
+        split_desc = f"{qs.train_ratio:.0%}/{qs.val_ratio:.0%}/{qs.test_ratio:.0%}"
+        print(f"Splitting data by query ({split_desc})...")
         train_results, val_results, test_results = self.split_by_query(
-            all_results, seed=seed
+            all_results, train_ratio=qs.train_ratio, val_ratio=qs.val_ratio, seed=seed
         )
 
         # Select split
@@ -297,7 +315,7 @@ class MarginalUtilityDataset(Dataset):
     @staticmethod
     def split_by_query(
         results: List,
-        train_ratio: float = 0.8,
+        train_ratio: float = 0.9,
         val_ratio: float = 0.1,
         seed: int = 42
     ) -> Tuple[List, List, List]:

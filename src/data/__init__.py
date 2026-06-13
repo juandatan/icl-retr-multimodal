@@ -6,6 +6,7 @@ from .marginal_utility_dataset import (
     InteractionFeaturesConfig,
     MarginalUtilityDataset,
     PairwiseMarginalUtilityDataset,
+    QuerySplitConfig,
 )
 from .mini_imagenet import MiniImageNetDataset
 from .stanford_cars import StanfordCarsDataset
@@ -17,6 +18,7 @@ __all__ = [
     'InteractionFeaturesConfig',
     'MarginalUtilityDataset',
     'PairwiseMarginalUtilityDataset',
+    'QuerySplitConfig',
     'MiniImageNetDataset',
     'StanfordCarsDataset',
 ]

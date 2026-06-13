@@ -61,6 +61,7 @@ def _run_baseline(
     num_queries: int,
     eval_mode: str,
     run_id_parts: dict,
+    use_all_classes: bool = False,
 ):
     """Run one baseline evaluation (single-GPU or multi-GPU) and save results."""
     cache = get_cache_path(
@@ -70,6 +71,7 @@ def _run_baseline(
         num_queries=num_queries,
         seed=args.seed,
         use_generative=args.use_generative,
+        use_all_classes=use_all_classes,
     )
 
     results = None
@@ -102,6 +104,8 @@ def _run_baseline(
                 candidate_batch_size=args.candidate_batch_size,
                 cache_path=cache,
                 image_split_path=args.image_split_path,
+                use_all_classes=use_all_classes,
+                force_recompute=args.force_recompute,
             )
         else:
             results = evaluate_icl(
@@ -169,6 +173,8 @@ def main():
                         help="Skip 0-shot evaluation")
     parser.add_argument("--skip-clip-retrieval", action="store_true",
                         help="Skip 1-shot CLIP-retrieval evaluation")
+    parser.add_argument("--use-all-classes", action="store_true",
+                        help="Score all 196 classes as candidates (discriminative only)")
 
     args = parser.parse_args()
 
@@ -242,6 +248,7 @@ def main():
             k=0,
             candidate_pool_size=0,
             vlm=vlm,
+            use_all_classes=args.use_all_classes,
             **shared,
         )
 
@@ -259,6 +266,7 @@ def main():
             k=1,
             candidate_pool_size=50,
             vlm=vlm,
+            use_all_classes=args.use_all_classes,
             **shared,
         )
 

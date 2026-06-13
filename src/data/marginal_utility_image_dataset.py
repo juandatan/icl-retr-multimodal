@@ -22,6 +22,7 @@ from torchvision import transforms
 # Import MarginalUtilityResult for pickle deserialization
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from data.dataclasses import MarginalUtilityResult
+from data.marginal_utility_dataset import QuerySplitConfig
 
 
 def clip_transform(image_size: int = 224) -> transforms.Compose:
@@ -52,7 +53,9 @@ class MarginalUtilityImageDataset(Dataset):
         split: str = 'train',
         seed: int = 42,
         image_size: int = 224,
-        normalize_utilities: bool = False
+        normalize_utilities: bool = False,
+        top_k: Optional[int] = None,
+        query_split: Optional[QuerySplitConfig] = None,
     ):
         """
         Initialize dataset.
@@ -64,6 +67,8 @@ class MarginalUtilityImageDataset(Dataset):
             seed: Random seed for reproducible splitting
             image_size: Size to resize images to (default: 224 for CLIP)
             normalize_utilities: If True, normalize utilities to [0, 1] range
+            top_k: If set, retain only the top-k candidates per query by similarity rank.
+            query_split: Train/val/test split fractions. Defaults to 90/10/0.
         """
         self.results_path = results_path
         self.base_dataset = base_dataset
@@ -71,6 +76,8 @@ class MarginalUtilityImageDataset(Dataset):
         self.seed = seed
         self.image_size = image_size
         self.normalize_utilities = normalize_utilities
+        self.top_k = top_k
+        self.query_split = query_split or QuerySplitConfig()
 
         # Load marginal utility data
         print(f"Loading marginal utility results from {results_path}...")
@@ -99,9 +106,11 @@ class MarginalUtilityImageDataset(Dataset):
             self.utility_range = None
 
         # Split by query
-        print(f"Splitting data by query (80/10/10)...")
+        qs = self.query_split
+        split_desc = f"{qs.train_ratio:.0%}/{qs.val_ratio:.0%}/{qs.test_ratio:.0%}"
+        print(f"Splitting data by query ({split_desc})...")
         train_results, val_results, test_results = self.split_by_query(
-            all_results, seed=seed
+            all_results, train_ratio=qs.train_ratio, val_ratio=qs.val_ratio, seed=seed
         )
 
         # Select split
@@ -113,6 +122,9 @@ class MarginalUtilityImageDataset(Dataset):
             self.results = test_results
         else:
             raise ValueError(f"Invalid split: {split}. Must be 'train', 'val', or 'test'")
+
+        if self.top_k is not None:
+            self.results = self._apply_top_k(self.results, self.top_k)
 
         query_indices = [self._get_attr(r, 'query_idx') for r in self.results]
         print(f"✓ {split.upper()} split: {len(self.results)} pairs from "
@@ -128,6 +140,41 @@ class MarginalUtilityImageDataset(Dataset):
         else:
             return getattr(obj, key)
 
+    @staticmethod
+    def prepare_splits(
+        all_results: List,
+        query_split: QuerySplitConfig,
+        top_k: Optional[int],
+        seed: int,
+    ) -> Tuple[List, List, List]:
+        """Split results and apply top_k filtering. Returns (train, val, test)."""
+        qs = query_split
+        train_results, val_results, test_results = MarginalUtilityImageDataset.split_by_query(
+            all_results, train_ratio=qs.train_ratio, val_ratio=qs.val_ratio, seed=seed
+        )
+        if top_k is not None:
+            train_results = MarginalUtilityImageDataset._apply_top_k(train_results, top_k)
+            val_results = MarginalUtilityImageDataset._apply_top_k(val_results, top_k)
+            test_results = MarginalUtilityImageDataset._apply_top_k(test_results, top_k)
+        return train_results, val_results, test_results
+
+    @staticmethod
+    def _apply_top_k(results: List, top_k: int) -> List:
+        """Retain only the top-k candidates per query ranked by similarity score."""
+        get_attr = MarginalUtilityImageDataset._get_attr
+        query_groups: Dict[int, List] = defaultdict(list)
+        for r in results:
+            query_groups[get_attr(r, 'query_idx')].append(r)
+
+        filtered = []
+        for group in query_groups.values():
+            sorted_group = sorted(group, key=lambda r: get_attr(r, 'similarity_score'), reverse=True)
+            filtered.extend(sorted_group[:top_k])
+
+        print(f"  top_k={top_k}: {len(filtered)} pairs retained from {len(query_groups)} queries "
+              f"(was {len(results)})")
+        return filtered
+
     def _normalize_utility(self, utility: float) -> float:
         """Normalize utility to [0, 1] range using min-max scaling."""
         if not self.normalize_utilities:
@@ -141,7 +188,7 @@ class MarginalUtilityImageDataset(Dataset):
     @staticmethod
     def split_by_query(
         results: List,
-        train_ratio: float = 0.8,
+        train_ratio: float = 0.9,
         val_ratio: float = 0.1,
         seed: int = 42
     ) -> Tuple[List, List, List]:
@@ -408,6 +455,62 @@ class CachedPatchFeatureDataset(Dataset):
         similarities = np.array([self._get_attr(r, 'similarity_score') for r in self.results])
         corr, _ = spearmanr(similarities, utilities)
         return float(corr)
+
+    def get_query_groups(self) -> Dict[int, List[int]]:
+        """Return {query_idx: [result_indices]} for building pairs."""
+        groups: Dict[int, List[int]] = defaultdict(list)
+        for i, r in enumerate(self.results):
+            groups[self._get_attr(r, 'query_idx')].append(i)
+        return dict(groups)
+
+
+class PairwiseCachedPatchFeatureDataset(CachedPatchFeatureDataset):
+    """
+    Pairwise variant of CachedPatchFeatureDataset for ranking loss training.
+
+    Returns (query, better_example, worse_example, similarity_better, similarity_worse)
+    pairs sampled from the same query so MarginRankingLoss can directly compare them.
+    """
+
+    def __init__(self, *args, pairs_per_query: int = 10, seed: int = 42, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pairs_per_query = pairs_per_query
+        self.rng = random.Random(seed)
+        self.pairs = self._build_pairs()
+        print(f"  ✓ Built {len(self.pairs)} pairwise examples ({pairs_per_query} pairs/query)")
+
+    def _build_pairs(self) -> List[Tuple[int, int]]:
+        groups = self.get_query_groups()
+        pairs = []
+        for result_indices in groups.values():
+            if len(result_indices) < 2:
+                continue
+            for _ in range(self.pairs_per_query):
+                idx1, idx2 = self.rng.sample(result_indices, 2)
+                u1 = self._get_attr(self.results[idx1], 'marginal_utility')
+                u2 = self._get_attr(self.results[idx2], 'marginal_utility')
+                if u1 > u2:
+                    pairs.append((idx1, idx2))
+                elif u2 > u1:
+                    pairs.append((idx2, idx1))
+        return pairs
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        better_idx, worse_idx = self.pairs[idx]
+
+        def _get_tensors(result_idx):
+            r = self.results[result_idx]
+            q_feat = self.feature_cache[self._get_attr(r, 'query_idx')].float()
+            e_feat = self.feature_cache[self._get_attr(r, 'example_idx')].float()
+            sim = torch.tensor([self._get_attr(r, 'similarity_score')], dtype=torch.float32)
+            return q_feat, e_feat, sim
+
+        q_feat, better_feat, better_sim = _get_tensors(better_idx)
+        _, worse_feat, worse_sim = _get_tensors(worse_idx)
+        return q_feat, better_feat, better_sim, worse_feat, worse_sim
 
 
 if __name__ == "__main__":
