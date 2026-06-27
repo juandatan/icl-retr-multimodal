@@ -1,5 +1,5 @@
 # Reranker Training Configuration - Stanford Cars (Idefics2)
-# n=50 candidates per query (full pool), pointwise Huber loss
+# n=50 candidates per query (full pool), ranking loss with per-epoch resampling
 
 experiment:
   name: "reranker_stanford_cars_idefics2_n50"
@@ -21,7 +21,7 @@ data:
   test_ratio: 0.0
 
   top_k: 50
-  contrastive_mode: "none"
+  contrastive_mode: "contrastive"
 
 model:
   architecture: "patch_attention"
@@ -43,8 +43,9 @@ training:
   weight_decay: 1e-3
   gradient_clip: 1.0
   early_stopping_patience: 15
-  loss_type: "huber"
-  huber_delta: 1.0
+  loss_type: "ranking"
+  ranking_margin: 0.3
+  pairs_per_query: 50
   normalize_utilities: false
 
   lr_scheduler: "cosine"
