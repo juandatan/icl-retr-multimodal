@@ -201,14 +201,8 @@ def evaluate_patch(
 ) -> dict:
     """Evaluate patch-based model."""
     model.eval()
-    total_loss = 0.0
-    num_batches = 0
-
     all_predictions = []
     all_targets = []
-
-    # MarginRankingLoss requires 3 args; use MSE for scalar val loss like the embedding ranking path
-    eval_criterion = nn.MSELoss() if isinstance(criterion, nn.MarginRankingLoss) else criterion
 
     iterator = tqdm(dataloader, desc="Evaluating (Patch)", leave=False, disable=(rank != 0))
 
@@ -224,11 +218,6 @@ def evaluate_patch(
 
         # Forward pass
         pred_utility = model(query_img, example_img, similarity)
-
-        # Compute loss
-        loss = eval_criterion(pred_utility, utility)
-        total_loss += loss.item()
-        num_batches += 1
 
         # Store predictions and targets
         all_predictions.extend(pred_utility.cpu().numpy().flatten())
@@ -250,7 +239,7 @@ def evaluate_patch(
     spearman_corr, _ = spearmanr(all_predictions, all_targets)
 
     return {
-        'loss': total_loss / num_batches,
+        'loss': mse,  # MSE is the canonical scalar for training-loop comparisons
         'mse': mse,
         'mae': mae,
         'r2': r2,
@@ -941,6 +930,10 @@ def main(cfg: DictConfig):
             PairwiseCachedPatchFeatureDataset if loss_type == 'ranking'
             else CachedPatchFeatureDataset
         )
+        patch_cache_dir = cfg.data.get('patch_cache_dir', None)
+        train_cache_path = str(Path(patch_cache_dir) / "patch_cache_train.pt") if patch_cache_dir else None
+        val_cache_path = str(Path(patch_cache_dir) / "patch_cache_val.pt") if patch_cache_dir else None
+
         patch_dataset_kwargs = dict(
             results=train_results,
             split='train',
@@ -949,7 +942,7 @@ def main(cfg: DictConfig):
             normalize_utilities=normalize_utilities,
             utility_min=utility_min,
             utility_max=utility_max,
-            cache_path=None,
+            cache_path=train_cache_path,
             extraction_batch_size=cfg.training.get('extraction_batch_size', 64),
             device=device,
             feature_cache=train_cache,
@@ -972,7 +965,7 @@ def main(cfg: DictConfig):
             normalize_utilities=normalize_utilities,
             utility_min=utility_min,
             utility_max=utility_max,
-            cache_path=None,
+            cache_path=val_cache_path,
             extraction_batch_size=cfg.training.get('extraction_batch_size', 64),
             device=device,
             feature_cache=val_cache,
@@ -1278,6 +1271,10 @@ def main(cfg: DictConfig):
 
         if is_main_process(rank):
             print(f"\nEpoch {epoch + 1}/{cfg.training.num_epochs}")
+
+        # Re-sample pairs each epoch so the model sees varied difficulty levels
+        if isinstance(train_dataset, PairwiseCachedPatchFeatureDataset):
+            train_dataset.resample()
 
         # Train — for one_cycle the scheduler steps per batch inside the train fn
         batch_scheduler = scheduler if lr_scheduler_type == 'one_cycle' else None

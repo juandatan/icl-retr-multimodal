@@ -475,9 +475,17 @@ class PairwiseCachedPatchFeatureDataset(CachedPatchFeatureDataset):
     def __init__(self, *args, pairs_per_query: int = 10, seed: int = 42, **kwargs):
         super().__init__(*args, **kwargs)
         self.pairs_per_query = pairs_per_query
+        self.seed = seed
+        self.epoch = 0
         self.rng = random.Random(seed)
         self.pairs = self._build_pairs()
         print(f"  ✓ Built {len(self.pairs)} pairwise examples ({pairs_per_query} pairs/query)")
+
+    def resample(self):
+        """Resample pairs for the next epoch. Call before each training epoch."""
+        self.epoch += 1
+        self.rng = random.Random(self.seed + self.epoch)
+        self.pairs = self._build_pairs()
 
     def _build_pairs(self) -> List[Tuple[int, int]]:
         groups = self.get_query_groups()

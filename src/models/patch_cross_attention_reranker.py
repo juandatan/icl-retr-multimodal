@@ -45,7 +45,38 @@ class CLIPPatchExtractor(nn.Module):
         x = x.permute(1, 0, 2)
         x = self.clip_model.visual.transformer(x)
         x = x.permute(1, 0, 2)
+        x = self.clip_model.visual.ln_post(x)
         return x
+
+
+class LearnablePooling(nn.Module):
+    """
+    Attention-weighted pooling over patch tokens.
+
+    Learns a per-patch scalar weight conditioned on both query and example
+    attended features, then returns a weighted sum over spatial patches.
+    This lets the model suppress uninformative patches rather than averaging
+    all of them equally.
+    """
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        # Single linear layer maps each patch token to a scalar attention logit
+        self.score = nn.Linear(hidden_dim, 1)
+
+    def forward(self, patch_features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            patch_features: (batch, seq_len, hidden_dim) — includes CLS at index 0
+
+        Returns:
+            Pooled vector: (batch, hidden_dim)
+        """
+        # Operate only on spatial patches (skip CLS token at index 0)
+        spatial = patch_features[:, 1:, :]          # (batch, num_patches, hidden_dim)
+        logits = self.score(spatial)                 # (batch, num_patches, 1)
+        weights = torch.softmax(logits, dim=1)       # (batch, num_patches, 1)
+        return (weights * spatial).sum(dim=1)        # (batch, hidden_dim)
 
 
 class PatchCrossAttentionReranker(nn.Module):
@@ -125,6 +156,11 @@ class PatchCrossAttentionReranker(nn.Module):
         self.query_norm = nn.LayerNorm(hidden_dim)
         self.example_norm = nn.LayerNorm(hidden_dim)
 
+        # Learnable pooling (only instantiated when pooling_method == "learned")
+        if pooling_method == "learned":
+            self.query_pooler = LearnablePooling(hidden_dim)
+            self.example_pooler = LearnablePooling(hidden_dim)
+
         # Feedforward network for utility prediction
         # Input: query_pooled + example_pooled + similarity
         combine_input_dim = 2 * hidden_dim + 1
@@ -172,10 +208,11 @@ class PatchCrossAttentionReranker(nn.Module):
         # Pass through transformer blocks
         x = self.clip_model.visual.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.clip_model.visual.ln_post(x)
 
         return x
 
-    def pool_patches(self, patch_features: torch.Tensor) -> torch.Tensor:
+    def pool_patches(self, patch_features: torch.Tensor, pooler: Optional['LearnablePooling'] = None) -> torch.Tensor:
         """Pool patch features into a single vector."""
         if self.pooling_method == "cls":
             return patch_features[:, 0, :]
@@ -183,6 +220,9 @@ class PatchCrossAttentionReranker(nn.Module):
             return patch_features[:, 1:, :].mean(dim=1)
         elif self.pooling_method == "max":
             return patch_features[:, 1:, :].max(dim=1)[0]
+        elif self.pooling_method == "learned":
+            assert pooler is not None
+            return pooler(patch_features)
         else:
             raise ValueError(f"Unknown pooling method: {self.pooling_method}")
 
@@ -226,8 +266,10 @@ class PatchCrossAttentionReranker(nn.Module):
         example_hidden = self.example_norm(example_hidden)
 
         # Pool patches
-        query_pooled = self.pool_patches(query_hidden)
-        example_pooled = self.pool_patches(example_hidden)
+        query_pooler = getattr(self, 'query_pooler', None)
+        example_pooler = getattr(self, 'example_pooler', None)
+        query_pooled = self.pool_patches(query_hidden, query_pooler)
+        example_pooled = self.pool_patches(example_hidden, example_pooler)
 
         # Combine with similarity
         combined = torch.cat([query_pooled, example_pooled, similarity], dim=1)
