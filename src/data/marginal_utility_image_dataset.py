@@ -472,14 +472,19 @@ class PairwiseCachedPatchFeatureDataset(CachedPatchFeatureDataset):
     pairs sampled from the same query so MarginRankingLoss can directly compare them.
     """
 
-    def __init__(self, *args, pairs_per_query: int = 10, seed: int = 42, **kwargs):
+    def __init__(self, *args, pairs_per_query: int = 10, seed: int = 42,
+                 hard_pair_fraction: float = 0.5, **kwargs):
         super().__init__(*args, **kwargs)
         self.pairs_per_query = pairs_per_query
         self.seed = seed
         self.epoch = 0
         self.rng = random.Random(seed)
+        # Fraction of pairs sampled from the hardest tercile (smallest utility gap).
+        # Remaining pairs are sampled uniformly for coverage.
+        self.hard_pair_fraction = hard_pair_fraction
         self.pairs = self._build_pairs()
-        print(f"  ✓ Built {len(self.pairs)} pairwise examples ({pairs_per_query} pairs/query)")
+        print(f"  ✓ Built {len(self.pairs)} pairwise examples "
+              f"({pairs_per_query} pairs/query, {hard_pair_fraction:.0%} hard)")
 
     def resample(self):
         """Resample pairs for the next epoch. Call before each training epoch."""
@@ -490,17 +495,43 @@ class PairwiseCachedPatchFeatureDataset(CachedPatchFeatureDataset):
     def _build_pairs(self) -> List[Tuple[int, int]]:
         groups = self.get_query_groups()
         pairs = []
+        n_hard = int(self.pairs_per_query * self.hard_pair_fraction)
+        n_uniform = self.pairs_per_query - n_hard
+
         for result_indices in groups.values():
             if len(result_indices) < 2:
                 continue
-            for _ in range(self.pairs_per_query):
-                idx1, idx2 = self.rng.sample(result_indices, 2)
-                u1 = self._get_attr(self.results[idx1], 'marginal_utility')
-                u2 = self._get_attr(self.results[idx2], 'marginal_utility')
-                if u1 > u2:
-                    pairs.append((idx1, idx2))
-                elif u2 > u1:
-                    pairs.append((idx2, idx1))
+
+            # Pre-compute all valid ordered pairs sorted by utility gap ascending
+            # (smallest gap = hardest pairs first)
+            all_pairs = []
+            for i in range(len(result_indices)):
+                for j in range(i + 1, len(result_indices)):
+                    a, b = result_indices[i], result_indices[j]
+                    ua = self._get_attr(self.results[a], 'marginal_utility')
+                    ub = self._get_attr(self.results[b], 'marginal_utility')
+                    if ua == ub:
+                        continue
+                    better, worse = (a, b) if ua > ub else (b, a)
+                    all_pairs.append((better, worse, abs(ua - ub)))
+
+            if not all_pairs:
+                continue
+
+            all_pairs.sort(key=lambda x: x[2])  # ascending gap = hardest first
+            hard_pool = all_pairs[:max(1, len(all_pairs) // 3)]
+            hard_sample = [
+                (b, w) for b, w, _ in self.rng.choices(hard_pool, k=n_hard)
+            ]
+
+            # Uniform sample from all pairs for coverage
+            uniform_sample = [
+                (b, w) for b, w, _ in self.rng.choices(all_pairs, k=n_uniform)
+            ]
+
+            pairs.extend(hard_sample)
+            pairs.extend(uniform_sample)
+
         return pairs
 
     def __len__(self):

@@ -949,6 +949,7 @@ def main(cfg: DictConfig):
         )
         if loss_type == 'ranking':
             patch_dataset_kwargs['pairs_per_query'] = cfg.training.get('pairs_per_query', 10)
+            patch_dataset_kwargs['hard_pair_fraction'] = cfg.training.get('hard_pair_fraction', 0.0)
             patch_dataset_kwargs['seed'] = cfg.experiment.seed
         train_dataset = patch_dataset_class(**patch_dataset_kwargs)
         del train_cache
