@@ -473,18 +473,18 @@ class PairwiseCachedPatchFeatureDataset(CachedPatchFeatureDataset):
     """
 
     def __init__(self, *args, pairs_per_query: int = 10, seed: int = 42,
-                 hard_pair_fraction: float = 0.5, **kwargs):
+                 within_cluster_fraction: float = 0.7, **kwargs):
         super().__init__(*args, **kwargs)
         self.pairs_per_query = pairs_per_query
         self.seed = seed
         self.epoch = 0
         self.rng = random.Random(seed)
-        # Fraction of pairs sampled from the hardest tercile (smallest utility gap).
-        # Remaining pairs are sampled uniformly for coverage.
-        self.hard_pair_fraction = hard_pair_fraction
+        # Fraction of pairs drawn from within-cluster (same sign) pairs to match
+        # the inference distribution, where retrieved candidates are mostly in one cluster.
+        self.within_cluster_fraction = within_cluster_fraction
         self.pairs = self._build_pairs()
         print(f"  ✓ Built {len(self.pairs)} pairwise examples "
-              f"({pairs_per_query} pairs/query, {hard_pair_fraction:.0%} hard)")
+              f"({pairs_per_query} pairs/query, {within_cluster_fraction:.0%} within-cluster)")
 
     def resample(self):
         """Resample pairs for the next epoch. Call before each training epoch."""
@@ -495,16 +495,15 @@ class PairwiseCachedPatchFeatureDataset(CachedPatchFeatureDataset):
     def _build_pairs(self) -> List[Tuple[int, int]]:
         groups = self.get_query_groups()
         pairs = []
-        n_hard = int(self.pairs_per_query * self.hard_pair_fraction)
-        n_uniform = self.pairs_per_query - n_hard
+        n_within = int(self.pairs_per_query * self.within_cluster_fraction)
+        n_cross = self.pairs_per_query - n_within
 
         for result_indices in groups.values():
             if len(result_indices) < 2:
                 continue
 
-            # Pre-compute all valid ordered pairs sorted by utility gap ascending
-            # (smallest gap = hardest pairs first)
-            all_pairs = []
+            within_pairs = []
+            cross_pairs = []
             for i in range(len(result_indices)):
                 for j in range(i + 1, len(result_indices)):
                     a, b = result_indices[i], result_indices[j]
@@ -513,24 +512,26 @@ class PairwiseCachedPatchFeatureDataset(CachedPatchFeatureDataset):
                     if ua == ub:
                         continue
                     better, worse = (a, b) if ua > ub else (b, a)
-                    all_pairs.append((better, worse, abs(ua - ub)))
+                    if (ua > 0) == (ub > 0):
+                        within_pairs.append((better, worse))
+                    else:
+                        cross_pairs.append((better, worse))
 
-            if not all_pairs:
+            if not within_pairs and not cross_pairs:
                 continue
 
-            all_pairs.sort(key=lambda x: x[2])  # ascending gap = hardest first
-            hard_pool = all_pairs[:max(1, len(all_pairs) // 3)]
-            hard_sample = [
-                (b, w) for b, w, _ in self.rng.choices(hard_pool, k=n_hard)
-            ]
+            # Sample within-cluster pairs (hard signal matching inference distribution)
+            if within_pairs:
+                pairs.extend(self.rng.choices(within_pairs, k=n_within))
+            elif cross_pairs:
+                # Fallback: if no within-cluster pairs, fill from cross
+                pairs.extend(self.rng.choices(cross_pairs, k=n_within))
 
-            # Uniform sample from all pairs for coverage
-            uniform_sample = [
-                (b, w) for b, w, _ in self.rng.choices(all_pairs, k=n_uniform)
-            ]
-
-            pairs.extend(hard_sample)
-            pairs.extend(uniform_sample)
+            # Sample cross-cluster pairs (easy signal for coarse discrimination)
+            if cross_pairs:
+                pairs.extend(self.rng.choices(cross_pairs, k=n_cross))
+            elif within_pairs:
+                pairs.extend(self.rng.choices(within_pairs, k=n_cross))
 
         return pairs
 

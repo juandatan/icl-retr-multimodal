@@ -506,6 +506,7 @@ class PairwiseMarginalUtilityDataset(MarginalUtilityDataset):
         normalize_utilities: bool = False,
         top_k: Optional[int] = None,
         contrastive_mode: str = 'none',
+        query_split: Optional['QuerySplitConfig'] = None,
     ):
         """
         Initialize pairwise dataset.
@@ -520,9 +521,10 @@ class PairwiseMarginalUtilityDataset(MarginalUtilityDataset):
             normalize_utilities: If True, normalize utilities to [0, 1] range
             top_k: If set, retain only top-k candidates per query by similarity rank
             contrastive_mode: 'none' or 'contrastive'
+            query_split: Train/val/test split fractions. Defaults to 90/10/0.
         """
         super().__init__(results_path, embeddings_path, split, seed, interaction_features,
-                         normalize_utilities, top_k, contrastive_mode)
+                         normalize_utilities, top_k, contrastive_mode, query_split)
 
         self.pairs_per_query = pairs_per_query
         self.rng = random.Random(seed)

@@ -46,6 +46,9 @@ class CLIPPatchExtractor(nn.Module):
         x = self.clip_model.visual.transformer(x)
         x = x.permute(1, 0, 2)
         x = self.clip_model.visual.ln_post(x)
+        # Project each patch token into CLIP's semantic embedding space
+        if self.clip_model.visual.proj is not None:
+            x = x @ self.clip_model.visual.proj.to(x.dtype)
         return x
 
 
@@ -135,8 +138,10 @@ class PatchCrossAttentionReranker(nn.Module):
             for param in self.clip_model.parameters():
                 param.requires_grad = False
 
-        # Get CLIP's embedding dimension
-        self.clip_embed_dim = self.clip_model.visual.transformer.width
+        # Projected embedding dim (512 for ViT-B/32); falls back to transformer width
+        # if the model has no projection (e.g. some non-standard checkpoints)
+        proj = self.clip_model.visual.proj
+        self.clip_embed_dim = proj.shape[1] if proj is not None else self.clip_model.visual.transformer.width
 
         # Project CLIP patch features to hidden dimension
         self.query_projection = nn.Linear(self.clip_embed_dim, hidden_dim)
@@ -209,6 +214,9 @@ class PatchCrossAttentionReranker(nn.Module):
         x = self.clip_model.visual.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.clip_model.visual.ln_post(x)
+        # Project each patch token into CLIP's semantic embedding space
+        if self.clip_model.visual.proj is not None:
+            x = x @ self.clip_model.visual.proj.to(x.dtype)
 
         return x
 

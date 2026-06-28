@@ -1,0 +1,62 @@
+# MLP Reranker - Stanford Cars (Idefics2) - Sanity check baseline
+# Mirrors train_reranker_stanford_cars_idefics2.yaml but uses global CLIP embeddings
+# instead of patch features. If this matches the patch model's Spearman ceiling,
+# the bottleneck is in the CLIP feature space, not the cross-attention architecture.
+
+experiment:
+  name: "reranker_stanford_cars_idefics2_mlp"
+  description: "MLP baseline reranker on Idefics2 marginal utilities, top-50 candidates"
+  seed: 42
+
+data:
+  use_embeddings: true
+  results_path: "outputs/marginal_utilities/marginal_utility_stanford_cars_idefics2/marginal_utilities.pkl"
+  embeddings_path: "data/stanford_cars/clip_embeddings_train.pkl"
+
+  kaggle_results_path: "/kaggle/input/datasets/juandatan/stanford-cars-idefics2-marginal-utilities/marginal_utilities.pkl"
+  kaggle_embeddings_path: "/kaggle/input/d/juandatan/stanford-cars-clip/clip_embeddings_train.pkl"
+
+  train_ratio: 0.9
+  val_ratio: 0.1
+  test_ratio: 0.0
+
+  top_k: 50
+  contrastive_mode: "contrastive"
+
+model:
+  architecture: "mlp"
+  embedding_dim: 512
+  hidden_dims: [512, 256, 128]
+  dropout: 0.2
+  use_product: false
+  use_difference: false
+  use_l2_distance: false
+  use_sigmoid: false
+
+training:
+  batch_size: 512  # much cheaper than images, use larger batches
+  num_epochs: 50
+  learning_rate: 3e-5
+  weight_decay: 1e-3
+  gradient_clip: 1.0
+  early_stopping_patience: 15
+  loss_type: "ranking"
+  ranking_margin: 0.05
+  pairs_per_query: 50
+  normalize_utilities: false
+
+  lr_scheduler: "cosine"
+
+checkpoint:
+  enabled: true
+  save_dir: "outputs/reranker_checkpoints"
+  save_best_only: false
+  save_interval: 10
+  overwrite: true
+
+logging:
+  use_wandb: false
+  wandb_project: "icl-retrieval-multimodal"
+  log_interval: 10
+
+use_mps: true

@@ -46,7 +46,7 @@ training:
   loss_type: "ranking"
   ranking_margin: 0.05  # ~p90 of within-cluster utility gaps; learnable but non-trivial
   pairs_per_query: 50
-  hard_pair_fraction: 0.5  # 50% of pairs from hardest tercile (smallest utility gap)
+  within_cluster_fraction: 0.7  # 70% within-cluster pairs to match inference distribution
   normalize_utilities: false
 
   lr_scheduler: "cosine"
