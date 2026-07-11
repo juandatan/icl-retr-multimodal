@@ -10,6 +10,8 @@ from .marginal_utility_dataset import (
 )
 from .mini_imagenet import MiniImageNetDataset
 from .stanford_cars import StanfordCarsDataset
+from .fine_grained_hf_dataset import FineGrainedHFDataset
+from .dataset_registry import FINE_GRAINED_DATASETS, FineGrainedDatasetSpec, get_dataset_spec
 
 __all__ = [
     'BaseUtilityDataset',
@@ -21,4 +23,8 @@ __all__ = [
     'QuerySplitConfig',
     'MiniImageNetDataset',
     'StanfordCarsDataset',
+    'FineGrainedHFDataset',
+    'FINE_GRAINED_DATASETS',
+    'FineGrainedDatasetSpec',
+    'get_dataset_spec',
 ]

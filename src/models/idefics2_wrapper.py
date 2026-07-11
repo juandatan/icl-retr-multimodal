@@ -360,7 +360,13 @@ class Idefics2Wrapper:
                 pos = start_pos + j
                 log_prob_sum += log_probs_all[i, pos, token_id].item()
 
-            batch_log_probs.append(log_prob_sum)
+            # Mean per-token log prob, not raw sum: summing penalizes longer label
+            # strings regardless of correctness (e.g. "Olive sided Flycatcher" would
+            # always score below "Mallard" under a raw sum), which breaks argmax-based
+            # classification across candidates of varying token length. Dividing by
+            # token count here is a no-op for marginal utility, since that's always a
+            # ratio of two scores for the *same* label (same token count cancels out).
+            batch_log_probs.append(log_prob_sum / len(label_tokens))
 
         return batch_log_probs
 
@@ -577,12 +583,10 @@ class Idefics2Wrapper:
             )
             all_label_tokens.append(label_tokens)
 
-        # Process text prompts (without images, since we have features already)
         all_prompt_inputs = []
         for i in range(batch_size):
-            # Process text only
-            prompt_input = self.processor.tokenizer(
-                prompts[i],
+            prompt_input = self.processor(
+                text=prompts[i],
                 return_tensors="pt",
             )
             all_prompt_inputs.append(prompt_input)
@@ -695,7 +699,8 @@ class Idefics2Wrapper:
                 pos = start_pos + j
                 log_prob_sum += log_probs_all[i, pos, token_id].item()
 
-            batch_log_probs.append(log_prob_sum)
+            # Mean per-token log prob -- see _compute_label_probabilities_batch for why.
+            batch_log_probs.append(log_prob_sum / len(label_tokens))
 
         return batch_log_probs
 

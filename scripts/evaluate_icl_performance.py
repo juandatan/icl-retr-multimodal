@@ -38,6 +38,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from data.stanford_cars import StanfordCarsDataset
 from data.mini_imagenet import MiniImageNetDataset
+from data.fine_grained_hf_dataset import FineGrainedHFDataset
+from data.dataset_registry import FINE_GRAINED_DATASETS, get_dataset_spec
 from data.marginal_utility_dataset import InteractionFeaturesConfig
 from data.base_dataset import ClassificationExample
 from models.mlp_reranker import MLPReranker
@@ -187,6 +189,15 @@ def load_dataset(dataset_name: str, split: str = "test",
             split=split,
             data_dir="data/mini_imagenet",
             class_split_seed=42
+        )
+    elif dataset_name in FINE_GRAINED_DATASETS:
+        spec = get_dataset_spec(dataset_name)
+        dataset = FineGrainedHFDataset(
+            hf_repo_ids=spec.hf_repo_ids,
+            split=split,
+            data_dir=spec.data_dir,
+            class_split_seed=42,
+            image_split_path=image_split_path,
         )
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
@@ -1332,7 +1343,8 @@ def _setup_device(num_gpus_requested: Optional[int] = None):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate ICL performance with a learned reranker")
-    parser.add_argument("--dataset", type=str, required=True, choices=["stanford_cars", "mini_imagenet"],
+    parser.add_argument("--dataset", type=str, required=True,
+                        choices=["stanford_cars", "mini_imagenet"] + list(FINE_GRAINED_DATASETS.keys()),
                         help="Dataset to evaluate on")
     parser.add_argument("--eval-split", type=str, default="test",
                         choices=["train", "val", "test", "val+test"],

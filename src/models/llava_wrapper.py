@@ -332,7 +332,12 @@ class LLaVAWrapper:
                 pos = start_pos + j
                 log_prob_sum += log_probs_all[i, pos, token_id].item()
 
-            batch_log_probs.append(log_prob_sum)
+            # Mean per-token log prob, not raw sum: summing penalizes longer label
+            # strings regardless of correctness, which breaks argmax-based
+            # classification across candidates of varying token length. This is a
+            # no-op for marginal utility, since that's a ratio of two scores for
+            # the same label (token count cancels out).
+            batch_log_probs.append(log_prob_sum / len(label_tokens))
 
         return batch_log_probs
 

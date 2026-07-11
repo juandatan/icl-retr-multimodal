@@ -15,6 +15,11 @@ Usage:
         --dataset stanford_cars \
         --image-split-path data/stanford_cars/image_split.json \
         --kaggle-dataset juandatan/stanford-cars-clip
+
+    # Fine-grained datasets registered in src/data/dataset_registry.py
+    python scripts/build_clip_embeddings.py \
+        --dataset cub_200 \
+        --image-split-path data/cub_200/image_split.json
 """
 
 import argparse
@@ -33,6 +38,8 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from src.data.stanford_cars import StanfordCarsDataset
 from src.data.mini_imagenet import MiniImageNetDataset
+from src.data.fine_grained_hf_dataset import FineGrainedHFDataset
+from src.data.dataset_registry import FINE_GRAINED_DATASETS, get_dataset_spec
 
 
 def _upload_embeddings_to_kaggle(data_dir: Path, splits: list, kaggle_dataset: str):
@@ -84,7 +91,7 @@ def main():
         '--dataset',
         type=str,
         default='stanford_cars',
-        choices=['stanford_cars', 'mini_imagenet'],
+        choices=['stanford_cars', 'mini_imagenet'] + list(FINE_GRAINED_DATASETS.keys()),
         help='Dataset to process (default: stanford_cars)'
     )
     parser.add_argument(
@@ -147,12 +154,19 @@ def main():
         args.data_dir = f'./data/{args.dataset}'
 
     # Select dataset class
+    fine_grained_spec = None
+    supports_image_split = args.dataset == 'stanford_cars'
     if args.dataset == 'stanford_cars':
         DatasetClass = StanfordCarsDataset
         dataset_display_name = "Stanford Cars"
     elif args.dataset == 'mini_imagenet':
         DatasetClass = MiniImageNetDataset
         dataset_display_name = "Mini-ImageNet"
+    elif args.dataset in FINE_GRAINED_DATASETS:
+        DatasetClass = FineGrainedHFDataset
+        fine_grained_spec = get_dataset_spec(args.dataset)
+        dataset_display_name = fine_grained_spec.display_name
+        supports_image_split = True
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
@@ -195,8 +209,10 @@ def main():
 
         # Load dataset
         kwargs = dict(split=split, data_dir=args.data_dir, class_split_seed=args.class_split_seed)
-        if args.dataset == 'stanford_cars' and args.image_split_path:
+        if supports_image_split and args.image_split_path:
             kwargs['image_split_path'] = args.image_split_path
+        if fine_grained_spec is not None:
+            kwargs['hf_repo_ids'] = fine_grained_spec.hf_repo_ids
         dataset = DatasetClass(**kwargs)
 
         print(f"Loaded {len(dataset)} examples\n")
@@ -242,8 +258,10 @@ def main():
 
     # Use train split to save class split info
     train_kwargs = dict(split='train', data_dir=args.data_dir, class_split_seed=args.class_split_seed)
-    if args.dataset == 'stanford_cars' and args.image_split_path:
+    if supports_image_split and args.image_split_path:
         train_kwargs['image_split_path'] = args.image_split_path
+    if fine_grained_spec is not None:
+        train_kwargs['hf_repo_ids'] = fine_grained_spec.hf_repo_ids
     train_dataset = DatasetClass(**train_kwargs)
     train_dataset.save_split_info()
 

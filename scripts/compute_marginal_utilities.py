@@ -37,6 +37,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from data.dataclasses import MarginalUtilityResult
 from data.stanford_cars import StanfordCarsDataset
 from data.mini_imagenet import MiniImageNetDataset
+from data.fine_grained_hf_dataset import FineGrainedHFDataset
+from data.dataset_registry import FINE_GRAINED_DATASETS, get_dataset_spec
 from models.idefics2_wrapper import Idefics2Wrapper
 from utils.kaggle_utils import (
     is_kaggle_environment,
@@ -61,6 +63,15 @@ def load_dataset(cfg: DictConfig):
             split=cfg.dataset.split,
             data_dir=cfg.dataset.cache_dir,
             class_split_seed=cfg.dataset.class_split_seed
+        )
+    elif cfg.dataset.name in FINE_GRAINED_DATASETS:
+        spec = get_dataset_spec(cfg.dataset.name)
+        dataset = FineGrainedHFDataset(
+            hf_repo_ids=spec.hf_repo_ids,
+            split=cfg.dataset.split,
+            data_dir=cfg.dataset.cache_dir,
+            class_split_seed=cfg.dataset.class_split_seed,
+            image_split_path=cfg.dataset.get('image_split_path'),
         )
     else:
         raise ValueError(f"Unknown dataset: {cfg.dataset.name}")
@@ -424,7 +435,10 @@ def load_checkpoint(cfg: DictConfig) -> Tuple[List[MarginalUtilityResult], int]:
     downloads checkpoints from Kaggle dataset first.
 
     Returns:
-        (existing_results, last_completed_query_idx)
+        (existing_results, last_completed_position). "Position" is an index into
+        the (possibly sampled) query_indices list built by get_query_indices,
+        not a raw dataset index -- resuming re-derives the same sampled list
+        from cfg.experiment.seed and continues from position + 1.
     """
     if not cfg.checkpoint.enabled:
         return [], -1
@@ -454,22 +468,22 @@ def load_checkpoint(cfg: DictConfig) -> Tuple[List[MarginalUtilityResult], int]:
         checkpoint_data = pickle.load(f)
 
     results = checkpoint_data['results']
-    last_query = checkpoint_data['last_query_idx']
+    last_position = checkpoint_data['last_query_idx']
 
     print(f"✓ Loaded checkpoint with {len(results)} results")
-    print(f"  Last completed query: {last_query}")
-    print(f"  Resuming from query {last_query + 1}\n")
+    print(f"  Last completed position: {last_position}")
+    print(f"  Resuming from position {last_position + 1}\n")
 
-    return results, last_query
+    return results, last_position
 
 
-def save_checkpoint(results: List[MarginalUtilityResult], query_idx: int, cfg: DictConfig, upload_to_kaggle: bool = True):
+def save_checkpoint(results: List[MarginalUtilityResult], position: int, cfg: DictConfig, upload_to_kaggle: bool = True):
     """
     Save checkpoint with current results.
 
     Args:
         results: List of marginal utility results
-        query_idx: Current query index
+        position: Current position in the query_indices list (see get_query_indices)
         cfg: Configuration
         upload_to_kaggle: Whether to upload to Kaggle (only done on save_interval)
     """
@@ -479,12 +493,12 @@ def save_checkpoint(results: List[MarginalUtilityResult], query_idx: int, cfg: D
     checkpoint_dir = Path(cfg.checkpoint.save_dir) / cfg.experiment.name / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_path = checkpoint_dir / f"checkpoint_{query_idx:06d}.pkl"
+    checkpoint_path = checkpoint_dir / f"checkpoint_{position:06d}.pkl"
 
     with open(checkpoint_path, 'wb') as f:
         pickle.dump({
             'results': results,
-            'last_query_idx': query_idx,
+            'last_query_idx': position,
             'config': OmegaConf.to_container(cfg, resolve=True),
             'num_queries': len(set(r.query_idx for r in results)),
             'num_pairs': len(results)
@@ -495,6 +509,25 @@ def save_checkpoint(results: List[MarginalUtilityResult], query_idx: int, cfg: D
         kaggle_dataset = get_kaggle_checkpoint_dataset()
         if kaggle_dataset:
             kaggle_upload_checkpoints(checkpoint_dir, kaggle_dataset, cfg.experiment.name)
+
+
+def get_query_indices(dataset, cfg: DictConfig) -> List[int]:
+    """
+    Determine which dataset indices to process as queries.
+
+    When cfg.limits.max_queries caps the run below the dataset size, draws a
+    seeded random sample rather than taking the first N indices. HF-backed
+    fine-grained datasets are typically grouped by class, so the first N
+    indices could span only a handful of classes -- a random sample is needed
+    for the subset to be representative (e.g. for the reranker-signal
+    diagnostics in scripts/diagnose_reranker_signal.py).
+    """
+    n = len(dataset)
+    if cfg.limits.max_queries and cfg.limits.max_queries < n:
+        rng = np.random.default_rng(cfg.experiment.seed)
+        sampled = rng.choice(n, size=cfg.limits.max_queries, replace=False)
+        return sorted(sampled.tolist())
+    return list(range(n))
 
 
 def run_experiment(model, dataset, baseline_probs: Dict[int, float], cfg: DictConfig) -> List[MarginalUtilityResult]:
@@ -511,19 +544,18 @@ def run_experiment(model, dataset, baseline_probs: Dict[int, float], cfg: DictCo
         List of all MarginalUtilityResult objects
     """
     # Load checkpoint if exists
-    all_results, start_query = load_checkpoint(cfg)
-    start_query += 1  # Start from next query
+    all_results, last_position = load_checkpoint(cfg)
+    start_position = last_position + 1  # Start from next position
 
-    # Determine which queries to process
-    num_queries = len(dataset)
-    if cfg.limits.max_queries:
-        num_queries = min(num_queries, cfg.limits.max_queries)
+    # Determine which queries to process (sampled if max_queries caps the dataset)
+    query_indices = get_query_indices(dataset, cfg)
+    num_queries = len(query_indices)
 
     print(f"\n{'='*70}")
     print(f"Computing marginal utilities for {num_queries} queries")
     print(f"Retrieving top-{cfg.retrieval.top_k} candidates per query")
-    if start_query > 0:
-        print(f"Resuming from query {start_query} (already completed {start_query})")
+    if start_position > 0:
+        print(f"Resuming from position {start_position} (already completed {start_position})")
     print(f"{'='*70}\n")
 
     # Track skipped queries
@@ -531,7 +563,8 @@ def run_experiment(model, dataset, baseline_probs: Dict[int, float], cfg: DictCo
     expected_pairs_per_query = cfg.retrieval.top_k
 
     # Process each query
-    for query_idx in tqdm(range(start_query, num_queries), desc="Queries", initial=start_query, total=num_queries):
+    for position in tqdm(range(start_position, num_queries), desc="Queries", initial=start_position, total=num_queries):
+        query_idx = query_indices[position]
         # Retrieve candidates
         candidate_indices, similarities = retrieve_candidates(
             dataset=dataset,
@@ -563,21 +596,22 @@ def run_experiment(model, dataset, baseline_probs: Dict[int, float], cfg: DictCo
             skipped_queries.append((query_idx, expected_pairs_per_query - results_added))
 
         # Clear GPU cache periodically to prevent memory fragmentation
-        if torch.cuda.is_available() and (query_idx + 1) % 50 == 0:
+        if torch.cuda.is_available() and (position + 1) % 50 == 0:
             torch.cuda.empty_cache()
 
-        # Save checkpoint periodically
-        if cfg.checkpoint.enabled and (query_idx + 1) % cfg.checkpoint.save_interval == 0:
-            save_checkpoint(all_results, query_idx, cfg)
-            msg = f"✓ Checkpoint saved: query {query_idx}"
+        # Save checkpoint periodically (position, not query_idx, so cadence is
+        # regular even when query_indices is a non-contiguous random sample)
+        if cfg.checkpoint.enabled and (position + 1) % cfg.checkpoint.save_interval == 0:
+            save_checkpoint(all_results, position, cfg)
+            msg = f"✓ Checkpoint saved: position {position} (query {query_idx})"
             if skipped_queries:
                 msg += f" ({len(skipped_queries)} queries skipped)"
             print(f"\n{msg}")
 
     # Save final checkpoint to capture any remaining queries
     if cfg.checkpoint.enabled and len(all_results) > 0:
-        save_checkpoint(all_results, query_idx, cfg, upload_to_kaggle=True)
-        print(f"\n✓ Final checkpoint saved: query {query_idx}")
+        save_checkpoint(all_results, position, cfg, upload_to_kaggle=True)
+        print(f"\n✓ Final checkpoint saved: position {position} (query {query_idx})")
 
     # Report skipped queries
     if skipped_queries:
