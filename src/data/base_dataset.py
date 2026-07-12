@@ -10,7 +10,7 @@ Provides common functionality for:
 import pickle
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass
 
 import numpy as np
@@ -127,8 +127,13 @@ class BaseUtilityDataset(Dataset, ABC):
         assert len(set(self.train_classes) & set(self.test_classes)) == 0
         assert len(set(self.val_classes) & set(self.test_classes)) == 0
 
-        print(f"Class splits: {len(self.train_classes)} train, "
-              f"{len(self.val_classes)} val, {len(self.test_classes)} test")
+        # Subclasses using an image-level split (e.g. FineGrainedHFDataset with
+        # image_split_path set) override _filter_examples_by_split and ignore
+        # these class-disjoint splits entirely; the print below would otherwise
+        # misleadingly suggest classes are disjoint across splits.
+        if getattr(self, '_image_split_hf_indices', None) is None:
+            print(f"Class splits: {len(self.train_classes)} train, "
+                  f"{len(self.val_classes)} val, {len(self.test_classes)} test")
 
     def _filter_examples_by_split(self):
         """Filter examples to only include those from the current split's classes."""
@@ -312,6 +317,7 @@ class BaseUtilityDataset(Dataset, ABC):
         k: int = 100,
         exclude_query: bool = True,
         exclude_same_class: bool = False,
+        allowed_indices: Optional[Set[int]] = None,
     ) -> Tuple[List[int], np.ndarray]:
         """
         Get top-k most similar examples to query based on CLIP embeddings.
@@ -321,6 +327,8 @@ class BaseUtilityDataset(Dataset, ABC):
             k: Number of candidates to return
             exclude_query: Whether to exclude the query itself
             exclude_same_class: Whether to exclude examples from same class
+            allowed_indices: If provided, restrict candidates to this set of example
+                indices (e.g. a confusable-class-restricted pool) before ranking.
 
         Returns:
             (candidate_indices, similarity_scores)
@@ -333,6 +341,11 @@ class BaseUtilityDataset(Dataset, ABC):
 
         # Create mask for valid candidates
         valid_mask = np.ones(len(self), dtype=bool)
+
+        if allowed_indices is not None:
+            allowed_mask = np.zeros(len(self), dtype=bool)
+            allowed_mask[list(allowed_indices)] = True
+            valid_mask &= allowed_mask
 
         if exclude_query:
             valid_mask[query_idx] = False

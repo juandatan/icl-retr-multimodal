@@ -1,0 +1,46 @@
+# Baseline MC evaluation configuration (0-shot vs. CLIP-top-1) - CUB-200-2011.
+# Fine-grained classification dataset with 200 bird species.
+
+experiment:
+  name: "eval_mc_baselines_cub_200"
+  seed: 42
+
+dataset:
+  name: "cub_200"
+  split: "test"
+  cache_dir: "data/cub_200"
+  image_split_path: "data/cub_200/image_split.json"
+  # Kaggle dataset holding siglip_text_embeddings.pkl / siglip_image_embeddings_{split}.pkl
+  # (see scripts/upload_siglip_distractor_set_to_kaggle.py). Assumed to already be
+  # attached as a notebook input (mounted at /kaggle/input/<slug>/); falls back to
+  # data/{dataset.name}/ when running locally or if not mounted.
+  siglip_kaggle_dataset: "juandatan/cub-200-siglip-embeddings-distractor-set"
+  # Kaggle dataset holding clip_embeddings_{split}.pkl, used for the CLIP-top-1
+  # retrieval condition (see scripts/build_clip_embeddings.py /
+  # scripts/upload_embeddings_to_kaggle.py). Assumed to already be attached as a
+  # notebook input; falls back to data/{dataset.name}/ when running locally or
+  # if not mounted, then to a Kaggle CLI download.
+  embeddings_kaggle_dataset: "juandatan/cub-200-2011-clip-embeddings"
+
+# Distractor options (the K-1 wrong answers plus the true label) are built from
+# SigLIP image-to-text similarity, ranked once per query and sliced to each K.
+distractor_set:
+  siglip_model: "google/siglip-so400m-patch14-384"
+  k_values: [4, 8, 12, 16]
+  letter_seed: 42
+
+# CLIP retrieval is restricted to images whose label falls within the distractor
+# set, so every retrieved candidate is a valid answer option.
+retrieval:
+  clip_model: "ViT-B/32"
+  candidate_pool_k: 30
+
+model:
+  idefics2_model: "HuggingFaceM4/idefics2-8b"
+  load_in_8bit: false
+
+output:
+  save_dir: "outputs/evals/mc_baselines"
+
+limits:
+  max_queries: null

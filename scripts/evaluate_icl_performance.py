@@ -188,14 +188,19 @@ def resolve_embeddings_cache_path(dataset_name: str, split: str,
         return None
 
     filename = f"clip_embeddings_{split}.pkl"
-    slug = embeddings_kaggle_dataset.split('/')[-1]
+    owner, slug = embeddings_kaggle_dataset.split('/')
 
-    # Matches the mount path Kaggle notebooks actually use when a dataset is attached
-    # as input (see scripts/upload_embeddings_to_kaggle.py's printed guidance).
-    mounted_path = Path(f"/kaggle/input/{slug}/{filename}")
-    if mounted_path.exists():
-        print(f"✓ Using mounted Kaggle input: {mounted_path}")
-        return mounted_path
+    # Kaggle notebooks may mount an attached dataset at either the older flat
+    # /kaggle/input/{slug}/ path or the newer /kaggle/input/datasets/{owner}/{slug}/
+    # path (seen when a dataset is referenced by full owner/slug).
+    candidate_paths = [
+        Path(f"/kaggle/input/datasets/{owner}/{slug}/{filename}"),
+        Path(f"/kaggle/input/{slug}/{filename}"),
+    ]
+    for mounted_path in candidate_paths:
+        if mounted_path.exists():
+            print(f"✓ Using mounted Kaggle input: {mounted_path}")
+            return mounted_path
 
     return download_from_kaggle_dataset(
         kaggle_dataset=embeddings_kaggle_dataset,

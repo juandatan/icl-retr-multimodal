@@ -69,6 +69,9 @@ class Idefics2Wrapper:
         # Vision embedding cache: maps image hash -> vision embeddings
         self._vision_cache = {} if cache_vision_embeddings else None
 
+        # MC option letter -> single-token id, populated lazily by _letter_token_id
+        self._letter_token_id_cache = {}
+
         print(f"Loading Idefics2 model: {model_name}")
         print(f"Device: {device}")
         if load_in_8bit:
@@ -187,6 +190,52 @@ class Idefics2Wrapper:
             lines.append("  " + "  ".join(line_items))
 
         return "\n".join(lines)
+
+    def _format_mc_prompt(
+        self,
+        letter_to_label: Dict[str, str],
+        example_labels: Optional[List[str]] = None,
+    ) -> str:
+        """
+        Format an MMLU-style multiple-choice prompt with <image> tokens.
+
+        Lists all K lettered options once at the top (sorted alphabetically by
+        letter, independent of dict ordering, for prompt determinism), then
+        interleaves ICL examples the same way format_prompt does, ending in
+        "Answer:" so a single forward pass yields the next-token distribution
+        over the answer letter.
+
+        Args:
+            letter_to_label: Mapping from option letter to class label text,
+                already shuffled by the caller (e.g. via materialize_distractor_set)
+            example_labels: List of example labels for ICL
+
+        Returns:
+            String prompt with <image> tokens properly placed, ending in "Answer:"
+        """
+        sorted_letters = sorted(letter_to_label.keys())
+        option_lines = [f"{letter}. {letter_to_label[letter]}" for letter in sorted_letters]
+
+        task_parts = [
+            "The goal of this task is to correctly classify an image. "
+            "Choose the correct option from the list below.",
+            "\n".join(option_lines),
+            "Output only the letter of the correct option.",
+        ]
+        task_description = "\n".join(task_parts)
+
+        prompt_parts = [task_description, ""]
+
+        if example_labels is not None and len(example_labels) > 0:
+            for ex_label in example_labels:
+                prompt_parts.append("<image>")
+                prompt_parts.append(f"Output: {ex_label}")
+                prompt_parts.append("")
+
+        prompt_parts.append("<image>")
+        prompt_parts.append("Answer:")
+
+        return "\n".join(prompt_parts)
 
     def _compute_label_probabilities_batch(
         self,
@@ -807,6 +856,88 @@ class Idefics2Wrapper:
         # Find label with highest log probability
         best_idx = max(range(len(all_log_probs)), key=lambda i: all_log_probs[i])
         return candidate_labels[best_idx]
+
+    def _letter_token_id(self, letter: str) -> int:
+        """
+        Token id the tokenizer assigns to a single MC option letter.
+
+        Encoding " " + letter (rather than the bare letter) and taking the last
+        token is necessary because a bare letter can tokenize differently at the
+        start of a string; empirically this last-token id is stable regardless of
+        what precedes it in the real prompt (verified across multiple prefixes),
+        so it's safe to precompute once and cache, rather than re-deriving it from
+        the full prompt on every call.
+        """
+        if letter not in self._letter_token_id_cache:
+            token_ids = self.processor.tokenizer.encode(" " + letter, add_special_tokens=False)
+            self._letter_token_id_cache[letter] = token_ids[-1]
+        return self._letter_token_id_cache[letter]
+
+    def classify_with_context_mc(
+        self,
+        query_image: Image.Image,
+        context_examples: List[Tuple[Image.Image, str]],
+        letter_to_label: Dict[str, str],
+    ) -> Tuple[str, Dict[str, float]]:
+        """
+        Classify an image as a K-way multiple-choice task in a single forward pass.
+
+        Unlike classify_with_context (which costs one forward pass per candidate
+        label), this lists all K options as single-letter choices in the prompt
+        and reads the model's next-token distribution over just those K letter
+        tokens from ONE forward pass -- giving a true closed-set softmax over K
+        options at O(1) cost instead of O(K).
+
+        Args:
+            query_image: Query image to classify
+            context_examples: List of (image, label_text) tuples for ICL context
+            letter_to_label: Mapping from option letter to class label text
+                (already shuffled by the caller, e.g. via materialize_distractor_set)
+
+        Returns:
+            (predicted_letter, probs) where probs is a dict mapping each option
+            letter to its softmax probability over the K-way closed set.
+        """
+        example_labels = [label for _, label in context_examples] if context_examples else None
+        prompt = self._format_mc_prompt(letter_to_label, example_labels=example_labels)
+
+        images = [img for img, _ in context_examples] + [query_image]
+        image_hidden_states = self._get_image_features_multi(images)
+
+        prompt_inputs = self.processor(text=prompt, return_tensors="pt")
+        prompt_inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                         for k, v in prompt_inputs.items()}
+
+        model_inputs = {
+            'input_ids': prompt_inputs['input_ids'],
+            'attention_mask': prompt_inputs['attention_mask'],
+            'image_hidden_states': image_hidden_states,
+            'use_cache': self.use_cache,
+        }
+
+        with torch.no_grad():
+            if self.device.startswith("cuda"):
+                with autocast(dtype=torch.float16):
+                    outputs = self.model(**model_inputs)
+            else:
+                outputs = self.model(**model_inputs)
+
+        # Next-token distribution after the last prompt token (i.e. after "Answer:").
+        last_pos = prompt_inputs['attention_mask'].sum().item() - 1
+        log_probs = torch.nn.functional.log_softmax(outputs.logits[0, last_pos], dim=-1)
+
+        letters = list(letter_to_label.keys())
+        letter_token_ids = torch.tensor(
+            [self._letter_token_id(l) for l in letters], device=log_probs.device
+        )
+        letter_logits = log_probs[letter_token_ids]
+
+        # Renormalize (softmax) over just the K letter logits, closed-set.
+        probs_tensor = torch.nn.functional.softmax(letter_logits, dim=-1)
+        probs = {letter: probs_tensor[i].item() for i, letter in enumerate(letters)}
+
+        predicted_letter = max(probs, key=probs.get)
+        return predicted_letter, probs
 
     def classify_with_context_generative(
         self,
