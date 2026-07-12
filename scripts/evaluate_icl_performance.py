@@ -172,8 +172,41 @@ def save_cached_results(cache_path: Path, results: Dict):
     print(f"✓ Cached results saved to {cache_path}")
 
 
+def resolve_embeddings_cache_path(dataset_name: str, split: str,
+                                   embeddings_kaggle_dataset: Optional[str]) -> Optional[Path]:
+    """
+    Resolve a local path to clip_embeddings_{split}.pkl sourced from a Kaggle dataset,
+    so scripts can reuse pre-built embeddings instead of rebuilding them locally.
+
+    Checks the Kaggle-mounted input path first (when running inside a Kaggle notebook
+    with the dataset attached), then falls back to downloading via the Kaggle CLI.
+
+    Returns None if embeddings_kaggle_dataset is not provided, in which case callers
+    should fall back to the dataset's own local default path.
+    """
+    if not embeddings_kaggle_dataset:
+        return None
+
+    filename = f"clip_embeddings_{split}.pkl"
+    slug = embeddings_kaggle_dataset.split('/')[-1]
+
+    # Matches the mount path Kaggle notebooks actually use when a dataset is attached
+    # as input (see scripts/upload_embeddings_to_kaggle.py's printed guidance).
+    mounted_path = Path(f"/kaggle/input/{slug}/{filename}")
+    if mounted_path.exists():
+        print(f"✓ Using mounted Kaggle input: {mounted_path}")
+        return mounted_path
+
+    return download_from_kaggle_dataset(
+        kaggle_dataset=embeddings_kaggle_dataset,
+        filename=filename,
+        cache_dir="./cache/embeddings",
+    )
+
+
 def load_dataset(dataset_name: str, split: str = "test",
-                 image_split_path: Optional[str] = None):
+                 image_split_path: Optional[str] = None,
+                 embeddings_kaggle_dataset: Optional[str] = None):
     """Load dataset for evaluation."""
     print(f"\nLoading {dataset_name} dataset ({split} split)...")
 
@@ -202,8 +235,11 @@ def load_dataset(dataset_name: str, split: str = "test",
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
-    # Load CLIP embeddings
-    success = dataset.load_clip_embeddings()
+    # Load CLIP embeddings, preferring a Kaggle-sourced cache when configured
+    embeddings_cache_path = resolve_embeddings_cache_path(
+        dataset_name, split, embeddings_kaggle_dataset
+    )
+    success = dataset.load_clip_embeddings(cache_path=embeddings_cache_path)
     if not success:
         raise FileNotFoundError(
             f"CLIP embeddings not found. Please run: "
@@ -218,34 +254,41 @@ def load_dataset(dataset_name: str, split: str = "test",
 
 
 def load_eval_datasets(dataset_name: str, eval_split: str, retrieval_split: str,
-                       image_split_path: Optional[str] = None):
+                       image_split_path: Optional[str] = None,
+                       embeddings_kaggle_dataset: Optional[str] = None):
     """Load and return (test_dataset, retrieval_dataset), reusing objects where splits overlap."""
     if eval_split == "val+test":
         test_dataset = CombinedDataset([
-            load_dataset(dataset_name, split="val", image_split_path=image_split_path),
-            load_dataset(dataset_name, split="test", image_split_path=image_split_path),
+            load_dataset(dataset_name, split="val", image_split_path=image_split_path,
+                        embeddings_kaggle_dataset=embeddings_kaggle_dataset),
+            load_dataset(dataset_name, split="test", image_split_path=image_split_path,
+                        embeddings_kaggle_dataset=embeddings_kaggle_dataset),
         ])
     else:
         test_dataset = load_dataset(dataset_name, split=eval_split,
-                                    image_split_path=image_split_path)
+                                    image_split_path=image_split_path,
+                                    embeddings_kaggle_dataset=embeddings_kaggle_dataset)
 
     if retrieval_split == eval_split and eval_split != "val+test":
         retrieval_dataset = test_dataset
     else:
         retrieval_dataset = load_dataset(dataset_name, split=retrieval_split,
-                                         image_split_path=image_split_path)
+                                         image_split_path=image_split_path,
+                                         embeddings_kaggle_dataset=embeddings_kaggle_dataset)
 
     return test_dataset, retrieval_dataset
 
 
 def build_all_classes_label_mapping(dataset_name: str, preloaded: Dict = None,
-                                    image_split_path: Optional[str] = None) -> Dict:
+                                    image_split_path: Optional[str] = None,
+                                    embeddings_kaggle_dataset: Optional[str] = None) -> Dict:
     """Build label_name -> label mapping from all splits, reusing any pre-loaded datasets."""
     preloaded = preloaded or {}
     mapping = {}
     for split in ("train", "val", "test"):
         ds = preloaded.get(split) or load_dataset(dataset_name, split=split,
-                                                   image_split_path=image_split_path)
+                                                   image_split_path=image_split_path,
+                                                   embeddings_kaggle_dataset=embeddings_kaggle_dataset)
         for ex in ds.examples:
             if ex.label_name not in mapping:
                 mapping[ex.label_name] = ex.label
@@ -927,6 +970,7 @@ def evaluate_icl_worker(
     worker_id: Optional[int] = None,
     image_split_path: Optional[str] = None,
     force_recompute: bool = False,
+    embeddings_kaggle_dataset: Optional[str] = None,
 ) -> Dict:
     """Worker function for multi-GPU evaluation. Runs on a single GPU and evaluates a subset of queries.
 
@@ -949,6 +993,7 @@ def evaluate_icl_worker(
         test_dataset, retrieval_dataset = load_eval_datasets(
             dataset_name, eval_split, retrieval_split,
             image_split_path=image_split_path,
+            embeddings_kaggle_dataset=embeddings_kaggle_dataset,
         )
 
         if use_all_classes and all_classes_label_mapping is None:
@@ -959,6 +1004,7 @@ def evaluate_icl_worker(
             preloaded[retrieval_split] = retrieval_dataset
             all_classes_label_mapping = build_all_classes_label_mapping(
                 dataset_name, preloaded, image_split_path=image_split_path,
+                embeddings_kaggle_dataset=embeddings_kaggle_dataset,
             )
             print(f"[Worker {worker_id}] Using {len(all_classes_label_mapping)} classes as candidates")
 
@@ -1081,6 +1127,7 @@ def evaluate_icl_multigpu(
     do_image_splitting: bool = True,
     image_split_path: Optional[str] = None,
     force_recompute: bool = False,
+    embeddings_kaggle_dataset: Optional[str] = None,
 ) -> Dict:
     """
     Evaluate ICL performance using multiple GPUs in parallel.
@@ -1103,6 +1150,7 @@ def evaluate_icl_multigpu(
     test_dataset, retrieval_dataset = load_eval_datasets(
         dataset_name, eval_split, retrieval_split,
         image_split_path=image_split_path,
+        embeddings_kaggle_dataset=embeddings_kaggle_dataset,
     )
 
     all_classes_label_mapping = None
@@ -1114,6 +1162,7 @@ def evaluate_icl_multigpu(
         preloaded[retrieval_split] = retrieval_dataset
         all_classes_label_mapping = build_all_classes_label_mapping(
             dataset_name, preloaded, image_split_path=image_split_path,
+            embeddings_kaggle_dataset=embeddings_kaggle_dataset,
         )
         print(f"✓ Using {len(all_classes_label_mapping)} classes as candidates")
 
@@ -1149,6 +1198,7 @@ def evaluate_icl_multigpu(
                 'do_image_splitting': do_image_splitting,
                 'image_split_path': image_split_path,
                 'force_recompute': force_recompute,
+                'embeddings_kaggle_dataset': embeddings_kaggle_dataset,
             }
         )
 

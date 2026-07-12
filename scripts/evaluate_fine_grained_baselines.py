@@ -114,6 +114,7 @@ def _run_baseline(
                 image_split_path=args.image_split_path,
                 use_all_classes=use_all_classes,
                 force_recompute=args.force_recompute,
+                embeddings_kaggle_dataset=args.embeddings_kaggle_dataset,
             )
         else:
             results = evaluate_icl(
@@ -185,6 +186,9 @@ def main():
                         help="Skip 1-shot CLIP-retrieval evaluation")
     parser.add_argument("--use-all-classes", action="store_true",
                         help="Score all classes as candidates (discriminative only)")
+    parser.add_argument("--embeddings-kaggle-dataset", type=str, default=None,
+                        help="Kaggle dataset (username/slug) to load pre-built CLIP "
+                             "embeddings from, instead of building them locally")
 
     args = parser.parse_args()
 
@@ -203,14 +207,17 @@ def main():
     print(f"\nLoading {args.eval_split} split(s)...")
     if args.eval_split == "val+test":
         temp_datasets = [
-            load_dataset(args.dataset, split="val", image_split_path=args.image_split_path),
-            load_dataset(args.dataset, split="test", image_split_path=args.image_split_path),
+            load_dataset(args.dataset, split="val", image_split_path=args.image_split_path,
+                        embeddings_kaggle_dataset=args.embeddings_kaggle_dataset),
+            load_dataset(args.dataset, split="test", image_split_path=args.image_split_path,
+                        embeddings_kaggle_dataset=args.embeddings_kaggle_dataset),
         ]
         test_dataset_size = sum(len(ds) for ds in temp_datasets)
         print(f"Combined val+test: {test_dataset_size} examples")
     else:
         temp_datasets = [load_dataset(args.dataset, split=args.eval_split,
-                                      image_split_path=args.image_split_path)]
+                                      image_split_path=args.image_split_path,
+                                      embeddings_kaggle_dataset=args.embeddings_kaggle_dataset)]
         test_dataset_size = len(temp_datasets[0])
         print(f"{args.eval_split}: {test_dataset_size} examples")
 
