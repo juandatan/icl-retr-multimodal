@@ -236,6 +236,83 @@ def kaggle_upload_checkpoints(checkpoint_dir: Path, dataset_name: str, experimen
         return False
 
 
+def kaggle_upload_eval_results(output_dir: Path, dataset_name: str, title: Optional[str] = None) -> bool:
+    """
+    Upload every file in an eval-results output directory (see save_eval_results
+    in src/utils/eval_utils.py) to a Kaggle dataset, so results survive after an
+    ephemeral Kaggle notebook session ends.
+
+    Args:
+        output_dir: Directory containing the run's .pkl/.json result files
+        dataset_name: Kaggle dataset name (format: username/dataset-name)
+        title: Dataset title (defaults to dataset slug)
+
+    Returns:
+        True if upload successful, False otherwise
+    """
+    if not dataset_name:
+        return False
+
+    output_dir = Path(output_dir)
+    files = [f for f in output_dir.iterdir() if f.is_file()]
+    if not files:
+        print(f"⚠️  No files found in {output_dir} to upload")
+        return False
+
+    username, slug = dataset_name.split('/')
+    if title is None:
+        title = slug.replace('-', ' ').title()
+
+    try:
+        import tempfile
+        import shutil
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+
+            for f in files:
+                shutil.copy2(f, temp_path / f.name)
+
+            metadata = {
+                "title": title,
+                "id": f"{username}/{slug}",
+                "licenses": [{"name": "CC0-1.0"}],
+            }
+            with open(temp_path / "dataset-metadata.json", 'w') as mf:
+                json.dump(metadata, mf, indent=2)
+
+            status = subprocess.run(
+                ["kaggle", "datasets", "status", dataset_name],
+                capture_output=True, text=True, check=False
+            )
+            dataset_exists = status.returncode == 0
+
+            if dataset_exists:
+                cmd = ["kaggle", "datasets", "version", "-p", str(temp_path),
+                       "-m", f"Upload {len(files)} eval result file(s)", "--dir-mode", "zip"]
+            else:
+                cmd = ["kaggle", "datasets", "create", "-p", str(temp_path), "--dir-mode", "zip"]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+            if result.returncode != 0:
+                print(f"⚠️  Failed to upload eval results: {result.stderr}")
+                return False
+
+            print(f"✓ Uploaded {len(files)} eval result file(s) to {dataset_name}")
+            return True
+
+    except subprocess.TimeoutExpired:
+        print("⚠️  Upload timed out")
+        return False
+    except FileNotFoundError:
+        print("⚠️  Kaggle CLI not found. Install with: pip install kaggle")
+        return False
+    except Exception as e:
+        print(f"⚠️  Error uploading eval results: {e}")
+        return False
+
+
 def setup_kaggle_credentials(kaggle_json_path: Optional[str] = None):
     """
     Setup Kaggle API credentials.

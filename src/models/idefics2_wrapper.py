@@ -201,14 +201,16 @@ class Idefics2Wrapper:
 
         Lists all K lettered options once at the top (sorted alphabetically by
         letter, independent of dict ordering, for prompt determinism), then
-        interleaves ICL examples the same way format_prompt does, ending in
-        "Answer:" so a single forward pass yields the next-token distribution
-        over the answer letter.
+        presents any context images as explicitly labeled references.  Calling
+        them references is important: their labels need not be members of the
+        query's option set, and the model is never shown a full class name as an
+        example response after being instructed to output only a letter.
 
         Args:
             letter_to_label: Mapping from option letter to class label text,
                 already shuffled by the caller (e.g. via materialize_distractor_set)
-            example_labels: List of example labels for ICL
+            example_labels: List of labels for reference images used as ICL
+                context. These may fall outside the query's option set.
 
         Returns:
             String prompt with <image> tokens properly placed, ending in "Answer:"
@@ -220,18 +222,19 @@ class Idefics2Wrapper:
             "The goal of this task is to correctly classify an image. "
             "Choose the correct option from the list below.",
             "\n".join(option_lines),
-            "Output only the letter of the correct option.",
         ]
         task_description = "\n".join(task_parts)
 
         prompt_parts = [task_description, ""]
 
         if example_labels is not None and len(example_labels) > 0:
+            prompt_parts.append("Labeled reference examples:")
             for ex_label in example_labels:
                 prompt_parts.append("<image>")
-                prompt_parts.append(f"Output: {ex_label}")
+                prompt_parts.append(f"Reference label: {ex_label}")
                 prompt_parts.append("")
 
+        prompt_parts.append("Classify the query image. Output only the letter of the correct option.")
         prompt_parts.append("<image>")
         prompt_parts.append("Answer:")
 

@@ -4,8 +4,29 @@ Shared evaluation result persistence utilities.
 
 import json
 import pickle
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+
+def _json_safe(value: Any) -> Any:
+    """Recursively convert common scientific/config values to JSON-safe types."""
+    if is_dataclass(value):
+        return _json_safe(asdict(value))
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except (ValueError, TypeError):
+            pass
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    return value
 
 
 def save_eval_results(
@@ -52,9 +73,12 @@ def save_eval_results(
         "correct": results["correct"],
         "total": results["total"],
         "args": args,
+        # Keep the complete lightweight metrics tree in JSON. Per-query records
+        # remain pickle-only because they can be large.
+        "results": results,
     }
     with open(out_dir / f"{run_id}.json", "w") as f:
-        json.dump(summary, f, indent=2)
+        json.dump(_json_safe(summary), f, indent=2)
 
     print(f"\n✓ {method} results saved to {out_dir}/{run_id}{{.pkl,.json}}")
     return out_dir

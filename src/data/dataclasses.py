@@ -29,6 +29,11 @@ class MCEvalResult:
 
     Reranker fields are reserved for a follow-up phase that adds a reranker-top-1
     condition; they are always None until that phase wires in a trained checkpoint.
+
+    Oracle fields measure the accuracy ceiling a perfect reranker could achieve by
+    exhaustively testing every candidate in the retrieval pool; they are only
+    populated when the eval script is run with oracle computation enabled (it costs
+    ~pool_size forward passes per query instead of 1), otherwise left None.
     """
     query_idx: int
     true_class_idx: int
@@ -47,3 +52,23 @@ class MCEvalResult:
     clip_correct: Optional[bool]
     reranker_correct: Optional[bool]
     pool_size: int
+    pool_has_true_class: bool
+    oracle_correct: Optional[bool] = None
+    oracle_example_idx: Optional[int] = None
+    # Schema-v2 fields. Defaults keep legacy pickles readable.
+    letter_seed: int = 42
+    random_example_idx: Optional[int] = None
+    random_pred_letter: Optional[str] = None
+    random_probs: Optional[Dict[str, float]] = None
+    random_correct: Optional[bool] = None
+    unrestricted_clip_example_idx: Optional[int] = None
+    unrestricted_clip_pred_letter: Optional[str] = None
+    unrestricted_clip_probs: Optional[Dict[str, float]] = None
+    unrestricted_clip_correct: Optional[bool] = None
+    unrestricted_clip_example_in_options: Optional[bool] = None
+    same_class_example_idx: Optional[int] = None
+    same_class_pred_letter: Optional[str] = None
+    same_class_probs: Optional[Dict[str, float]] = None
+    same_class_correct: Optional[bool] = None
+    clip_example_same_class: Optional[bool] = None
+    random_example_same_class: Optional[bool] = None

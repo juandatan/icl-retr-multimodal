@@ -27,13 +27,31 @@ dataset:
 distractor_set:
   siglip_model: "google/siglip-so400m-patch14-384"
   k_values: [4, 8, 12, 16]
-  letter_seed: 42
+  # Repeating the evaluation under independent option-letter assignments exposes
+  # and averages over answer-position bias. Each additional seed multiplies the
+  # Idefics2 evaluation cost, so use a single seed for smoke tests.
+  letter_seeds: [42, 43, 44]
 
 # CLIP retrieval is restricted to images whose label falls within the distractor
 # set, so every retrieved candidate is a valid answer option.
 retrieval:
   clip_model: "ViT-B/32"
   candidate_pool_k: 30
+  # Labeled references come from train by default. Setting this to "test" opts
+  # into the transductive test-corpus setting used by the legacy evaluation.
+  split: "train"
+
+# Diagnostic baselines used to separate retrieval quality from generic effects
+# of adding a labeled reference. All conditions use the same query/options and
+# are repeated under every configured letter seed.
+controls:
+  # Uniformly sampled reference from the restricted top-30 candidate pool.
+  random_pool: true
+  # CLIP top-1 over the whole support split, without filtering to option classes.
+  unrestricted_clip: true
+  # Ground-truth-class-filtered CLIP top-1. This is an oracle ceiling, not a
+  # deployable retrieval method.
+  same_class_oracle: true
 
 model:
   idefics2_model: "HuggingFaceM4/idefics2-8b"
@@ -41,6 +59,27 @@ model:
 
 output:
   save_dir: "outputs/evals/mc_baselines"
+  # Kaggle dataset to upload the saved results (.pkl/.json) to after the run
+  # completes, so results survive after an ephemeral Kaggle notebook session
+  # ends. Set to null/empty to skip uploading.
+  results_kaggle_dataset: "juandatan/cub-200-multiple-choice-baselines"
 
 limits:
   max_queries: null
+  # If true, also test every candidate in the CLIP-restricted pool (not just its
+  # top-1) and record whether *any* of them lets Idefics2 pick the true label --
+  # the accuracy ceiling a perfect reranker could achieve. Costs ~candidate_pool_k
+  # forward passes per query instead of 1, so it's off by default. The free
+  # pool_has_true_class stat (always computed) tells you whether the pool even
+  # contains a correct-class exemplar, without this added cost.
+  compute_oracle: false
+  # Path to a schema-v2 mc_baselines .pkl (see save_eval_results/
+  # scripts/evaluate_mc_baselines.py) to resume from. When set, the 0-shot and
+  # CLIP-top-1 results are loaded as-is (no Idefics2 calls re-run for them) and
+  # only the oracle pass is executed -- the retrieval pool for each query is
+  # deterministically rebuilt from the saved letter_to_class_idx and support
+  # split. Legacy results created before the prompt/retrieval-split correction
+  # are intentionally rejected. Implies compute_oracle=true.
+  # Can be a local path or a Kaggle-mounted path (e.g.
+  # /kaggle/input/datasets/<owner>/<slug>/<dataset>_<split>.pkl).
+  resume_from: null
