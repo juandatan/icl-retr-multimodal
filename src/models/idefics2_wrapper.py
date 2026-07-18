@@ -530,13 +530,29 @@ class Idefics2Wrapper:
         Processes each image independently through _get_image_features to keep
         peak activation memory bounded to a single image, then concatenates.
 
-        Returns image_hidden_states of shape (1, N, num_visual_tokens, hidden_size)
-        where N = len(images), matching the format expected by
-        _compute_label_probabilities_batch_with_features.
+        Transformers versions differ here: current Idefics2 returns flattened
+        ``(N * visual_tokens, hidden_size)`` states, while older versions may
+        preserve batch/image dimensions. Concatenation follows the layout
+        returned by the installed model.
         """
         per_image_features = [self._get_image_features(img) for img in images]
-        # Each is (1, 1, num_tokens, hidden); cat along dim=1 → (1, N, num_tokens, hidden)
-        return torch.cat(per_image_features, dim=1)
+        return self._concatenate_full_label_image_features(per_image_features)
+
+    @staticmethod
+    def _concatenate_full_label_image_features(features: List[torch.Tensor]) -> torch.Tensor:
+        """Concatenate ordered images for flattened or dimension-preserving layouts."""
+        if not features:
+            raise ValueError("features must not be empty")
+        rank = features[0].ndim
+        if any(feature.ndim != rank for feature in features):
+            raise ValueError("All image feature tensors must have the same rank")
+        if any(feature.shape[-1] != features[0].shape[-1] for feature in features):
+            raise ValueError("All image feature tensors must have the same hidden size")
+        # Current Transformers flattens each image to (visual_tokens, hidden).
+        # Legacy layouts retain a leading batch dimension and concatenate images
+        # along dimension 1.
+        image_dimension = 0 if rank == 2 else 1
+        return torch.cat(features, dim=image_dimension)
 
     def compute_marginal_utilities_batch_cached(
         self,
@@ -578,9 +594,11 @@ class Idefics2Wrapper:
             # Cache each example image features
             example_features = self._get_image_features(example_images[i])
 
-            # Combine: [example, query]
-            # Shape: (1, 2, 64, 4096) for 2 images
-            combined_features = torch.cat([example_features, query_features], dim=1)
+            # Combine in prompt order: [example, query]. Current Transformers
+            # flattens this to (128, hidden); legacy versions may retain image dims.
+            combined_features = self._concatenate_full_label_image_features(
+                [example_features, query_features]
+            )
             batch_images_features.append(combined_features)
 
             batch_prompts.append(self.format_prompt(example_labels=[example_labels[i]]))
@@ -859,6 +877,104 @@ class Idefics2Wrapper:
         # Find label with highest log probability
         best_idx = max(range(len(all_log_probs)), key=lambda i: all_log_probs[i])
         return candidate_labels[best_idx]
+
+    def _format_full_label_scoring_prompt(
+        self,
+        example_labels: Optional[List[str]] = None,
+    ) -> str:
+        """Create an option-free prompt for closed-set candidate-label scoring."""
+        prompt_parts = [
+            "Classify the query image. Output only its exact class label.",
+            "",
+        ]
+        if example_labels:
+            prompt_parts.append("Labeled reference examples:")
+            for label in example_labels:
+                prompt_parts.extend(["<image>", f"Label: {label}", ""])
+        prompt_parts.extend(["Query image:", "<image>", "Label:"])
+        return "\n".join(prompt_parts)
+
+    def score_candidate_labels_with_context(
+        self,
+        query_image: Image.Image,
+        context_examples: List[Tuple[Image.Image, str]],
+        candidate_labels: List[str],
+        batch_size: int = 8,
+    ) -> Dict[str, float]:
+        """Score exact class-label continuations against one fixed prompt.
+
+        Candidate labels are deliberately absent from the prompt. Each returned
+        score is the mean token log-likelihood of that label under the identical
+        query/context prefix, so adding candidates cannot alter existing scores.
+        Image features are encoded once and reused across candidate batches.
+        """
+        if not candidate_labels:
+            raise ValueError("candidate_labels must not be empty")
+        if len(set(candidate_labels)) != len(candidate_labels):
+            raise ValueError("candidate_labels must be unique")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+
+        example_labels = [label for _, label in context_examples] if context_examples else None
+        prompt = self._format_full_label_scoring_prompt(example_labels)
+        images = [image for image, _ in context_examples] + [query_image]
+        image_hidden_states = self._get_image_features_multi(images)
+
+        scores = []
+        for start in range(0, len(candidate_labels), batch_size):
+            labels = candidate_labels[start:start + batch_size]
+            scores.extend(self._compute_label_probabilities_batch_with_features(
+                image_hidden_states_list=[image_hidden_states] * len(labels),
+                prompts=[prompt] * len(labels),
+                labels=labels,
+            ))
+        return {label: float(score) for label, score in zip(candidate_labels, scores)}
+
+    def encode_full_label_scoring_images(self, images: List[Image.Image]) -> torch.Tensor:
+        """Encode ordered prompt images once for reuse across candidate labels."""
+        if not images:
+            raise ValueError("images must not be empty")
+        return self._get_image_features_multi(images)
+
+    @staticmethod
+    def combine_full_label_scoring_image_features(
+        context_features: torch.Tensor,
+        query_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """Combine context then query features in the prompt's image order."""
+        return Idefics2Wrapper._concatenate_full_label_image_features(
+            [context_features, query_features]
+        )
+
+    def score_candidate_labels_with_image_features(
+        self,
+        image_hidden_states: torch.Tensor,
+        example_labels: List[str],
+        candidate_labels: List[str],
+        batch_size: int = 8,
+    ) -> Dict[str, float]:
+        """Score labels using precomputed context/query image features.
+
+        ``image_hidden_states`` must contain context images followed by the query
+        image, matching the option-free prompt produced from ``example_labels``.
+        This API lets exhaustive exemplar evaluation encode the query once.
+        """
+        if not candidate_labels:
+            raise ValueError("candidate_labels must not be empty")
+        if len(set(candidate_labels)) != len(candidate_labels):
+            raise ValueError("candidate_labels must be unique")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        prompt = self._format_full_label_scoring_prompt(example_labels or None)
+        scores = []
+        for start in range(0, len(candidate_labels), batch_size):
+            labels = candidate_labels[start:start + batch_size]
+            scores.extend(self._compute_label_probabilities_batch_with_features(
+                image_hidden_states_list=[image_hidden_states] * len(labels),
+                prompts=[prompt] * len(labels),
+                labels=labels,
+            ))
+        return {label: float(score) for label, score in zip(candidate_labels, scores)}
 
     def _letter_token_id(self, letter: str) -> int:
         """

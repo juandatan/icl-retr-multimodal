@@ -1,0 +1,45 @@
+# Exhaustive candidate-pool oracle over fixed full-label scores.
+
+experiment:
+  name: "eval_full_label_oracle_cub_200"
+  seed: 42
+
+dataset:
+  name: "cub_200"
+  eval_split: "test"
+  retrieval_split: "train"
+  image_split_path: "data/cub_200/image_split.json"
+  embeddings_kaggle_dataset: "juandatan/cub-200-2011-clip-embeddings"
+
+input:
+  # Schema-v2 output from evaluate_full_label_baselines.py. Override this path.
+  baseline_results_path: null
+
+oracle:
+  # restricted: score only the union of K-way labels; unrestricted: all labels;
+  # all: compute both in one (unrestricted-cost) pass.
+  scope: "restricted"
+  k_values: [4, 8, 12, 16]
+  candidate_pool_size: 30
+
+hardware:
+  num_gpus: 2
+  require_all: true
+
+model:
+  idefics2_model: "HuggingFaceM4/idefics2-8b"
+  load_in_8bit: true
+
+scoring:
+  candidate_batch_size: 4
+  temperature: 1.0
+
+output:
+  save_dir: "outputs/evals"
+  checkpoint_every: 10
+  results_kaggle_dataset: null
+  upload_every_checkpoint: true
+
+limits:
+  # Schema-v1 oracle output with the same scope and baseline input.
+  resume_from: null

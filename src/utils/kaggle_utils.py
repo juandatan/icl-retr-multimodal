@@ -270,6 +270,28 @@ def kaggle_upload_eval_results(output_dir: Path, dataset_name: str, title: Optio
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
 
+            status = subprocess.run(
+                ["kaggle", "datasets", "status", dataset_name],
+                capture_output=True, text=True, check=False
+            )
+            dataset_exists = status.returncode == 0
+
+            # Kaggle dataset versions replace the previous file set. Seed the
+            # staging directory with the current version so independent eval
+            # stages accumulate instead of deleting one another's artifacts.
+            if dataset_exists:
+                download = subprocess.run(
+                    ["kaggle", "datasets", "download", "-d", dataset_name,
+                     "-p", str(temp_path), "--unzip"],
+                    capture_output=True, text=True, check=False, timeout=300,
+                )
+                if download.returncode != 0:
+                    print(
+                        "⚠️  Refusing to upload because the existing Kaggle dataset "
+                        f"could not be preserved: {download.stderr}"
+                    )
+                    return False
+
             for f in files:
                 shutil.copy2(f, temp_path / f.name)
 
@@ -280,12 +302,6 @@ def kaggle_upload_eval_results(output_dir: Path, dataset_name: str, title: Optio
             }
             with open(temp_path / "dataset-metadata.json", 'w') as mf:
                 json.dump(metadata, mf, indent=2)
-
-            status = subprocess.run(
-                ["kaggle", "datasets", "status", dataset_name],
-                capture_output=True, text=True, check=False
-            )
-            dataset_exists = status.returncode == 0
 
             if dataset_exists:
                 cmd = ["kaggle", "datasets", "version", "-p", str(temp_path),

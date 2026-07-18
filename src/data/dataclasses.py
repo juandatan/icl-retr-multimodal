@@ -6,7 +6,7 @@ imported without heavy dependencies, useful for pickle deserialization.
 """
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -72,3 +72,31 @@ class MCEvalResult:
     same_class_correct: Optional[bool] = None
     clip_example_same_class: Optional[bool] = None
     random_example_same_class: Optional[bool] = None
+
+
+@dataclass
+class FullLabelEvalResult:
+    """All-class label-likelihood scores for one zero/one-shot query."""
+
+    query_idx: int
+    true_class_idx: int
+    clip_example_idx: int
+    clip_example_class_idx: int
+    clip_similarity: float
+    zero_shot_scores: List[float]
+    clip_scores: List[float]
+    distractor_class_indices: Dict[int, List[int]]
+
+
+@dataclass
+class FullLabelOracleResult:
+    """Candidate-pool oracle diagnostics for one full-label query."""
+
+    query_idx: int
+    true_class_idx: int
+    candidate_indices: List[int]
+    candidate_class_indices: List[int]
+    candidate_similarities: List[float]
+    candidate_correct_by_k: Dict[int, List[bool]]
+    candidate_margin_by_k: Dict[int, List[float]]
+    candidate_true_rank_by_k: Dict[int, List[int]]

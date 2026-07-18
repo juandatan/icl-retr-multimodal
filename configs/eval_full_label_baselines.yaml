@@ -1,0 +1,46 @@
+# Option-free, all-class candidate-label likelihood baselines.
+
+experiment:
+  name: "eval_full_label_baselines_cub_200"
+  seed: 42
+
+dataset:
+  name: "cub_200"
+  eval_split: "test"
+  retrieval_split: "train"
+  image_split_path: "data/cub_200/image_split.json"
+  embeddings_kaggle_dataset: "juandatan/cub-200-2011-clip-embeddings"
+  siglip_kaggle_dataset: "juandatan/cub-200-siglip-embeddings-distractor-set"
+
+# The model scores all 200 labels once. These nested SigLIP-derived sets are
+# masks applied to the saved scores; they are never shown in the prompt.
+distractor_set:
+  k_values: [4, 8, 12, 16]
+
+hardware:
+  num_gpus: 2
+  # Fail instead of silently falling back to one GPU.
+  require_all: true
+
+model:
+  idefics2_model: "HuggingFaceM4/idefics2-8b"
+  load_in_8bit: false
+
+scoring:
+  # One randomly selected class-balanced test query per class until this budget
+  # is reached. Set null to evaluate every query.
+  num_queries: 100
+  candidate_batch_size: 8
+  # Temperature affects reported closed-set probabilities/entropy, but not ranks.
+  temperature: 1.0
+
+output:
+  save_dir: "outputs/evals"
+  checkpoint_every: 10
+  # Set to owner/slug in Kaggle to persist checkpoints; null skips uploads.
+  results_kaggle_dataset: null
+  upload_every_checkpoint: true
+
+limits:
+  # Schema-v2 full-label baseline (or legacy pilot) pickle. Completed queries are skipped.
+  resume_from: null
