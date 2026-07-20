@@ -100,3 +100,17 @@ class FullLabelOracleResult:
     candidate_correct_by_k: Dict[int, List[bool]]
     candidate_margin_by_k: Dict[int, List[float]]
     candidate_true_rank_by_k: Dict[int, List[int]]
+
+
+@dataclass
+class LabelSpaceAuditResult:
+    """Full-class scores used to audit restricted label-space targets."""
+
+    query_idx: int
+    true_class_idx: int
+    zero_shot_scores: List[float]
+    candidate_indices: List[int]
+    candidate_class_indices: List[int]
+    candidate_similarities: List[float]
+    candidate_scores: List[List[float]]
+    ranked_distractor_class_indices: List[int]

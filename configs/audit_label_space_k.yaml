@@ -1,0 +1,42 @@
+# Audit whether nested SigLIP hard-label sets preserve full-200 exemplar utility.
+
+experiment:
+  name: "audit_label_space_k_cub_200"
+  seed: 42
+
+dataset:
+  name: "cub_200"
+  eval_split: "val"
+  retrieval_split: "train"
+  image_split_path: "data/cub_200/image_split.json"
+  embeddings_kaggle_dataset: "juandatan/cub-200-2011-clip-embeddings"
+  siglip_kaggle_dataset: "juandatan/cub-200-siglip-embeddings-distractor-set"
+
+audit:
+  # All candidates are scored over all 200 labels once. Smaller K values are
+  # masks over those fixed scores and add no Idefics2 inference cost.
+  num_queries: 50
+  candidate_pool_size: 30
+  k_values: [4, 8, 12, 16, 24, 32, 48, 64, 100, 200]
+
+model:
+  idefics2_model: "HuggingFaceM4/idefics2-8b"
+  load_in_8bit: true
+
+hardware:
+  num_gpus: 2
+  # Fail rather than silently running the expensive audit on one GPU.
+  require_all: true
+
+scoring:
+  candidate_batch_size: 8
+
+output:
+  save_dir: "outputs/evals"
+  checkpoint_every: 5
+  results_kaggle_dataset: "juandatan/cub-200-label-space-audit"
+  upload_every_checkpoint: true
+
+limits:
+  # Point to a partial or completed audit pickle to skip completed queries.
+  resume_from: null
