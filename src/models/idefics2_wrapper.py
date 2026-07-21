@@ -71,6 +71,11 @@ class Idefics2Wrapper:
 
         # MC option letter -> single-token id, populated lazily by _letter_token_id
         self._letter_token_id_cache = {}
+        # Full-label scoring repeatedly reuses the same class strings and one of
+        # only a few hundred prompt strings. Cache their CPU tokenization; tensors
+        # are read-only and moved/stacked by the scoring method as before.
+        self._label_token_cache = {}
+        self._prompt_token_cache = {}
 
         print(f"Loading Idefics2 model: {model_name}")
         print(f"Device: {device}")
@@ -647,18 +652,24 @@ class Idefics2Wrapper:
         # Tokenize all labels first
         all_label_tokens = []
         for label in labels:
-            label_tokens = self.processor.tokenizer.encode(
-                label,
-                add_special_tokens=False
-            )
+            label_tokens = self._label_token_cache.get(label)
+            if label_tokens is None:
+                label_tokens = self.processor.tokenizer.encode(
+                    label,
+                    add_special_tokens=False
+                )
+                self._label_token_cache[label] = label_tokens
             all_label_tokens.append(label_tokens)
 
         all_prompt_inputs = []
         for i in range(batch_size):
-            prompt_input = self.processor(
-                text=prompts[i],
-                return_tensors="pt",
-            )
+            prompt_input = self._prompt_token_cache.get(prompts[i])
+            if prompt_input is None:
+                prompt_input = self.processor(
+                    text=prompts[i],
+                    return_tensors="pt",
+                )
+                self._prompt_token_cache[prompts[i]] = prompt_input
             all_prompt_inputs.append(prompt_input)
 
         # Stack the inputs

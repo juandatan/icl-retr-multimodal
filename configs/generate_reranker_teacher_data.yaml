@@ -1,0 +1,69 @@
+# Generate dense K=32 Idefics2 targets for reranker training and validation.
+
+experiment:
+  name: "cub_200_reranker_teacher_k32"
+  seed: 42
+
+dataset:
+  name: "cub_200"
+  # Official train/val query splits are separate partitions in the artifact.
+  # Test is deliberately excluded and remains reserved for final evaluation.
+  query_splits: ["train", "val"]
+  retrieval_split: "train"
+  image_split_path: "data/cub_200/image_split.json"
+  embeddings_kaggle_dataset: "juandatan/cub-200-2011-clip-embeddings"
+  siglip_kaggle_dataset: "juandatan/cub-200-siglip-embeddings-distractor-set"
+
+targets:
+  k: 32
+  temperature: 1.0
+  score_definition: "mean_token_log_likelihood"
+  candidate_policy: "top_clip_similarity"
+  label_policy: "true_plus_top_siglip_image_text_distractors"
+
+retrieval:
+  candidate_pool_size: 30
+  exclude_same_class: false
+
+model:
+  idefics2_model: "HuggingFaceM4/idefics2-8b"
+  load_in_8bit: true
+
+hardware:
+  num_gpus: 2
+  require_all: true
+
+scoring:
+  candidate_batch_size: 8
+  # Reuse Idefics2 vision features for retrieval images that recur across
+  # neighboring queries. Roughly 0.5 MB/image in fp16 for Idefics2-8B.
+  candidate_feature_cache_size: 256
+  # Emptying CUDA's allocator every query forces synchronization and repeated
+  # allocations. Do it only occasionally to limit fragmentation.
+  empty_cache_every_queries: 50
+
+logging:
+  # bitsandbytes 8-bit inference emits this expected cast notice on almost every
+  # matrix multiplication, overwhelming tqdm in notebook subprocess output.
+  suppress_bitsandbytes_cast_warnings: true
+  # Show intra-query progress for the first query and every Nth query per worker.
+  heartbeat_every_queries: 25
+  heartbeat_every_candidates: 10
+
+output:
+  save_dir: "outputs/reranker_teacher_data"
+  checkpoint_every_queries: 50
+  kaggle_dataset: "juandatan/cub-200-reranker-teacher-data"
+  upload_every_checkpoint: true
+  # Stop after preserving the local checkpoint if remote persistence fails.
+  require_upload_success: true
+  # Bundles model-input features once, indexed by query/candidate/class IDs.
+  include_feature_tables: true
+
+limits:
+  # Null means every query. Integer overrides are useful for smoke tests.
+  max_queries_per_split:
+    train: null
+    val: null
+  # A partial or complete generator pickle with the same immutable arguments.
+  resume_from: null

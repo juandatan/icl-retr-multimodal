@@ -6,7 +6,7 @@ imported without heavy dependencies, useful for pickle deserialization.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -114,3 +114,33 @@ class LabelSpaceAuditResult:
     candidate_similarities: List[float]
     candidate_scores: List[List[float]]
     ranked_distractor_class_indices: List[int]
+
+
+@dataclass
+class RerankerTeacherQueryRecord:
+    """Dense K-way Idefics2 targets for one query and its exemplar pool.
+
+    Raw score arrays are canonical. Derived arrays are stored as well so model
+    training can consume common targets without silently changing their
+    definition; they can always be checked or regenerated from the raw scores.
+    Array-valued fields use ``Any`` to keep this pickle schema importable without
+    importing NumPy in this lightweight module.
+    """
+
+    query_split: str
+    query_idx: int
+    true_class_idx: int
+    label_class_indices: Any
+    label_siglip_similarities: Any
+    ranked_distractor_class_indices: Any
+    zero_shot_scores: Any
+    zero_shot_metrics: Dict[str, Any]
+    candidate_indices: Any
+    candidate_class_indices: Any
+    candidate_similarities: Any
+    candidate_scores: Any
+    candidate_metrics: Dict[str, Any]
+    # Batch size is not part of the target definition, but recording it makes
+    # any kernel-level floating-point variation across resumed runs auditable.
+    scoring_batch_size: int = 8
+    scoring_mode: str = "full_sequence_batch"
