@@ -1,30 +1,5 @@
-"""Data loading utilities for ICL utility learning."""
+"""Data contracts and loading utilities for the CUB-200 pipeline.
 
-from .base_dataset import BaseUtilityDataset, ClassificationExample
-from .dataclasses import MarginalUtilityResult
-from .marginal_utility_dataset import (
-    InteractionFeaturesConfig,
-    MarginalUtilityDataset,
-    PairwiseMarginalUtilityDataset,
-    QuerySplitConfig,
-)
-from .mini_imagenet import MiniImageNetDataset
-from .stanford_cars import StanfordCarsDataset
-from .fine_grained_hf_dataset import FineGrainedHFDataset
-from .dataset_registry import FINE_GRAINED_DATASETS, FineGrainedDatasetSpec, get_dataset_spec
-
-__all__ = [
-    'BaseUtilityDataset',
-    'ClassificationExample',
-    'MarginalUtilityResult',
-    'InteractionFeaturesConfig',
-    'MarginalUtilityDataset',
-    'PairwiseMarginalUtilityDataset',
-    'QuerySplitConfig',
-    'MiniImageNetDataset',
-    'StanfordCarsDataset',
-    'FineGrainedHFDataset',
-    'FINE_GRAINED_DATASETS',
-    'FineGrainedDatasetSpec',
-    'get_dataset_spec',
-]
+Submodules are intentionally not imported here: command-line workers and unit
+tests should not load Hugging Face datasets merely by importing ``src.data``.
+"""

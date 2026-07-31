@@ -10,11 +10,10 @@ isolated subprocess per GPU. Each subprocess sees only one physical GPU through
 CUDA_VISIBLE_DEVICES and loads its own Idefics2 copy.
 
 Usage:
-    python scripts/evaluate_full_label_baselines.py
-    python scripts/evaluate_full_label_baselines.py scoring.num_queries=10
+    python -m scripts.evaluate_full_label_baselines
+    python -m scripts.evaluate_full_label_baselines scoring.num_queries=10
 """
 
-import hashlib
 import os
 import pickle
 import subprocess
@@ -30,51 +29,19 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
-from data.dataclasses import FullLabelEvalResult
-from data.distractor_sets import build_distractor_ranking
-from models.idefics2_wrapper import Idefics2Wrapper
-from utils.eval_utils import save_eval_results
-from utils.imagenet_names import get_readable_name
-from utils.kaggle_utils import kaggle_upload_eval_results
-
-sys.path.insert(0, str(Path(__file__).parent))
-from evaluate_icl_performance import _setup_device, load_dataset
-
-
-def stratified_query_indices(examples, num_queries: Optional[int], seed: int) -> list[int]:
-    """Select an image-balanced sample by cycling through shuffled classes."""
-    if num_queries is None or num_queries >= len(examples):
-        return list(range(len(examples)))
-    if num_queries <= 0:
-        raise ValueError("num_queries must be positive or null")
-
-    by_class = defaultdict(list)
-    for dataset_idx, example in enumerate(examples):
-        by_class[example.label].append(dataset_idx)
-
-    rng = np.random.default_rng(seed)
-    for indices in by_class.values():
-        rng.shuffle(indices)
-
-    selected = []
-    active_classes = sorted(by_class)
-    offsets = {class_idx: 0 for class_idx in active_classes}
-    while len(selected) < num_queries and active_classes:
-        for class_idx in rng.permutation(active_classes):
-            class_idx = int(class_idx)
-            offset = offsets[class_idx]
-            if offset < len(by_class[class_idx]):
-                selected.append(by_class[class_idx][offset])
-                offsets[class_idx] += 1
-                if len(selected) == num_queries:
-                    break
-        active_classes = [
-            class_idx for class_idx in active_classes
-            if offsets[class_idx] < len(by_class[class_idx])
-        ]
-    return selected
+from src.data.dataclasses import FullLabelEvalResult
+from src.data.distractor_sets import build_distractor_ranking
+from src.data.loading import load_dataset, load_siglip_inputs
+from src.models.idefics2_wrapper import Idefics2Wrapper
+from src.utils.eval_utils import save_eval_results
+from src.utils.kaggle_utils import kaggle_upload_eval_results
+from src.utils.runtime import (
+    atomic_pickle_dump as _atomic_pickle_dump,
+    file_sha256 as _file_sha256,
+    git_revision as _git_revision,
+    setup_device as _setup_device,
+    stratified_query_indices,
+)
 
 
 def closed_set_metrics(scores, true_class_idx: int, temperature: float = 1.0) -> dict:
@@ -267,66 +234,6 @@ def summarize_results(records: list, temperature: float, k_values: list[int]) ->
     }
 
 
-def _file_sha256(path: Optional[str]) -> Optional[str]:
-    if not path or not Path(path).exists():
-        return None
-    digest = hashlib.sha256()
-    with open(path, "rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _git_revision() -> Optional[str]:
-    try:
-        return subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
-        ).stdout.strip()
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return None
-
-
-def resolve_siglip_cache_path(
-    dataset_name: str, filename: str, siglip_kaggle_dataset: Optional[str]
-) -> Path:
-    if siglip_kaggle_dataset:
-        owner, slug = siglip_kaggle_dataset.split("/")
-        mounted_paths = [
-            Path(f"/kaggle/input/datasets/{owner}/{slug}/{filename}"),
-            Path(f"/kaggle/input/{slug}/{filename}"),
-        ]
-        for mounted_path in mounted_paths:
-            if mounted_path.exists():
-                print(f"✓ Using mounted Kaggle input: {mounted_path}")
-                return mounted_path
-    return Path(f"data/{dataset_name}/{filename}")
-
-
-def load_siglip_inputs(cfg: DictConfig):
-    dataset_name = str(cfg.dataset.name)
-    kaggle_dataset = cfg.dataset.get("siglip_kaggle_dataset", None)
-    text_path = resolve_siglip_cache_path(
-        dataset_name, "siglip_text_embeddings.pkl", kaggle_dataset
-    )
-    image_path = resolve_siglip_cache_path(
-        dataset_name, f"siglip_image_embeddings_{cfg.dataset.eval_split}.pkl", kaggle_dataset
-    )
-    for path in (text_path, image_path):
-        if not path.exists():
-            raise FileNotFoundError(f"Required SigLIP distractor embedding file not found: {path}")
-    with open(text_path, "rb") as file:
-        text_data = pickle.load(file)
-    with open(image_path, "rb") as file:
-        image_data = pickle.load(file)
-    return (
-        np.asarray(text_data["embeddings"]),
-        list(text_data["class_names"]),
-        np.asarray(image_data["embeddings"]),
-        text_path,
-        image_path,
-    )
-
-
 def build_query_tasks(
     eval_dataset,
     query_indices: list[int],
@@ -355,14 +262,6 @@ def build_query_tasks(
     return tasks
 
 
-def _atomic_pickle_dump(value, path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_suffix(path.suffix + ".tmp")
-    with open(temporary_path, "wb") as file:
-        pickle.dump(value, file)
-    os.replace(temporary_path, path)
-
-
 def score_query_tasks(
     cfg: DictConfig,
     tasks: list[dict],
@@ -388,10 +287,7 @@ def score_query_tasks(
     if eval_dataset.clip_model_name != retrieval_dataset.clip_model_name:
         raise ValueError("Evaluation and retrieval embeddings use different CLIP models")
 
-    candidate_labels = [
-        get_readable_name(label) if cfg.dataset.name == "mini_imagenet" else label
-        for label in eval_dataset.class_names
-    ]
+    candidate_labels = list(eval_dataset.class_names)
     device, _, _ = _setup_device(1)
     if device != "cuda":
         raise RuntimeError("Full-label GPU worker requires CUDA")
@@ -475,7 +371,7 @@ def run_multi_gpu_workers(
     for gpu_id, shard in enumerate(task_shards):
         print(f"  GPU {gpu_id}: {len(shard)} queries")
 
-    worker_script = Path(__file__).with_name("evaluate_full_label_baselines_worker.py")
+    project_root = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory(prefix="full_label_baselines_") as temp_dir:
         temp_path = Path(temp_dir)
         config_path = temp_path / "config.pkl"
@@ -492,14 +388,18 @@ def run_multi_gpu_workers(
             env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_id)}
             command = [
                 sys.executable,
-                str(worker_script),
+                "-m",
+                "scripts.evaluate_full_label_baselines_worker",
                 "--worker-id", str(gpu_id),
                 "--config-path", str(config_path),
                 "--tasks-path", str(tasks_path),
                 "--output-path", str(output_path),
                 "--checkpoint-every", str(worker_checkpoint_every),
             ]
-            processes.append((gpu_id, subprocess.Popen(command, env=env)))
+            processes.append((
+                gpu_id,
+                subprocess.Popen(command, env=env, cwd=project_root),
+            ))
             output_paths.append(output_path)
 
         last_progress_count = len(existing_records)
@@ -578,10 +478,7 @@ def main(cfg: DictConfig):
     if eval_dataset.clip_model_name != retrieval_dataset.clip_model_name:
         raise ValueError("Evaluation and retrieval embeddings use different CLIP models")
 
-    candidate_labels = [
-        get_readable_name(label) if cfg.dataset.name == "mini_imagenet" else label
-        for label in eval_dataset.class_names
-    ]
+    candidate_labels = list(eval_dataset.class_names)
     if len(set(candidate_labels)) != len(candidate_labels):
         raise ValueError("Canonical candidate labels are not unique")
     k_values = sorted({int(k) for k in cfg.distractor_set.k_values})
@@ -591,7 +488,13 @@ def main(cfg: DictConfig):
     query_indices = stratified_query_indices(
         eval_dataset.examples, cfg.scoring.get("num_queries", None), int(cfg.experiment.seed)
     )
-    siglip_text, siglip_class_names, siglip_images, text_path, image_path = load_siglip_inputs(cfg)
+    siglip_text, siglip_class_names, siglip_images, text_path, image_path = load_siglip_inputs(
+        str(cfg.dataset.name),
+        str(cfg.dataset.eval_split),
+        cfg.dataset.get("siglip_kaggle_dataset", None),
+        expected_class_names=eval_dataset.class_names,
+        expected_example_ids=[example.image_path for example in eval_dataset.examples],
+    )
     if siglip_class_names != list(eval_dataset.class_names):
         raise ValueError("SigLIP text-embedding class mapping differs from the evaluation dataset")
     if siglip_text.shape[0] != len(candidate_labels):

@@ -94,7 +94,8 @@ class FineGrainedHFDataset(BaseUtilityDataset):
             if not self.image_split_path.exists():
                 raise FileNotFoundError(
                     f"Image split file not found: {self.image_split_path}\n"
-                    f"Generate it with: python scripts/create_image_split.py --dataset <name>"
+                    "Generate it with: "
+                    "python -m scripts.create_image_split --dataset cub_200"
                 )
             with open(self.image_split_path) as f:
                 split_data = json.load(f)

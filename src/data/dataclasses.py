@@ -6,21 +6,13 @@ imported without heavy dependencies, useful for pickle deserialization.
 """
 
 from dataclasses import dataclass
+import sys
 from typing import Any, Dict, List, Optional
 
-
-@dataclass
-class MarginalUtilityResult:
-    """Results for a single query-example pair."""
-    query_idx: int
-    example_idx: int
-    query_label: str
-    example_label: str
-    baseline_log_prob: float
-    oneshot_log_prob: float
-    marginal_utility: float
-    similarity_score: float
-    same_class: bool
+# Historical artifacts were serialized while ``src`` was inserted directly on
+# sys.path, so their qualified module is ``data.dataclasses``. Register that
+# name before any resume pickle is loaded.
+sys.modules.setdefault("data.dataclasses", sys.modules[__name__])
 
 
 @dataclass

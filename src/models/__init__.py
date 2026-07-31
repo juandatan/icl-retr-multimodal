@@ -1,7 +1,1 @@
-"""
-Models for ICL utility learning.
-"""
-
-from .llava_wrapper import LLaVAWrapper
-
-__all__ = ['LLaVAWrapper']
+"""Model adapters used by the CUB-200 evaluation and teacher pipelines."""

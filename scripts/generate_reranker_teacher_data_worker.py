@@ -4,17 +4,14 @@ import argparse
 import logging
 import os
 import pickle
-import sys
 from pathlib import Path
 
 if "CUDA_VISIBLE_DEVICES" not in os.environ:
     raise RuntimeError("CUDA_VISIBLE_DEVICES must be set before starting a teacher worker")
 
-sys.path.insert(0, str(Path(__file__).parent))
-
 from omegaconf import OmegaConf
 
-from generate_reranker_teacher_data import score_teacher_tasks
+from scripts.generate_reranker_teacher_data import score_teacher_tasks
 
 
 def main():

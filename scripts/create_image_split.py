@@ -1,7 +1,5 @@
 """
-Create a reproducible image-level train/val/test split for a fine-grained
-classification dataset registered in src/data/dataset_registry.py
-(e.g. cub_200, fgvc_aircraft, oxford_pets), or for Stanford Cars.
+Create the reproducible image-level train/val/test split used for CUB-200.
 
 All classes appear in every split; images are divided per class so the
 class distribution is balanced across splits.  The split is saved as a JSON
@@ -13,7 +11,7 @@ The split file is the single source of truth: load the dataset with
 to use it.
 
 Usage:
-    python scripts/create_image_split.py \
+    python -m scripts.create_image_split \
         --dataset cub_200 \
         --output data/cub_200/image_split.json \
         --train-ratio 0.7 \
@@ -21,7 +19,7 @@ Usage:
         --seed 42
 
     # Also upload to Kaggle:
-    python scripts/create_image_split.py \
+    python -m scripts.create_image_split \
         --dataset cub_200 \
         --output data/cub_200/image_split.json \
         --kaggle-dataset juandatan/cub-200-image-split
@@ -29,15 +27,13 @@ Usage:
 
 import argparse
 import json
-import sys
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
-from data.dataset_registry import FINE_GRAINED_DATASETS, get_dataset_spec
+from src.data.dataset_registry import FINE_GRAINED_DATASETS, get_dataset_spec
+from src.utils.kaggle_utils import kaggle_publish_files
 
 
 def create_image_split(
@@ -158,41 +154,11 @@ class _FullFineGrainedDataset:
 
 def upload_split_to_kaggle(split_path: Path, kaggle_dataset: str):
     """Upload the split JSON to a Kaggle dataset."""
-    import json as _json
-    import subprocess
-    import shutil
-    import tempfile
-
-    username, slug = kaggle_dataset.split('/')
-    title = slug.replace('-', ' ').title()
-
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        shutil.copy(split_path, tmp / split_path.name)
-
-        metadata = {
-            "title": title,
-            "id": f"{username}/{slug}",
-            "licenses": [{"name": "CC0-1.0"}],
-        }
-        (tmp / "dataset-metadata.json").write_text(_json.dumps(metadata, indent=2))
-
-        exists = subprocess.run(
-            ["kaggle", "datasets", "status", kaggle_dataset],
-            capture_output=True
-        ).returncode == 0
-
-        if exists:
-            cmd = ["kaggle", "datasets", "version", "-p", str(tmp),
-                   "-m", f"Update split: {split_path.name}", "--dir-mode", "zip"]
-        else:
-            cmd = ["kaggle", "datasets", "create", "-p", str(tmp), "--dir-mode", "zip"]
-
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            print(f"✓ Uploaded to https://www.kaggle.com/datasets/{kaggle_dataset}")
-        else:
-            print(f"✗ Upload failed: {result.stderr}")
+    return kaggle_publish_files(
+        [split_path],
+        kaggle_dataset,
+        version_message=f"Publish split: {split_path.name}",
+    )
 
 
 def main():

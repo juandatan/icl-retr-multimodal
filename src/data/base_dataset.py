@@ -10,7 +10,7 @@ Provides common functionality for:
 import pickle
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 from dataclasses import dataclass
 
 import numpy as np
@@ -370,25 +370,3 @@ class BaseUtilityDataset(Dataset, ABC):
         top_k_scores = valid_similarities[top_k_in_valid]
 
         return top_k_indices.tolist(), top_k_scores
-
-    def save_split_info(self, save_path: Optional[str] = None):
-        """Save class split information for reproducibility."""
-        if save_path is None:
-            save_path = self.data_dir / 'class_splits.json'
-
-        import json
-
-        split_info = {
-            'num_classes': self.num_classes,
-            'train_classes': self.train_classes.tolist(),
-            'val_classes': self.val_classes.tolist(),
-            'test_classes': self.test_classes.tolist(),
-            'class_split_seed': self.class_split_seed,
-            'train_ratio': self.train_ratio,
-            'val_ratio': self.val_ratio,
-        }
-
-        with open(save_path, 'w') as f:
-            json.dump(split_info, f, indent=2)
-
-        print(f"Saved split info to {save_path}")

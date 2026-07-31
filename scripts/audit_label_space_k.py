@@ -6,9 +6,9 @@ once. Nested query-specific SigLIP hard-label sets are then applied to those
 fixed scores to compare each K with the full-class exemplar ranking.
 
 Usage:
-    python scripts/audit_label_space_k.py
-    python scripts/audit_label_space_k.py audit.num_queries=10
-    python scripts/audit_label_space_k.py limits.resume_from=/path/to/audit.pkl
+    python -m scripts.audit_label_space_k
+    python -m scripts.audit_label_space_k audit.num_queries=10
+    python -m scripts.audit_label_space_k limits.resume_from=/path/to/audit.pkl
 """
 
 import json
@@ -27,25 +27,20 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
-from data.dataclasses import LabelSpaceAuditResult
-from data.distractor_sets import build_distractor_ranking
-from models.idefics2_wrapper import Idefics2Wrapper
-from utils.eval_utils import _json_safe
-from utils.imagenet_names import get_readable_name
-from utils.kaggle_utils import kaggle_upload_eval_results
-from utils.label_space_audit import summarize_label_space_audit
-
-sys.path.insert(0, str(Path(__file__).parent))
-from evaluate_full_label_baselines import (
-    _atomic_pickle_dump,
-    _file_sha256,
-    _git_revision,
-    load_siglip_inputs,
+from src.data.dataclasses import LabelSpaceAuditResult
+from src.data.distractor_sets import build_distractor_ranking
+from src.data.loading import load_dataset, load_siglip_inputs
+from src.models.idefics2_wrapper import Idefics2Wrapper
+from src.utils.eval_utils import _json_safe
+from src.utils.kaggle_utils import kaggle_upload_eval_results
+from src.utils.label_space_audit import summarize_label_space_audit
+from src.utils.runtime import (
+    atomic_pickle_dump as _atomic_pickle_dump,
+    file_sha256 as _file_sha256,
+    git_revision as _git_revision,
+    setup_device as _setup_device,
     stratified_query_indices,
 )
-from evaluate_icl_performance import _setup_device, load_dataset
 
 
 def build_audit_tasks(
@@ -101,10 +96,7 @@ def score_audit_tasks(
         image_split_path=cfg.dataset.image_split_path,
         embeddings_kaggle_dataset=cfg.dataset.embeddings_kaggle_dataset,
     )
-    candidate_labels = [
-        get_readable_name(label) if cfg.dataset.name == "mini_imagenet" else label
-        for label in eval_dataset.class_names
-    ]
+    candidate_labels = list(eval_dataset.class_names)
     device, _, _ = _setup_device(1)
     if device != "cuda":
         raise RuntimeError("The label-space audit requires a CUDA GPU")
@@ -193,7 +185,7 @@ def run_multi_gpu_workers(
     for gpu_id, shard in enumerate(task_shards):
         print(f"  GPU {gpu_id}: {len(shard)} queries")
 
-    worker_script = Path(__file__).with_name("audit_label_space_k_worker.py")
+    project_root = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory(prefix="label_space_k_audit_") as temp_dir:
         temp_path = Path(temp_dir)
         config_path = temp_path / "config.pkl"
@@ -211,7 +203,8 @@ def run_multi_gpu_workers(
             env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_id)}
             command = [
                 sys.executable,
-                str(worker_script),
+                "-m",
+                "scripts.audit_label_space_k_worker",
                 "--worker-id",
                 str(gpu_id),
                 "--config-path",
@@ -223,7 +216,10 @@ def run_multi_gpu_workers(
                 "--checkpoint-every",
                 str(worker_checkpoint_every),
             ]
-            processes.append((gpu_id, subprocess.Popen(command, env=env)))
+            processes.append((
+                gpu_id,
+                subprocess.Popen(command, env=env, cwd=project_root),
+            ))
             output_paths.append(output_path)
 
         last_count = len(existing_records)
@@ -325,7 +321,13 @@ def main(cfg: DictConfig):
     query_indices = stratified_query_indices(
         eval_dataset.examples, int(cfg.audit.num_queries), int(cfg.experiment.seed)
     )
-    siglip_text, siglip_class_names, siglip_images, text_path, image_path = load_siglip_inputs(cfg)
+    siglip_text, siglip_class_names, siglip_images, text_path, image_path = load_siglip_inputs(
+        str(cfg.dataset.name),
+        str(cfg.dataset.eval_split),
+        cfg.dataset.get("siglip_kaggle_dataset", None),
+        expected_class_names=eval_dataset.class_names,
+        expected_example_ids=[example.image_path for example in eval_dataset.examples],
+    )
     if siglip_class_names != list(eval_dataset.class_names):
         raise ValueError("SigLIP class mapping differs from the evaluation dataset")
     if siglip_text.shape[0] != class_count:
@@ -342,10 +344,7 @@ def main(cfg: DictConfig):
         pool_size,
     )
     task_by_query = {task["query_idx"]: task for task in tasks}
-    candidate_labels = [
-        get_readable_name(label) if cfg.dataset.name == "mini_imagenet" else label
-        for label in eval_dataset.class_names
-    ]
+    candidate_labels = list(eval_dataset.class_names)
     records = []
 
     resume_from = cfg.limits.get("resume_from", None)

@@ -1,5 +1,4 @@
-"""
-Script to build and cache SigLIP embeddings for datasets.
+"""Build and cache SigLIP image/text embeddings for CUB-200.
 
 Precomputes SigLIP image embeddings (per split, mirroring the CLIP embedding
 cache convention) and SigLIP text embeddings for all class labels (once per
@@ -8,40 +7,30 @@ image-to-text (I2T) distractor sets for multiple-choice ICL evaluation --
 kept separate from the CLIP embeddings used for actual candidate retrieval.
 
 Usage:
-    python scripts/build_siglip_embeddings.py --dataset stanford_cars --splits train val test
-    python scripts/build_siglip_embeddings.py --dataset mini_imagenet --splits test
-
-    # With image-level split (Stanford Cars within-distribution eval)
-    python scripts/build_siglip_embeddings.py \
-        --dataset stanford_cars \
-        --image-split-path data/stanford_cars/image_split.json
+    python -m scripts.build_siglip_embeddings \
+        --dataset cub_200 \
+        --image-split-path data/cub_200/image_split.json
 """
 
 import argparse
 import pickle
-import sys
 from pathlib import Path
 
-sys.path.append(str(Path(__file__).parent.parent))
-
-from src.data.stanford_cars import StanfordCarsDataset
-from src.data.mini_imagenet import MiniImageNetDataset
 from src.data.fine_grained_hf_dataset import FineGrainedHFDataset
 from src.data.dataset_registry import FINE_GRAINED_DATASETS, get_dataset_spec
 from src.models.siglip_encoder import SiglipEncoder
-from src.utils.imagenet_names import get_readable_name
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Build SigLIP image and text embeddings for datasets"
+        description="Build SigLIP image and text embeddings for CUB-200"
     )
     parser.add_argument(
         '--dataset',
         type=str,
-        default='stanford_cars',
-        choices=['stanford_cars', 'mini_imagenet'] + list(FINE_GRAINED_DATASETS.keys()),
-        help='Dataset to process (default: stanford_cars)'
+        default='cub_200',
+        choices=list(FINE_GRAINED_DATASETS),
+        help='Dataset to process (default: cub_200)'
     )
     parser.add_argument(
         '--data_dir',
@@ -86,7 +75,7 @@ def main():
         '--image-split-path',
         type=str,
         default=None,
-        help='Path to image-level split JSON (for Stanford Cars within-distribution eval)'
+        help='Path to the canonical CUB image-level split JSON'
     )
 
     args = parser.parse_args()
@@ -95,21 +84,8 @@ def main():
         args.data_dir = f'./data/{args.dataset}'
     data_dir = Path(args.data_dir)
 
-    fine_grained_spec = None
-    supports_image_split = args.dataset == 'stanford_cars'
-    if args.dataset == 'stanford_cars':
-        DatasetClass = StanfordCarsDataset
-        dataset_display_name = "Stanford Cars"
-    elif args.dataset == 'mini_imagenet':
-        DatasetClass = MiniImageNetDataset
-        dataset_display_name = "Mini-ImageNet"
-    elif args.dataset in FINE_GRAINED_DATASETS:
-        DatasetClass = FineGrainedHFDataset
-        fine_grained_spec = get_dataset_spec(args.dataset)
-        dataset_display_name = fine_grained_spec.display_name
-        supports_image_split = True
-    else:
-        raise ValueError(f"Unknown dataset: {args.dataset}")
+    spec = get_dataset_spec(args.dataset)
+    dataset_display_name = spec.display_name
 
     print(f"\n{'='*70}")
     print(f"SigLIP Embedding Generation for {dataset_display_name}")
@@ -129,12 +105,15 @@ def main():
     print(f"✓ SigLIP model loaded on {encoder.device}\n")
 
     def _load_dataset(split: str):
-        kwargs = dict(split=split, data_dir=args.data_dir, class_split_seed=args.class_split_seed)
-        if supports_image_split and args.image_split_path:
+        kwargs = dict(
+            hf_repo_ids=list(spec.hf_repo_ids),
+            split=split,
+            data_dir=args.data_dir,
+            class_split_seed=args.class_split_seed,
+        )
+        if args.image_split_path:
             kwargs['image_split_path'] = args.image_split_path
-        if fine_grained_spec is not None:
-            kwargs['hf_repo_ids'] = fine_grained_spec.hf_repo_ids
-        return DatasetClass(**kwargs)
+        return FineGrainedHFDataset(**kwargs)
 
     # --- Text embeddings: once per dataset, not per split ---
     text_cache_path = data_dir / 'siglip_text_embeddings.pkl'
@@ -148,11 +127,7 @@ def main():
         # class_names is identical across splits (it's set before split filtering),
         # so any split's dataset instance works here.
         reference_dataset = _load_dataset(args.splits[0])
-        is_mini_imagenet = args.dataset == 'mini_imagenet'
-        readable_class_names = (
-            [get_readable_name(name) for name in reference_dataset.class_names]
-            if is_mini_imagenet else list(reference_dataset.class_names)
-        )
+        readable_class_names = list(reference_dataset.class_names)
 
         text_embeddings = encoder.encode_texts(readable_class_names, batch_size=args.batch_size)
         print(f"✓ Text embedding shape: {text_embeddings.shape}")

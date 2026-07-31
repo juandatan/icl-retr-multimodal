@@ -1,98 +1,34 @@
-"""
-Script to build and cache CLIP embeddings for datasets.
+"""Build and cache CLIP retrieval embeddings for CUB-200.
 
 This script pre-computes CLIP embeddings for all images in the dataset,
 enabling fast semantic similarity-based candidate retrieval during utility
 computation and training.
 
 Usage:
-    python scripts/build_clip_embeddings.py --dataset stanford_cars --splits train val test
-    python scripts/build_clip_embeddings.py --dataset mini_imagenet --splits train
-    python scripts/build_clip_embeddings.py --dataset stanford_cars --model ViT-L/14
-
-    # With image-level split (Stanford Cars within-distribution eval)
-    python scripts/build_clip_embeddings.py \
-        --dataset stanford_cars \
-        --image-split-path data/stanford_cars/image_split.json \
-        --kaggle-dataset juandatan/stanford-cars-clip
-
-    # Fine-grained datasets registered in src/data/dataset_registry.py
-    python scripts/build_clip_embeddings.py \
+    python -m scripts.build_clip_embeddings \
         --dataset cub_200 \
         --image-split-path data/cub_200/image_split.json
 """
 
 import argparse
-import json
-import shutil
-import subprocess
-import sys
-import tempfile
-from pathlib import Path
 
 import torch
 import clip
 
-# Add src to path
-sys.path.append(str(Path(__file__).parent.parent))
-
-from src.data.stanford_cars import StanfordCarsDataset
-from src.data.mini_imagenet import MiniImageNetDataset
 from src.data.fine_grained_hf_dataset import FineGrainedHFDataset
 from src.data.dataset_registry import FINE_GRAINED_DATASETS, get_dataset_spec
 
 
-def _upload_embeddings_to_kaggle(data_dir: Path, splits: list, kaggle_dataset: str):
-    """Upload clip_embeddings_{split}.pkl files to a Kaggle dataset."""
-    username, slug = kaggle_dataset.split('/')
-    title = slug.replace('-', ' ').title()
-
-    embedding_files = [data_dir / f'clip_embeddings_{s}.pkl' for s in splits]
-    missing = [f for f in embedding_files if not f.exists()]
-    if missing:
-        print(f"✗ Missing embedding files: {missing}")
-        return
-
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        for f in embedding_files:
-            shutil.copy(f, tmp / f.name)
-
-        metadata = {
-            "title": title,
-            "id": f"{username}/{slug}",
-            "licenses": [{"name": "CC0-1.0"}],
-        }
-        (tmp / "dataset-metadata.json").write_text(json.dumps(metadata, indent=2))
-
-        exists = subprocess.run(
-            ["kaggle", "datasets", "status", kaggle_dataset],
-            capture_output=True,
-        ).returncode == 0
-
-        if exists:
-            cmd = ["kaggle", "datasets", "version", "-p", str(tmp),
-                   "-m", f"Update embeddings: {', '.join(splits)}", "--dir-mode", "zip"]
-        else:
-            cmd = ["kaggle", "datasets", "create", "-p", str(tmp), "--dir-mode", "zip"]
-
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            print(f"✓ Uploaded embeddings to https://www.kaggle.com/datasets/{kaggle_dataset}")
-        else:
-            print(f"✗ Upload failed: {result.stderr}")
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Build CLIP embeddings for datasets"
+        description="Build CLIP embeddings for CUB-200"
     )
     parser.add_argument(
         '--dataset',
         type=str,
-        default='stanford_cars',
-        choices=['stanford_cars', 'mini_imagenet'] + list(FINE_GRAINED_DATASETS.keys()),
-        help='Dataset to process (default: stanford_cars)'
+        default='cub_200',
+        choices=list(FINE_GRAINED_DATASETS),
+        help='Dataset to process (default: cub_200)'
     )
     parser.add_argument(
         '--data_dir',
@@ -138,37 +74,16 @@ def main():
         '--image-split-path',
         type=str,
         default=None,
-        help='Path to image-level split JSON (for Stanford Cars within-distribution eval)'
+        help='Path to the canonical CUB image-level split JSON'
     )
-    parser.add_argument(
-        '--kaggle-dataset',
-        type=str,
-        default=None,
-        help='Kaggle dataset to upload embeddings to (username/dataset-slug)'
-    )
-
     args = parser.parse_args()
 
     # Set default data_dir if not provided
     if args.data_dir is None:
         args.data_dir = f'./data/{args.dataset}'
 
-    # Select dataset class
-    fine_grained_spec = None
-    supports_image_split = args.dataset == 'stanford_cars'
-    if args.dataset == 'stanford_cars':
-        DatasetClass = StanfordCarsDataset
-        dataset_display_name = "Stanford Cars"
-    elif args.dataset == 'mini_imagenet':
-        DatasetClass = MiniImageNetDataset
-        dataset_display_name = "Mini-ImageNet"
-    elif args.dataset in FINE_GRAINED_DATASETS:
-        DatasetClass = FineGrainedHFDataset
-        fine_grained_spec = get_dataset_spec(args.dataset)
-        dataset_display_name = fine_grained_spec.display_name
-        supports_image_split = True
-    else:
-        raise ValueError(f"Unknown dataset: {args.dataset}")
+    spec = get_dataset_spec(args.dataset)
+    dataset_display_name = spec.display_name
 
     # Determine device
     if args.device:
@@ -208,12 +123,15 @@ def main():
         print(f"{'='*70}\n")
 
         # Load dataset
-        kwargs = dict(split=split, data_dir=args.data_dir, class_split_seed=args.class_split_seed)
-        if supports_image_split and args.image_split_path:
+        kwargs = dict(
+            hf_repo_ids=list(spec.hf_repo_ids),
+            split=split,
+            data_dir=args.data_dir,
+            class_split_seed=args.class_split_seed,
+        )
+        if args.image_split_path:
             kwargs['image_split_path'] = args.image_split_path
-        if fine_grained_spec is not None:
-            kwargs['hf_repo_ids'] = fine_grained_spec.hf_repo_ids
-        dataset = DatasetClass(**kwargs)
+        dataset = FineGrainedHFDataset(**kwargs)
 
         print(f"Loaded {len(dataset)} examples\n")
 
@@ -251,20 +169,6 @@ def main():
             'embedding_shape': embeddings.shape,
         }
 
-    # Save split info (once)
-    print(f"\n{'='*70}")
-    print("Saving metadata")
-    print(f"{'='*70}\n")
-
-    # Use train split to save class split info
-    train_kwargs = dict(split='train', data_dir=args.data_dir, class_split_seed=args.class_split_seed)
-    if supports_image_split and args.image_split_path:
-        train_kwargs['image_split_path'] = args.image_split_path
-    if fine_grained_spec is not None:
-        train_kwargs['hf_repo_ids'] = fine_grained_spec.hf_repo_ids
-    train_dataset = DatasetClass(**train_kwargs)
-    train_dataset.save_split_info()
-
     # Final summary
     print(f"\n{'='*70}")
     print("SUMMARY")
@@ -285,14 +189,6 @@ def main():
     print(f"\nEmbeddings cached in: {args.data_dir}/")
     print(f"  Format: clip_embeddings_{{split}}.pkl")
     print(f"\n✓ All embeddings generated successfully!")
-
-    if args.kaggle_dataset:
-        _upload_embeddings_to_kaggle(
-            data_dir=Path(args.data_dir),
-            splits=args.splits,
-            kaggle_dataset=args.kaggle_dataset,
-        )
-
 
 if __name__ == "__main__":
     main()

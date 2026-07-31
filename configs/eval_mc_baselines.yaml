@@ -8,10 +8,9 @@ experiment:
 dataset:
   name: "cub_200"
   split: "test"
-  cache_dir: "data/cub_200"
   image_split_path: "data/cub_200/image_split.json"
   # Kaggle dataset holding siglip_text_embeddings.pkl / siglip_image_embeddings_{split}.pkl
-  # (see scripts/upload_siglip_distractor_set_to_kaggle.py). Assumed to already be
+  # (see scripts/upload_siglip_embeddings_to_kaggle.py). Assumed to already be
   # attached as a notebook input (mounted at /kaggle/input/<slug>/); falls back to
   # data/{dataset.name}/ when running locally or if not mounted.
   siglip_kaggle_dataset: "juandatan/cub-200-siglip-embeddings-distractor-set"
@@ -35,7 +34,6 @@ distractor_set:
 # CLIP retrieval is restricted to images whose label falls within the distractor
 # set, so every retrieved candidate is a valid answer option.
 retrieval:
-  clip_model: "ViT-B/32"
   candidate_pool_k: 30
   # Labeled references come from train by default. Setting this to "test" opts
   # into the transductive test-corpus setting used by the legacy evaluation.

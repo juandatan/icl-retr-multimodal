@@ -7,7 +7,6 @@ nested K-way label sets; unrestricted mode scores all labels. The previously
 scored CLIP top-1 exemplar is reused without another model call.
 """
 
-import hashlib
 import os
 import pickle
 import subprocess
@@ -23,34 +22,18 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
-from data.dataclasses import FullLabelOracleResult
-from models.idefics2_wrapper import Idefics2Wrapper
-from utils.eval_utils import save_eval_results
-from utils.imagenet_names import get_readable_name
-from utils.kaggle_utils import kaggle_upload_eval_results
-
-sys.path.insert(0, str(Path(__file__).parent))
-from evaluate_full_label_baselines import _atomic_pickle_dump, closed_set_metrics
-from evaluate_icl_performance import _setup_device, load_dataset
-
-
-def _file_sha256(path: str) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _git_revision() -> Optional[str]:
-    try:
-        return subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
-        ).stdout.strip()
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return None
+from scripts.evaluate_full_label_baselines import closed_set_metrics
+from src.data.dataclasses import FullLabelOracleResult
+from src.data.loading import load_dataset
+from src.models.idefics2_wrapper import Idefics2Wrapper
+from src.utils.eval_utils import save_eval_results
+from src.utils.kaggle_utils import kaggle_upload_eval_results
+from src.utils.runtime import (
+    atomic_pickle_dump as _atomic_pickle_dump,
+    file_sha256 as _file_sha256,
+    git_revision as _git_revision,
+    setup_device as _setup_device,
+)
 
 
 def load_baseline_results(path: str) -> dict:
@@ -150,10 +133,7 @@ def score_oracle_tasks(
         image_split_path=cfg.dataset.image_split_path,
         embeddings_kaggle_dataset=cfg.dataset.embeddings_kaggle_dataset,
     )
-    candidate_labels = [
-        get_readable_name(label) if cfg.dataset.name == "mini_imagenet" else label
-        for label in eval_dataset.class_names
-    ]
+    candidate_labels = list(eval_dataset.class_names)
     if len(candidate_labels) != class_count:
         raise ValueError("Worker dataset class count differs from the baseline")
 
@@ -323,7 +303,7 @@ def run_oracle_workers(
     for gpu_id, shard in enumerate(task_shards):
         print(f"  GPU {gpu_id}: {len(shard)} queries")
 
-    worker_script = Path(__file__).with_name("evaluate_full_label_oracle_worker.py")
+    project_root = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory(prefix="full_label_oracle_") as temp_dir:
         temp_path = Path(temp_dir)
         config_path = temp_path / "config.pkl"
@@ -339,7 +319,7 @@ def run_oracle_workers(
             _atomic_pickle_dump(shard, tasks_path)
             env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_id)}
             command = [
-                sys.executable, str(worker_script),
+                sys.executable, "-m", "scripts.evaluate_full_label_oracle_worker",
                 "--worker-id", str(gpu_id),
                 "--config-path", str(config_path),
                 "--tasks-path", str(tasks_path),
@@ -348,7 +328,10 @@ def run_oracle_workers(
                 "--target-k-values", *[str(k) for k in target_k_values],
                 "--checkpoint-every", str(per_worker_checkpoint),
             ]
-            processes.append((gpu_id, subprocess.Popen(command, env=env)))
+            processes.append((
+                gpu_id,
+                subprocess.Popen(command, env=env, cwd=project_root),
+            ))
             output_paths.append(output_path)
 
         last_count = len(existing_records)
@@ -441,10 +424,7 @@ def main(cfg: DictConfig):
         raise ValueError("Evaluation and retrieval embeddings use different CLIP models")
     if len(eval_dataset.class_names) != class_count:
         raise ValueError("Baseline class count differs from the current dataset")
-    current_candidate_labels = [
-        get_readable_name(label) if cfg.dataset.name == "mini_imagenet" else label
-        for label in eval_dataset.class_names
-    ]
+    current_candidate_labels = list(eval_dataset.class_names)
     if current_candidate_labels != candidate_labels:
         raise ValueError("Baseline candidate labels differ from the current dataset")
     baseline_model_cfg = baseline["args"]["resolved_config"]["model"]

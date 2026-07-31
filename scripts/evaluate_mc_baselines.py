@@ -26,21 +26,18 @@ This is a baselines-only script (Phase 1). A follow-up phase adds a
 reranker-top-1 condition using the same DistractorSet/pool machinery.
 
 Usage:
-    python scripts/evaluate_mc_baselines.py
-    python scripts/evaluate_mc_baselines.py limits.max_queries=5
-    python scripts/evaluate_mc_baselines.py limits.compute_oracle=true
+    python -m scripts.evaluate_mc_baselines
+    python -m scripts.evaluate_mc_baselines limits.max_queries=5
+    python -m scripts.evaluate_mc_baselines limits.compute_oracle=true
 
     # Resume oracle-only from a previously saved mc_baselines .pkl -- reuses the
     # saved 0-shot/CLIP-top-1 results as-is (no Idefics2 calls re-run for them)
     # and only pays the oracle pass's cost:
-    python scripts/evaluate_mc_baselines.py \
+    python -m scripts.evaluate_mc_baselines \
         limits.resume_from=outputs/evals/mc_baselines/mc_baselines/cub_200_test_train.pkl
 """
 
-import hashlib
 import math
-import subprocess
-import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional
@@ -51,48 +48,20 @@ import numpy as np
 import pickle
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
-from data.dataclasses import MCEvalResult
-from data.distractor_sets import (
+from src.data.dataclasses import MCEvalResult
+from src.data.distractor_sets import (
     build_distractor_ranking,
     materialize_distractor_set,
 )
-from models.idefics2_wrapper import Idefics2Wrapper
-from utils.imagenet_names import get_readable_name
-from utils.eval_utils import save_eval_results
-from utils.kaggle_utils import kaggle_upload_eval_results
-
-sys.path.insert(0, str(Path(__file__).parent))
-from evaluate_icl_performance import load_dataset, _setup_device
-
-
-def resolve_siglip_cache_path(dataset_name: str, filename: str, siglip_kaggle_dataset: Optional[str]) -> Path:
-    """
-    Resolve a local path to a siglip_*.pkl file, preferring a Kaggle dataset
-    mounted as a notebook input (via scripts/upload_siglip_distractor_set_to_kaggle.py)
-    over the local data/{dataset_name}/ cache.
-
-    Assumes the dataset has already been added as an input in the Kaggle
-    notebook -- no download-via-CLI fallback, unlike
-    resolve_embeddings_cache_path in evaluate_icl_performance.py.
-
-    Tries both known Kaggle mount conventions: the older flat
-    /kaggle/input/{slug}/ and the newer /kaggle/input/datasets/{owner}/{slug}/
-    (seen when a dataset is referenced by full owner/slug).
-    """
-    if siglip_kaggle_dataset:
-        owner, slug = siglip_kaggle_dataset.split('/')
-        candidate_paths = [
-            Path(f"/kaggle/input/datasets/{owner}/{slug}/{filename}"),
-            Path(f"/kaggle/input/{slug}/{filename}"),
-        ]
-        for mounted_path in candidate_paths:
-            if mounted_path.exists():
-                print(f"✓ Using mounted Kaggle input: {mounted_path}")
-                return mounted_path
-
-    return Path(f"data/{dataset_name}/{filename}")
+from src.data.loading import load_dataset, resolve_siglip_cache_path
+from src.models.idefics2_wrapper import Idefics2Wrapper
+from src.utils.eval_utils import save_eval_results
+from src.utils.kaggle_utils import kaggle_upload_eval_results
+from src.utils.runtime import (
+    file_sha256 as _file_sha256,
+    git_revision as _git_revision,
+    setup_device as _setup_device,
+)
 
 
 def load_siglip_text_embeddings(dataset_name: str, siglip_kaggle_dataset: Optional[str] = None):
@@ -100,11 +69,11 @@ def load_siglip_text_embeddings(dataset_name: str, siglip_kaggle_dataset: Option
     if not cache_path.exists():
         raise FileNotFoundError(
             f"SigLIP text embeddings not found at {cache_path}. Please run: "
-            f"python scripts/build_siglip_embeddings.py --dataset {dataset_name}"
+            f"python -m scripts.build_siglip_embeddings --dataset {dataset_name}"
         )
     with open(cache_path, "rb") as f:
         data = pickle.load(f)
-    return data["embeddings"], data["class_names"]
+    return data["embeddings"], data["class_names"], data.get("model_name"), cache_path
 
 
 def load_siglip_image_embeddings(dataset_name: str, split: str, siglip_kaggle_dataset: Optional[str] = None):
@@ -113,17 +82,20 @@ def load_siglip_image_embeddings(dataset_name: str, split: str, siglip_kaggle_da
     if not cache_path.exists():
         raise FileNotFoundError(
             f"SigLIP image embeddings not found at {cache_path}. Please run: "
-            f"python scripts/build_siglip_embeddings.py --dataset {dataset_name} --splits {split}"
+            f"python -m scripts.build_siglip_embeddings --dataset {dataset_name} --splits {split}"
         )
     with open(cache_path, "rb") as f:
         data = pickle.load(f)
-    return data["embeddings"]
+    return (
+        data["embeddings"],
+        data.get("model_name"),
+        data.get("example_ids"),
+        cache_path,
+    )
 
 
 def resolve_label_text(dataset_name: str, class_name: str) -> str:
-    """Mini-ImageNet class_names are synset IDs; everything else is already readable."""
-    if dataset_name == "mini_imagenet":
-        return get_readable_name(class_name)
+    """Return the canonical CUB class label."""
     return class_name
 
 
@@ -175,25 +147,6 @@ def evaluate_reference(
         query_image, [(image, label_text)], letter_to_label
     )
     return pred_letter, probs
-
-
-def _file_sha256(path: Optional[str]) -> Optional[str]:
-    if not path or not Path(path).exists():
-        return None
-    digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _git_revision() -> Optional[str]:
-    try:
-        return subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
-        ).stdout.strip()
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return None
 
 
 def load_saved_mc_results(resume_from: str):
@@ -566,19 +519,40 @@ def main(cfg: DictConfig):
 
     siglip_kaggle_dataset = cfg.dataset.get("siglip_kaggle_dataset", None)
     print("Loading SigLIP embeddings...")
-    siglip_text_embs, siglip_class_names = load_siglip_text_embeddings(dataset_name, siglip_kaggle_dataset)
-    siglip_image_embs = load_siglip_image_embeddings(dataset_name, split, siglip_kaggle_dataset)
+    (
+        siglip_text_embs,
+        siglip_class_names,
+        siglip_text_model,
+        siglip_text_path,
+    ) = load_siglip_text_embeddings(dataset_name, siglip_kaggle_dataset)
+    (
+        siglip_image_embs,
+        siglip_image_model,
+        siglip_example_ids,
+        siglip_image_path,
+    ) = load_siglip_image_embeddings(dataset_name, split, siglip_kaggle_dataset)
+    if siglip_text_model != siglip_image_model:
+        raise ValueError("SigLIP text and image artifacts use different models")
+    if siglip_text_model and siglip_text_model != str(cfg.distractor_set.siglip_model):
+        raise ValueError(
+            "Configured SigLIP model differs from the loaded artifact: "
+            f"{cfg.distractor_set.siglip_model!r} != {siglip_text_model!r}"
+        )
     assert len(siglip_class_names) == len(query_dataset.class_names), (
         f"SigLIP text embeddings were built for {len(siglip_class_names)} classes, "
         f"but dataset has {len(query_dataset.class_names)} classes. Rebuild with "
-        f"scripts/build_siglip_embeddings.py."
+        "`python -m scripts.build_siglip_embeddings`."
     )
     if list(siglip_class_names) != list(query_dataset.class_names):
         raise ValueError("SigLIP and dataset class names have different ordering.")
+    if siglip_example_ids is not None and list(siglip_example_ids) != [
+        example.image_path for example in query_dataset.examples
+    ]:
+        raise ValueError("SigLIP image rows differ from the evaluation dataset split")
     assert siglip_image_embs.shape[0] == len(query_dataset), (
         f"SigLIP image embeddings ({siglip_image_embs.shape[0]}) don't match "
         f"dataset size ({len(query_dataset)}) for split '{split}'. Rebuild with "
-        f"scripts/build_siglip_embeddings.py."
+        "`python -m scripts.build_siglip_embeddings`."
     )
 
     k_values = list(cfg.distractor_set.k_values)
@@ -623,7 +597,9 @@ def main(cfg: DictConfig):
         "clip_embedding_model_eval": query_dataset.clip_model_name,
         "clip_embedding_model_retrieval": retrieval_dataset.clip_model_name,
         "idefics2_model": cfg.model.idefics2_model,
-        "siglip_model": cfg.distractor_set.siglip_model,
+        "siglip_model": siglip_text_model,
+        "siglip_text_embeddings_sha256": _file_sha256(siglip_text_path),
+        "siglip_image_embeddings_sha256": _file_sha256(siglip_image_path),
         "load_in_8bit": bool(cfg.model.load_in_8bit),
         "image_split_path": image_split_path,
         "image_split_sha256": _file_sha256(image_split_path),

@@ -5,8 +5,8 @@ queries across isolated GPU workers, merges atomic worker checkpoints, and is
 the only process that publishes to Kaggle.
 
 Usage:
-    python scripts/generate_reranker_teacher_data.py
-    python scripts/generate_reranker_teacher_data.py \
+    python -m scripts.generate_reranker_teacher_data
+    python -m scripts.generate_reranker_teacher_data \
         limits.max_queries_per_split.train=10 limits.max_queries_per_split.val=10
 """
 
@@ -27,25 +27,23 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
-from data.dataclasses import RerankerTeacherQueryRecord
-from data.distractor_sets import build_distractor_ranking
-from models.idefics2_wrapper import Idefics2Wrapper
-from utils.eval_utils import _json_safe
-from utils.imagenet_names import get_readable_name
-from utils.kaggle_utils import kaggle_upload_eval_results
-from utils.reranker_teacher_data import derive_candidate_metrics, summarize_teacher_records
-
-sys.path.insert(0, str(Path(__file__).parent))
-from evaluate_full_label_baselines import (
-    _atomic_pickle_dump,
-    _file_sha256,
-    _git_revision,
-    resolve_siglip_cache_path,
+from src.data.dataclasses import RerankerTeacherQueryRecord
+from src.data.distractor_sets import build_distractor_ranking
+from src.data.loading import load_dataset, resolve_siglip_cache_path
+from src.models.idefics2_wrapper import Idefics2Wrapper
+from src.utils.eval_utils import _json_safe
+from src.utils.kaggle_utils import kaggle_upload_eval_results
+from src.utils.reranker_teacher_data import (
+    derive_candidate_metrics,
+    summarize_teacher_records,
+)
+from src.utils.runtime import (
+    atomic_pickle_dump as _atomic_pickle_dump,
+    file_sha256 as _file_sha256,
+    git_revision as _git_revision,
+    setup_device as _setup_device,
     stratified_query_indices,
 )
-from evaluate_icl_performance import _setup_device, load_dataset
 
 
 def _task_key(value) -> tuple[str, int]:
@@ -176,10 +174,7 @@ def score_teacher_tasks(
         embeddings_kaggle_dataset=cfg.dataset.embeddings_kaggle_dataset,
     )
     class_names = retrieval_dataset.class_names
-    candidate_labels = [
-        get_readable_name(label) if cfg.dataset.name == "mini_imagenet" else label
-        for label in class_names
-    ]
+    candidate_labels = list(class_names)
     device, _, _ = _setup_device(1)
     if device != "cuda":
         raise RuntimeError("Reranker teacher generation requires a CUDA GPU")
@@ -353,7 +348,7 @@ def run_workers(
     for gpu_id, shard in enumerate(shards):
         print(f"  GPU {gpu_id}: {len(shard)} queries")
 
-    worker_script = Path(__file__).with_name("generate_reranker_teacher_data_worker.py")
+    project_root = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory(prefix="reranker_teacher_") as temp_dir:
         temp_path = Path(temp_dir)
         config_path = temp_path / "config.pkl"
@@ -370,14 +365,18 @@ def run_workers(
             env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_id)}
             command = [
                 sys.executable,
-                str(worker_script),
+                "-m",
+                "scripts.generate_reranker_teacher_data_worker",
                 "--worker-id", str(gpu_id),
                 "--config-path", str(config_path),
                 "--tasks-path", str(tasks_path),
                 "--output-path", str(output_path),
                 "--checkpoint-every", str(cadence),
             ]
-            processes.append((gpu_id, subprocess.Popen(command, env=env)))
+            processes.append((
+                gpu_id,
+                subprocess.Popen(command, env=env, cwd=project_root),
+            ))
             output_paths.append(output_path)
 
         last_count = len(existing_records)

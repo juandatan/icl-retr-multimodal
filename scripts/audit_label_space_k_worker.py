@@ -3,17 +3,14 @@
 import argparse
 import os
 import pickle
-import sys
 from pathlib import Path
 
 if "CUDA_VISIBLE_DEVICES" not in os.environ:
     raise RuntimeError("CUDA_VISIBLE_DEVICES must be set before starting an audit worker")
 
-sys.path.insert(0, str(Path(__file__).parent))
-
 from omegaconf import OmegaConf
 
-from audit_label_space_k import score_audit_tasks
+from scripts.audit_label_space_k import score_audit_tasks
 
 
 def main():
