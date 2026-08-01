@@ -6,7 +6,11 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 from PIL import Image
-from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
+from transformers import (
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    BitsAndBytesConfig,
+)
 
 
 class Idefics2Wrapper:
@@ -55,7 +59,7 @@ class Idefics2Wrapper:
             elif self.device.startswith("cuda"):
                 model_kwargs["device_map"] = "auto"
 
-        self.model = AutoModelForVision2Seq.from_pretrained(
+        self.model = AutoModelForImageTextToText.from_pretrained(
             model_name,
             **model_kwargs,
         )
@@ -110,14 +114,24 @@ class Idefics2Wrapper:
         with torch.no_grad():
             if self.device.startswith("cuda"):
                 with torch.autocast("cuda", dtype=torch.float16):
-                    return self.model.get_image_features(
+                    outputs = self.model.get_image_features(
                         pixel_values=pixel_values,
                         pixel_attention_mask=pixel_attention_mask,
                     )
-            return self.model.get_image_features(
-                pixel_values=pixel_values,
-                pixel_attention_mask=pixel_attention_mask,
+            else:
+                outputs = self.model.get_image_features(
+                    pixel_values=pixel_values,
+                    pixel_attention_mask=pixel_attention_mask,
+                )
+        if isinstance(outputs, torch.Tensor):
+            return outputs
+        image_features = getattr(outputs, "last_hidden_state", None)
+        if not isinstance(image_features, torch.Tensor):
+            raise TypeError(
+                "Idefics2 get_image_features returned an unsupported output "
+                f"type: {type(outputs).__name__}"
             )
+        return image_features
 
     def _get_image_features_multi(
         self,
