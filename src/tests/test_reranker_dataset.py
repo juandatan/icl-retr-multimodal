@@ -50,7 +50,7 @@ def _artifact():
     return {
         "method": "reranker_teacher_data",
         "immutable_args": {
-            "schema_version": 1,
+            "schema_version": 2,
             "retrieval_split": "train",
         },
         "records": [
@@ -80,6 +80,14 @@ def test_dataset_resolves_query_candidate_and_label_features():
     )
     np.testing.assert_allclose(item["retrieval_ranks"].numpy(), [0.0, 0.5, 1.0])
     np.testing.assert_allclose(item["targets"].numpy(), [1.0, 2.0, 3.0])
+
+
+def test_dataset_rejects_legacy_schema_v1():
+    artifact = _artifact()
+    artifact["immutable_args"]["schema_version"] = 1
+
+    with pytest.raises(ValueError, match="schema version: 1"):
+        RerankerTeacherDataset(artifact, split="train")
 
 
 def test_collator_pads_variable_candidate_pools_and_builds_mask():

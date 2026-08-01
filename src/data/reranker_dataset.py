@@ -64,7 +64,7 @@ class RerankerTeacherDataset(Dataset):
         if payload.get("method") != "reranker_teacher_data":
             raise ValueError("Not a reranker teacher-data artifact")
         schema_version = int(payload.get("immutable_args", {}).get("schema_version", -1))
-        if schema_version != 1:
+        if schema_version != 2:
             raise ValueError(f"Unsupported teacher artifact schema version: {schema_version}")
 
         tables = payload.get("feature_tables")

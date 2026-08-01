@@ -67,11 +67,16 @@ def test_teacher_record_validation_recomputes_derived_targets():
 def test_teacher_summary_is_partitioned_by_official_query_split():
     train = _record("train", 5)
     val = _record("val", 0)
+    train.scoring_mode = "full_sequence_batch"
+    val.scoring_mode = "prefix_kv_cache"
     summary = summarize_teacher_records([train, val], k=3, pool_size=3)
     assert summary["num_queries"] == 2
     assert summary["num_pairs"] == 6
     assert summary["scoring_batch_sizes"] == {"8": 2}
-    assert summary["scoring_modes"] == {"full_sequence_batch": 2}
+    assert summary["scoring_modes"] == {
+        "full_sequence_batch": 1,
+        "prefix_kv_cache": 1,
+    }
     assert set(summary["by_query_split"]) == {"train", "val"}
     assert summary["by_query_split"]["train"]["zero_shot_accuracy"] == 0.0
     assert summary["by_query_split"]["val"]["pool_oracle_accuracy"] == 1.0

@@ -11,7 +11,10 @@ from scripts.evaluate_full_label_baselines import (
     stratified_query_indices,
     summarize_results,
 )
-from src.models.idefics2_wrapper import Idefics2Wrapper
+from src.models.idefics2_wrapper import (
+    PREFIX_KV_CACHE_SCORING,
+    Idefics2Wrapper,
+)
 
 
 def test_stratified_sample_balances_classes_and_is_reproducible():
@@ -152,6 +155,38 @@ def test_image_feature_concatenation_supports_current_flattened_layout():
     assert torch.equal(combined[64:], query)
 
 
+def test_image_encoding_uses_post_connector_pooler_output():
+    raw_vision_features = torch.zeros(1, 729, 12)
+    projected_features = torch.ones(64, 16)
+
+    class FakeProcessor:
+        @staticmethod
+        def __call__(images, text, return_tensors):
+            return {
+                "pixel_values": torch.zeros(1, 1, 3, 4, 4),
+                "pixel_attention_mask": torch.ones(1, 1, 4, 4),
+            }
+
+    class FakeModel:
+        config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=16))
+
+        @staticmethod
+        def get_image_features(**kwargs):
+            return SimpleNamespace(
+                last_hidden_state=raw_vision_features,
+                pooler_output=projected_features,
+            )
+
+    wrapper = Idefics2Wrapper.__new__(Idefics2Wrapper)
+    wrapper.device = "cpu"
+    wrapper.processor = FakeProcessor()
+    wrapper.model = FakeModel()
+
+    result = wrapper._get_image_features(SimpleNamespace())
+
+    assert torch.equal(result, projected_features)
+
+
 def test_image_feature_concatenation_supports_legacy_layout():
     context = torch.zeros(1, 1, 64, 16)
     query = torch.ones(1, 1, 64, 16)
@@ -183,3 +218,79 @@ def test_precomputed_scoring_accepts_flattened_transformers_features():
     assert scores == {"A": -1.0, "Bird": -4.0, "Long Bird": -9.0}
     assert [call[2] for call in calls] == [["A", "Bird"], ["Long Bird"]]
     assert all(call[0][0].shape == (64, 16) for call in calls)
+
+
+def test_prefix_cache_prefills_once_and_branches_label_chunks():
+    vocabulary_size = 16
+    tokenizations = {
+        "A": [1],
+        "Bee": [2, 3, 4],
+        "Cat": [5, 6],
+    }
+
+    class FakeTokenizer:
+        pad_token_id = 0
+
+        @staticmethod
+        def encode(label, add_special_tokens=False):
+            assert add_special_tokens is False
+            return tokenizations[label]
+
+    class FakeProcessor:
+        tokenizer = FakeTokenizer()
+
+        @staticmethod
+        def __call__(text, return_tensors):
+            assert return_tensors == "pt"
+            return {
+                "input_ids": torch.tensor([[7, 8]]),
+                "attention_mask": torch.ones(1, 2, dtype=torch.long),
+            }
+
+    class FakeCache:
+        def __init__(self):
+            self.repeats = None
+
+        def batch_repeat_interleave(self, repeats):
+            self.repeats = repeats
+
+    class FakeModel:
+        def __init__(self):
+            self.prefix_calls = 0
+            self.continuation_batch_sizes = []
+
+        def __call__(self, **inputs):
+            if "past_key_values" not in inputs:
+                self.prefix_calls += 1
+                assert inputs["use_cache"] is True
+                assert inputs["logits_to_keep"] == 1
+                return SimpleNamespace(
+                    logits=torch.zeros(1, 1, vocabulary_size),
+                    past_key_values=FakeCache(),
+                )
+            batch_size, length = inputs["input_ids"].shape
+            assert inputs["past_key_values"].repeats == batch_size
+            assert inputs["attention_mask"].shape == (batch_size, 2 + length)
+            self.continuation_batch_sizes.append(batch_size)
+            return SimpleNamespace(
+                logits=torch.zeros(batch_size, length, vocabulary_size),
+            )
+
+    wrapper = Idefics2Wrapper.__new__(Idefics2Wrapper)
+    wrapper.device = "cpu"
+    wrapper.processor = FakeProcessor()
+    wrapper.model = FakeModel()
+    wrapper._label_token_cache = {}
+    wrapper._prompt_token_cache = {}
+    scores = wrapper.score_candidate_labels_with_image_features(
+        torch.zeros(64, 16),
+        example_labels=[],
+        candidate_labels=list(tokenizations),
+        batch_size=2,
+        scoring_mode=PREFIX_KV_CACHE_SCORING,
+    )
+
+    expected = -float(np.log(vocabulary_size))
+    assert wrapper.model.prefix_calls == 1
+    assert wrapper.model.continuation_batch_sizes == [2, 1]
+    assert all(np.isclose(score, expected) for score in scores.values())

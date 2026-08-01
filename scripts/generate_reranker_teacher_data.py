@@ -30,7 +30,12 @@ from tqdm import tqdm
 from src.data.dataclasses import RerankerTeacherQueryRecord
 from src.data.distractor_sets import build_distractor_ranking
 from src.data.loading import load_dataset, resolve_siglip_cache_path
-from src.models.idefics2_wrapper import Idefics2Wrapper
+from src.models.idefics2_wrapper import (
+    FULL_SEQUENCE_SCORING,
+    PREFIX_KV_CACHE_SCORING,
+    SUPPORTED_SCORING_MODES,
+    Idefics2Wrapper,
+)
 from src.utils.eval_utils import _json_safe
 from src.utils.kaggle_utils import kaggle_upload_eval_results
 from src.utils.reranker_teacher_data import (
@@ -50,6 +55,74 @@ def _task_key(value) -> tuple[str, int]:
     if isinstance(value, dict):
         return str(value["query_split"]), int(value["query_idx"])
     return str(value.query_split), int(value.query_idx)
+
+
+def _assert_score_parity(
+    first: dict[str, float],
+    second: dict[str, float],
+    labels: list[str],
+    *,
+    rtol: float,
+    atol: float,
+    context: str,
+    allow_near_tie_label_flip: bool = False,
+    true_label: Optional[str] = None,
+) -> tuple[float, float, bool]:
+    """Validate score geometry and return raw and shift-invariant deltas.
+
+    All downstream teacher targets depend on score differences or softmax
+    probabilities, so adding one constant to every label score is immaterial.
+    Cached and uncached kernels may introduce such a common offset while still
+    defining the same distribution over labels.
+    """
+    first_values = np.asarray([first[label] for label in labels], dtype=np.float64)
+    second_values = np.asarray([second[label] for label in labels], dtype=np.float64)
+    raw_maximum_delta = float(np.max(np.abs(first_values - second_values)))
+    first_centered = first_values - np.max(first_values)
+    second_centered = second_values - np.max(second_values)
+    centered_deltas = np.abs(first_centered - second_centered)
+    centered_maximum_delta = float(np.max(centered_deltas))
+    worst_index = int(np.argmax(centered_deltas))
+    if not np.allclose(first_centered, second_centered, rtol=rtol, atol=atol):
+        raise RuntimeError(
+            f"Scoring parity failed for {context}: "
+            f"raw_max_abs_delta={raw_maximum_delta:.6g}, "
+            f"centered_max_abs_delta={centered_maximum_delta:.6g}, "
+            f"worst_label={labels[worst_index]!r}, "
+            f"scores=({first_values[worst_index]:.6g}, "
+            f"{second_values[worst_index]:.6g}), rtol={rtol}, atol={atol}"
+        )
+    first_winner = int(np.argmax(first_values))
+    second_winner = int(np.argmax(second_values))
+    label_flip = first_winner != second_winner
+    if label_flip:
+        first_preference = float(
+            first_values[first_winner] - first_values[second_winner]
+        )
+        second_preference = float(
+            second_values[second_winner] - second_values[first_winner]
+        )
+        true_label_involved = true_label in {
+            labels[first_winner], labels[second_winner]
+        }
+        detail = (
+            f"{labels[first_winner]!r} vs {labels[second_winner]!r}; "
+            f"preference_gaps=({first_preference:.6g}, "
+            f"{second_preference:.6g}); "
+            f"true_label_involved={true_label_involved}; "
+            f"raw_max_abs_delta={raw_maximum_delta:.6g}, "
+            f"centered_max_abs_delta={centered_maximum_delta:.6g}"
+        )
+        if not allow_near_tie_label_flip or true_label_involved:
+            raise RuntimeError(
+                f"Scoring parity changed the predicted label for {context}: {detail}"
+            )
+        print(
+            f"Scoring parity accepted a within-tolerance label flip for "
+            f"{context}: {detail}",
+            flush=True,
+        )
+    return raw_maximum_delta, centered_maximum_delta, label_flip
 
 
 def load_siglip_split(cfg: DictConfig, split: str):
@@ -175,6 +248,14 @@ def score_teacher_tasks(
     )
     class_names = retrieval_dataset.class_names
     candidate_labels = list(class_names)
+    scoring_mode = str(
+        cfg.scoring.get("mode", FULL_SEQUENCE_SCORING)
+    )
+    if scoring_mode not in SUPPORTED_SCORING_MODES:
+        raise ValueError(
+            f"Unsupported scoring mode {scoring_mode!r}; expected one of "
+            f"{sorted(SUPPORTED_SCORING_MODES)}"
+        )
     device, _, _ = _setup_device(1)
     if device != "cuda":
         raise RuntimeError("Reranker teacher generation requires a CUDA GPU")
@@ -182,6 +263,7 @@ def score_teacher_tasks(
         model_name=cfg.model.idefics2_model,
         device="cuda:0",
         load_in_8bit=bool(cfg.model.load_in_8bit),
+        scoring_mode=scoring_mode,
     )
 
     records = []
@@ -190,6 +272,17 @@ def score_teacher_tasks(
     heartbeat_candidate_every = int(log_cfg.get("heartbeat_every_candidates", 10))
     feature_cache_size = int(cfg.scoring.get("candidate_feature_cache_size", 0))
     empty_cache_every = int(cfg.scoring.get("empty_cache_every_queries", 50))
+    parity_queries = int(cfg.scoring.get("parity_check_queries", 0))
+    parity_rtol = float(cfg.scoring.get("parity_rtol", 1e-3))
+    parity_atol = float(cfg.scoring.get("parity_atol", 1e-3))
+    allow_near_tie_label_flips = bool(
+        cfg.scoring.get("parity_allow_near_tie_label_flips", False)
+    )
+    parity_mode = (
+        PREFIX_KV_CACHE_SCORING
+        if scoring_mode == FULL_SEQUENCE_SCORING
+        else FULL_SEQUENCE_SCORING
+    )
     candidate_feature_cache = OrderedDict()
     feature_cache_hits = 0
     feature_cache_misses = 0
@@ -215,6 +308,7 @@ def score_teacher_tasks(
         label_indices = np.asarray(task["label_class_indices"], dtype=np.int16)
         labels = [candidate_labels[int(idx)] for idx in label_indices]
         true_local_idx = int(np.flatnonzero(label_indices == query.label)[0])
+        true_label = candidate_labels[int(query.label)]
 
         query_features = model.encode_full_label_scoring_images([query_image])
         zero_by_label = model.score_candidate_labels_with_image_features(
@@ -223,6 +317,33 @@ def score_teacher_tasks(
             labels,
             batch_size=int(cfg.scoring.candidate_batch_size),
         )
+        parity_raw_max_delta = 0.0
+        parity_centered_max_delta = 0.0
+        parity_label_flips = 0
+        check_parity = local_position <= parity_queries
+        if check_parity:
+            parity_zero = model.score_candidate_labels_with_image_features(
+                query_features,
+                [],
+                labels,
+                batch_size=int(cfg.scoring.candidate_batch_size),
+                scoring_mode=parity_mode,
+            )
+            raw_delta, centered_delta, label_flip = _assert_score_parity(
+                zero_by_label,
+                parity_zero,
+                labels,
+                rtol=parity_rtol,
+                atol=parity_atol,
+                context=f"{split}:{query_idx} zero-shot",
+                allow_near_tie_label_flip=allow_near_tie_label_flips,
+                true_label=true_label,
+            )
+            parity_raw_max_delta = max(parity_raw_max_delta, raw_delta)
+            parity_centered_max_delta = max(
+                parity_centered_max_delta, centered_delta
+            )
+            parity_label_flips += int(label_flip)
         zero_scores = np.asarray([zero_by_label[label] for label in labels], dtype=np.float32)
 
         candidate_scores = []
@@ -252,6 +373,31 @@ def score_teacher_tasks(
                 labels,
                 batch_size=int(cfg.scoring.candidate_batch_size),
             )
+            if check_parity:
+                parity_scores = model.score_candidate_labels_with_image_features(
+                    combined,
+                    [candidate_labels[candidate.label]],
+                    labels,
+                    batch_size=int(cfg.scoring.candidate_batch_size),
+                    scoring_mode=parity_mode,
+                )
+                raw_delta, centered_delta, label_flip = _assert_score_parity(
+                    scores_by_label,
+                    parity_scores,
+                    labels,
+                    rtol=parity_rtol,
+                    atol=parity_atol,
+                    context=(
+                        f"{split}:{query_idx} candidate {int(candidate_idx)}"
+                    ),
+                    allow_near_tie_label_flip=allow_near_tie_label_flips,
+                    true_label=true_label,
+                )
+                parity_raw_max_delta = max(parity_raw_max_delta, raw_delta)
+                parity_centered_max_delta = max(
+                    parity_centered_max_delta, centered_delta
+                )
+                parity_label_flips += int(label_flip)
             candidate_classes.append(int(candidate.label))
             candidate_scores.append([scores_by_label[label] for label in labels])
             if (
@@ -270,6 +416,15 @@ def score_teacher_tasks(
                     f"{feature_cache_hits}/{feature_cache_hits + feature_cache_misses}",
                     flush=True,
                 )
+        if check_parity:
+            print(
+                f"[GPU {worker_id}] scoring parity passed for {split}:{query_idx}; "
+                f"{scoring_mode} vs {parity_mode}; "
+                f"raw_max_abs_delta={parity_raw_max_delta:.6g}; "
+                f"centered_max_abs_delta={parity_centered_max_delta:.6g}; "
+                f"within_tolerance_label_flips={parity_label_flips}",
+                flush=True,
+            )
         candidate_scores = np.asarray(candidate_scores, dtype=np.float32)
         zero_metrics, candidate_metrics = derive_candidate_metrics(
             zero_scores,
@@ -298,7 +453,7 @@ def score_teacher_tasks(
             candidate_scores=candidate_scores,
             candidate_metrics=candidate_metrics,
             scoring_batch_size=int(cfg.scoring.candidate_batch_size),
-            scoring_mode="full_sequence_batch",
+            scoring_mode=scoring_mode,
         ))
         if checkpoint_path and checkpoint_every > 0 and len(records) % checkpoint_every == 0:
             _atomic_pickle_dump(records, checkpoint_path)
@@ -539,7 +694,7 @@ def main(cfg: DictConfig):
     output_dir = Path(cfg.output.save_dir) / run_id
     output_path = output_dir / "reranker_teacher_data.pkl"
     immutable_args = {
-        "schema_version": 1,
+        "schema_version": 2,
         "dataset": str(cfg.dataset.name),
         "query_splits": query_splits,
         "retrieval_split": str(cfg.dataset.retrieval_split),
@@ -554,6 +709,7 @@ def main(cfg: DictConfig):
         "load_in_8bit": bool(cfg.model.load_in_8bit),
         "clip_model": retrieval_dataset.clip_model_name,
         "siglip_model": siglip_model,
+        "image_feature_representation": "post_connector_pooler_output",
         "image_split_sha256": _file_sha256(cfg.dataset.image_split_path),
         "siglip_text_embeddings_sha256": _file_sha256(str(text_path)),
         "siglip_image_embeddings_sha256_by_split": {
@@ -590,10 +746,10 @@ def main(cfg: DictConfig):
             if "scoring_batch_size" not in getattr(record, "__dict__", {}):
                 record.scoring_batch_size = previous_batch_size
             if "scoring_mode" not in getattr(record, "__dict__", {}):
-                record.scoring_mode = "full_sequence_batch"
-            if record.scoring_mode != "full_sequence_batch":
+                record.scoring_mode = FULL_SEQUENCE_SCORING
+            if record.scoring_mode not in SUPPORTED_SCORING_MODES:
                 raise ValueError(
-                    "Resume artifact contains non-production scoring mode "
+                    "Resume artifact contains unsupported scoring mode "
                     f"{record.scoring_mode!r} for query {_task_key(record)}"
                 )
         if len({_task_key(record) for record in records}) != len(records):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -12,6 +13,13 @@ from transformers import (
     BitsAndBytesConfig,
 )
 
+FULL_SEQUENCE_SCORING = "full_sequence_batch"
+PREFIX_KV_CACHE_SCORING = "prefix_kv_cache"
+SUPPORTED_SCORING_MODES = frozenset({
+    FULL_SEQUENCE_SCORING,
+    PREFIX_KV_CACHE_SCORING,
+})
+
 
 class Idefics2Wrapper:
     """Expose only the discriminative scoring paths used by this project."""
@@ -21,10 +29,17 @@ class Idefics2Wrapper:
         model_name: str = "HuggingFaceM4/idefics2-8b",
         device: Optional[str] = None,
         load_in_8bit: bool = False,
+        scoring_mode: str = FULL_SEQUENCE_SCORING,
     ) -> None:
         self.model_name = model_name
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.load_in_8bit = load_in_8bit
+        if scoring_mode not in SUPPORTED_SCORING_MODES:
+            raise ValueError(
+                f"Unsupported scoring mode {scoring_mode!r}; expected one of "
+                f"{sorted(SUPPORTED_SCORING_MODES)}"
+            )
+        self.scoring_mode = scoring_mode
         self.use_cache = False
         self._letter_token_id_cache: dict[str, int] = {}
         self._label_token_cache: dict[str, list[int]] = {}
@@ -124,12 +139,23 @@ class Idefics2Wrapper:
                     pixel_attention_mask=pixel_attention_mask,
                 )
         if isinstance(outputs, torch.Tensor):
-            return outputs
-        image_features = getattr(outputs, "last_hidden_state", None)
+            image_features = outputs
+        else:
+            # Transformers 5 returns raw vision states in last_hidden_state and
+            # post-connector, language-space states in pooler_output. Only the
+            # latter are valid as Idefics2's image_hidden_states input.
+            image_features = getattr(outputs, "pooler_output", None)
         if not isinstance(image_features, torch.Tensor):
             raise TypeError(
                 "Idefics2 get_image_features returned an unsupported output "
                 f"type: {type(outputs).__name__}"
+            )
+        expected_hidden_size = int(self.model.config.text_config.hidden_size)
+        if image_features.shape[-1] != expected_hidden_size:
+            raise ValueError(
+                "Idefics2 image features are not in language-model space: "
+                f"expected hidden size {expected_hidden_size}, got "
+                f"{image_features.shape[-1]}"
             )
         return image_features
 
@@ -317,6 +343,136 @@ class Idefics2Wrapper:
             )
         return batch_log_probabilities
 
+    def _compute_label_probabilities_with_prefix_cache(
+        self,
+        image_hidden_states: torch.Tensor,
+        prompt: str,
+        labels: List[str],
+        batch_size: int,
+    ) -> List[float]:
+        """Score labels after one shared image-conditioned prefix prefill."""
+        if not labels:
+            return []
+
+        all_label_tokens = []
+        for label in labels:
+            label_tokens = self._label_token_cache.get(label)
+            if label_tokens is None:
+                label_tokens = self.processor.tokenizer.encode(
+                    label,
+                    add_special_tokens=False,
+                )
+                self._label_token_cache[label] = label_tokens
+            if not label_tokens:
+                raise ValueError(f"Candidate label {label!r} produced no tokens")
+            all_label_tokens.append(label_tokens)
+
+        prompt_inputs = self._prompt_token_cache.get(prompt)
+        if prompt_inputs is None:
+            prompt_inputs = self.processor(text=prompt, return_tensors="pt")
+            self._prompt_token_cache[prompt] = prompt_inputs
+        prefix_input_ids = prompt_inputs["input_ids"].to(self.device)
+        prefix_attention_mask = prompt_inputs["attention_mask"].to(self.device)
+        prefix_model_inputs = {
+            "input_ids": prefix_input_ids,
+            "attention_mask": prefix_attention_mask,
+            "image_hidden_states": image_hidden_states,
+            "use_cache": True,
+            # Only the final prefix position predicts the first label token.
+            "logits_to_keep": 1,
+        }
+        with torch.no_grad():
+            if self.device.startswith("cuda"):
+                with torch.autocast("cuda", dtype=torch.float16):
+                    prefix_outputs = self.model(**prefix_model_inputs)
+            else:
+                prefix_outputs = self.model(**prefix_model_inputs)
+
+        prefix_cache = getattr(prefix_outputs, "past_key_values", None)
+        if prefix_cache is None or not hasattr(
+            prefix_cache, "batch_repeat_interleave"
+        ):
+            raise TypeError(
+                "Idefics2 did not return a branchable Transformers cache"
+            )
+        prefix_log_probabilities = torch.nn.functional.log_softmax(
+            prefix_outputs.logits[0, -1],
+            dim=-1,
+        )
+        scores = []
+        pad_token_id = self.processor.tokenizer.pad_token_id
+        if pad_token_id is None:
+            raise ValueError("The Idefics2 tokenizer must define a pad token")
+
+        for start in range(0, len(labels), batch_size):
+            chunk_tokens = all_label_tokens[start:start + batch_size]
+            chunk_size = len(chunk_tokens)
+            token_log_probability_sums = [
+                float(prefix_log_probabilities[tokens[0]].item())
+                for tokens in chunk_tokens
+            ]
+            continuation_length = max(len(tokens) - 1 for tokens in chunk_tokens)
+            if continuation_length:
+                continuation_ids = torch.full(
+                    (chunk_size, continuation_length),
+                    pad_token_id,
+                    dtype=prefix_input_ids.dtype,
+                    device=self.device,
+                )
+                continuation_mask = torch.zeros(
+                    (chunk_size, continuation_length),
+                    dtype=prefix_attention_mask.dtype,
+                    device=self.device,
+                )
+                for row, tokens in enumerate(chunk_tokens):
+                    continuation = tokens[:-1]
+                    if continuation:
+                        continuation_ids[row, :len(continuation)] = torch.tensor(
+                            continuation,
+                            dtype=prefix_input_ids.dtype,
+                            device=self.device,
+                        )
+                        continuation_mask[row, :len(continuation)] = 1
+
+                branched_cache = copy.deepcopy(prefix_cache)
+                branched_cache.batch_repeat_interleave(chunk_size)
+                continuation_inputs = {
+                    "input_ids": continuation_ids,
+                    "attention_mask": torch.cat(
+                        [
+                            prefix_attention_mask.repeat(chunk_size, 1),
+                            continuation_mask,
+                        ],
+                        dim=1,
+                    ),
+                    "past_key_values": branched_cache,
+                    "use_cache": True,
+                }
+                with torch.no_grad():
+                    if self.device.startswith("cuda"):
+                        with torch.autocast("cuda", dtype=torch.float16):
+                            continuation_outputs = self.model(**continuation_inputs)
+                    else:
+                        continuation_outputs = self.model(**continuation_inputs)
+                continuation_log_probabilities = torch.nn.functional.log_softmax(
+                    continuation_outputs.logits,
+                    dim=-1,
+                )
+                for row, tokens in enumerate(chunk_tokens):
+                    token_log_probability_sums[row] += sum(
+                        continuation_log_probabilities[
+                            row,
+                            token_offset - 1,
+                            tokens[token_offset],
+                        ].item()
+                        for token_offset in range(1, len(tokens))
+                    )
+            scores.extend(
+                total / len(tokens)
+                for total, tokens in zip(token_log_probability_sums, chunk_tokens)
+            )
+        return scores
+
     def _format_full_label_scoring_prompt(
         self,
         example_labels: Optional[List[str]] = None,
@@ -356,6 +512,7 @@ class Idefics2Wrapper:
         example_labels: List[str],
         candidate_labels: List[str],
         batch_size: int = 8,
+        scoring_mode: Optional[str] = None,
     ) -> Dict[str, float]:
         """Score exact label continuations under one fixed prompt."""
         if not candidate_labels:
@@ -364,20 +521,36 @@ class Idefics2Wrapper:
             raise ValueError("candidate_labels must be unique")
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        scoring_mode = scoring_mode or getattr(
+            self, "scoring_mode", FULL_SEQUENCE_SCORING
+        )
+        if scoring_mode not in SUPPORTED_SCORING_MODES:
+            raise ValueError(
+                f"Unsupported scoring mode {scoring_mode!r}; expected one of "
+                f"{sorted(SUPPORTED_SCORING_MODES)}"
+            )
 
         prompt = self._format_full_label_scoring_prompt(example_labels or None)
-        scores = []
-        for start in range(0, len(candidate_labels), batch_size):
-            labels = candidate_labels[start:start + batch_size]
-            scores.extend(
-                self._compute_label_probabilities_batch_with_features(
-                    image_hidden_states_list=[
-                        image_hidden_states
-                    ] * len(labels),
-                    prompts=[prompt] * len(labels),
-                    labels=labels,
-                )
+        if scoring_mode == PREFIX_KV_CACHE_SCORING:
+            scores = self._compute_label_probabilities_with_prefix_cache(
+                image_hidden_states,
+                prompt,
+                candidate_labels,
+                batch_size,
             )
+        else:
+            scores = []
+            for start in range(0, len(candidate_labels), batch_size):
+                labels = candidate_labels[start:start + batch_size]
+                scores.extend(
+                    self._compute_label_probabilities_batch_with_features(
+                        image_hidden_states_list=[
+                            image_hidden_states
+                        ] * len(labels),
+                        prompts=[prompt] * len(labels),
+                        labels=labels,
+                    )
+                )
         return {
             label: float(score)
             for label, score in zip(candidate_labels, scores)
