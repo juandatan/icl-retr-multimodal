@@ -1,6 +1,6 @@
 # Runtime dependencies for the CUB-200 evaluation and teacher-data pipelines.
-torch>=2.0
-transformers>=4.37
+torch>=2.0,<2.9
+transformers==4.46.3
 accelerate>=0.25
 bitsandbytes>=0.41
 openai-clip
