@@ -71,3 +71,33 @@ def test_select_never_returns_a_padded_candidate():
     mask = torch.tensor([[True, True, False], [True, True, True]])
     selected = LabelAwareReranker.select(scores, mask)
     assert selected.tolist() == [1, 0]
+
+
+def test_pooled_transformer_scores_candidates_and_backpropagates():
+    model = LabelAwareReranker(RerankerConfig(
+        clip_dim=6,
+        siglip_dim=8,
+        architecture="pooled_transformer",
+        hidden_dim=16,
+        transformer_heads=4,
+        transformer_layers=1,
+        transformer_ff_dim=32,
+    ))
+    scores = model(**_inputs())
+    scores.sum().backward()
+    assert scores.shape == (2, 4)
+    assert model.score_token.grad is not None
+
+
+def test_optional_clip_and_metadata_branches_are_independent_ablation_flags():
+    model = LabelAwareReranker(RerankerConfig(
+        clip_dim=6,
+        siglip_dim=8,
+        hidden_dim=16,
+        metadata_dim=4,
+        use_clip_embeddings=True,
+        use_clip_similarity=True,
+        use_retrieval_rank=True,
+        use_derived_siglip_similarities=True,
+    ))
+    assert model(**_inputs()).shape == (2, 4)

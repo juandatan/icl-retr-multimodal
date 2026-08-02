@@ -27,7 +27,7 @@ retrieval:
 
 model:
   idefics2_model: "HuggingFaceM4/idefics2-8b"
-  load_in_8bit: true
+  load_in_8bit: false
 
 hardware:
   num_gpus: 2
@@ -36,16 +36,8 @@ hardware:
 scoring:
   # prefix_kv_cache prefills each image-conditioned prompt once, then branches
   # its text-model KV cache across the K candidate label continuations.
-  mode: "full_sequence_batch"
+  mode: "prefix_kv_cache"
   candidate_batch_size: 8
-  # When positive, each worker compares both scoring modes for its first N
-  # queries and aborts on a score or predicted-label mismatch.
-  parity_check_queries: 0
-  parity_rtol: 0.001
-  parity_atol: 0.001
-  # A label flip may be accepted only when the complete centered score vectors
-  # already pass the tolerances above. The competing labels and gaps are logged.
-  parity_allow_near_tie_label_flips: false
   # Reuse Idefics2 vision features for retrieval images that recur across
   # neighboring queries. Roughly 0.5 MB/image in fp16 for Idefics2-8B.
   candidate_feature_cache_size: 256

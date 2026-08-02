@@ -15,13 +15,18 @@ from torch.utils.data import Dataset
 from src.data import dataclasses as _artifact_dataclasses  # noqa: F401
 
 
-SUPPORTED_TARGETS = frozenset({
+RAW_TARGETS = frozenset({
     "margin",
     "incremental_margin",
     "true_probability",
     "true_log_probability",
     "incremental_true_probability",
     "incremental_true_log_probability",
+})
+SUPPORTED_TARGETS = RAW_TARGETS | frozenset({
+    "bounded_margin",
+    "bounded_incremental_margin",
+    "normalized_incremental_probability",
 })
 
 
@@ -47,11 +52,17 @@ class RerankerTeacherDataset(Dataset):
         self,
         artifact: str | Path | Mapping[str, Any],
         split: str,
-        target: str = "margin",
+        target: str = "true_probability",
+        target_temperature: float = 1.0,
+        incremental_lambda: float = 1.0,
     ) -> None:
         if target not in SUPPORTED_TARGETS:
             choices = ", ".join(sorted(SUPPORTED_TARGETS))
             raise ValueError(f"Unsupported target {target!r}; choose one of: {choices}")
+        if target_temperature <= 0:
+            raise ValueError("target_temperature must be positive")
+        if not 0 <= incremental_lambda <= 1:
+            raise ValueError("incremental_lambda must be in [0, 1]")
 
         if isinstance(artifact, (str, Path)):
             with Path(artifact).open("rb") as file:
@@ -105,6 +116,8 @@ class RerankerTeacherDataset(Dataset):
         self.split = split
         self.retrieval_split = retrieval_split
         self.target = target
+        self.target_temperature = float(target_temperature)
+        self.incremental_lambda = float(incremental_lambda)
         self.clip_dim = self.clip_features[split].shape[1]
         self.siglip_dim = self.siglip_features[split].shape[1]
         self._validate_tables()
@@ -132,7 +145,7 @@ class RerankerTeacherDataset(Dataset):
         candidate_indices = np.asarray(record.candidate_indices)
         candidate_classes = np.asarray(record.candidate_class_indices)
         similarities = np.asarray(record.candidate_similarities)
-        targets = np.asarray(record.candidate_metrics.get(self.target))
+        targets = self._targets(record)
         candidate_count = len(candidate_indices)
         if candidate_count == 0:
             raise ValueError(f"Query {query_idx} has an empty candidate pool")
@@ -156,6 +169,26 @@ class RerankerTeacherDataset(Dataset):
             raise ValueError(f"Query {query_idx} has out-of-range feature indices")
         if not np.all(np.isfinite(similarities)) or not np.all(np.isfinite(targets)):
             raise ValueError(f"Query {query_idx} has non-finite model inputs or targets")
+
+    def _targets(self, record: Any) -> np.ndarray:
+        metrics = record.candidate_metrics
+        if self.target in RAW_TARGETS:
+            return np.asarray(metrics.get(self.target), dtype=np.float32)
+        if self.target == "bounded_margin":
+            values = np.asarray(metrics["margin"], dtype=np.float64)
+            scaled = np.clip(values / self.target_temperature, -80, 80)
+            return (1 / (1 + np.exp(-scaled))).astype(np.float32)
+        if self.target == "bounded_incremental_margin":
+            values = np.asarray(metrics["incremental_margin"], dtype=np.float64)
+            scaled = np.clip(values / self.target_temperature, -80, 80)
+            return (1 / (1 + np.exp(-scaled))).astype(np.float32)
+        if self.target == "normalized_incremental_probability":
+            one_shot = np.asarray(metrics["true_probability"], dtype=np.float64)
+            zero_shot = float(record.zero_shot_metrics["true_probability"])
+            denominator = np.maximum(one_shot, zero_shot) ** self.incremental_lambda
+            ratio = (one_shot - zero_shot) / np.maximum(denominator, 1e-12)
+            return np.clip((ratio + 1) / 2, 0, 1).astype(np.float32)
+        raise AssertionError(f"Unhandled target: {self.target}")
 
     def __len__(self) -> int:
         return len(self.records)
@@ -187,8 +220,17 @@ class RerankerTeacherDataset(Dataset):
             ),
             "retrieval_ranks": torch.arange(candidate_count, dtype=torch.float32)
             / rank_denominator,
-            "targets": torch.as_tensor(
-                np.asarray(record.candidate_metrics[self.target]), dtype=torch.float32
+            "targets": torch.as_tensor(self._targets(record), dtype=torch.float32),
+            # Evaluation-only teacher quantities. None is a permitted model input.
+            "teacher_margins": torch.as_tensor(
+                np.asarray(record.candidate_metrics["margin"]), dtype=torch.float32
+            ),
+            "teacher_probabilities": torch.as_tensor(
+                np.asarray(record.candidate_metrics["true_probability"]),
+                dtype=torch.float32,
+            ),
+            "teacher_correct": torch.as_tensor(
+                np.asarray(record.candidate_metrics["correct"]), dtype=torch.bool
             ),
         }
 
@@ -231,4 +273,7 @@ def collate_reranker_queries(items: Sequence[Mapping[str, Any]]) -> dict[str, An
         "clip_similarities": pad("clip_similarities"),
         "retrieval_ranks": pad("retrieval_ranks"),
         "targets": pad("targets"),
+        "teacher_margins": pad("teacher_margins"),
+        "teacher_probabilities": pad("teacher_probabilities"),
+        "teacher_correct": pad("teacher_correct"),
     }

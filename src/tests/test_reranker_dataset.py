@@ -110,6 +110,29 @@ def test_dataset_rejects_unknown_target_and_missing_split():
         RerankerTeacherDataset(_artifact(), split="val")
 
 
+def test_dataset_derives_bounded_and_normalized_targets():
+    bounded = RerankerTeacherDataset(
+        _artifact(), split="train", target="bounded_margin", target_temperature=2.0
+    )[0]["targets"]
+    expected = torch.sigmoid(torch.tensor([1.0, 2.0, 3.0]) / 2.0)
+    torch.testing.assert_close(bounded, expected)
+
+    normalized = RerankerTeacherDataset(
+        _artifact(),
+        split="train",
+        target="normalized_incremental_probability",
+        incremental_lambda=1.0,
+    )[0]["targets"]
+    assert torch.all((0 <= normalized) & (normalized <= 1))
+
+
+def test_dataset_exposes_teacher_metrics_only_for_evaluation():
+    item = RerankerTeacherDataset(_artifact(), split="train")[0]
+    assert item["teacher_margins"].shape == item["targets"].shape
+    assert item["teacher_correct"].dtype == torch.bool
+    assert "true_class_idx" not in item
+
+
 def test_dataset_model_and_loss_contract_supports_one_training_step():
     dataset = RerankerTeacherDataset(_artifact(), split="train")
     batch = collate_reranker_queries([dataset[0], dataset[1]])

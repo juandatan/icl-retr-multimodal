@@ -1,0 +1,56 @@
+experiment:
+  name: cub_200_siglip_mlp_probability
+  seed: 42
+
+data:
+  artifact_path: /workspace/icl-artifacts/cub-200-reranker-teacher-data-v2/reranker_teacher_data.pkl
+  train_split: train
+  val_split: val
+  # Paper-aligned first target. Controlled alternatives: bounded_margin,
+  # bounded_incremental_margin, normalized_incremental_probability.
+  target: true_probability
+  target_temperature: 1.0
+  incremental_lambda: 1.0
+  batch_size: 64
+  num_workers: 0
+  max_train_queries: null
+  max_val_queries: null
+
+model:
+  architecture: interaction_mlp
+  hidden_dim: 256
+  metadata_dim: 64
+  dropout: 0.1
+  # Minimal first experiment: only query image, exemplar image, and exemplar
+  # label embeddings in the shared SigLIP space.
+  use_clip_embeddings: false
+  use_clip_similarity: false
+  use_retrieval_rank: false
+  use_derived_siglip_similarities: false
+  transformer_layers: 2
+  transformer_heads: 4
+  transformer_ff_dim: 1024
+
+objective:
+  # pointwise_bce is the paper-aligned baseline. pairwise and huber are ablations.
+  name: pointwise_bce
+  pairwise_min_target_gap: 0.02
+  pairwise_score_temperature: 1.0
+  huber_delta: 1.0
+
+optimization:
+  epochs: 50
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  gradient_clip_norm: 1.0
+  early_stopping_patience: 8
+  # This is accuracy within the artifact's K=32 teacher label set. Full K=200
+  # evaluation is a separate post-training Idefics2 run.
+  monitor: restricted_selected_accuracy
+  monitor_mode: max
+  secondary_monitor: mean_margin_regret
+  secondary_monitor_mode: min
+  amp: false
+
+output:
+  dir: outputs/reranker_training

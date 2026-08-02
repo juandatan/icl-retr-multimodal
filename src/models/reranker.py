@@ -1,4 +1,4 @@
-"""Label-aware frozen-feature reranker for multimodal ICL exemplars."""
+"""Frozen-feature architectures for multimodal ICL exemplar reranking."""
 
 from dataclasses import dataclass
 
@@ -13,15 +13,38 @@ class RerankerConfig:
 
     clip_dim: int
     siglip_dim: int
+    architecture: str = "interaction_mlp"
     hidden_dim: int = 256
     metadata_dim: int = 64
     dropout: float = 0.1
+    use_clip_embeddings: bool = False
+    use_clip_similarity: bool = False
+    use_retrieval_rank: bool = False
+    use_derived_siglip_similarities: bool = False
+    transformer_layers: int = 2
+    transformer_heads: int = 4
+    transformer_ff_dim: int = 1024
 
     def __post_init__(self) -> None:
-        if min(self.clip_dim, self.siglip_dim, self.hidden_dim, self.metadata_dim) <= 0:
-            raise ValueError("All reranker dimensions must be positive")
+        if self.architecture not in {"interaction_mlp", "pooled_transformer"}:
+            raise ValueError(
+                "architecture must be 'interaction_mlp' or 'pooled_transformer'"
+            )
+        dimensions = (
+            self.clip_dim,
+            self.siglip_dim,
+            self.hidden_dim,
+            self.metadata_dim,
+            self.transformer_layers,
+            self.transformer_heads,
+            self.transformer_ff_dim,
+        )
+        if min(dimensions) <= 0:
+            raise ValueError("All reranker dimensions and layer counts must be positive")
         if not 0 <= self.dropout < 1:
             raise ValueError("dropout must be in [0, 1)")
+        if self.hidden_dim % self.transformer_heads:
+            raise ValueError("hidden_dim must be divisible by transformer_heads")
 
 
 class _ProjectionTower(nn.Module):
@@ -61,12 +84,12 @@ def _pair_features(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
 
 
 class LabelAwareReranker(nn.Module):
-    """Score candidate exemplars without running an image encoder at training time.
+    """Score each exemplar using only inference-available frozen features.
 
-    CLIP captures the retrieval geometry. SigLIP supplies a shared image/text
-    space in which the exemplar's class label can interact with both images.
-    Query and exemplar image towers share weights within each backbone so the
-    score is not tied to two arbitrary embedding coordinate systems.
+    The minimal controlled model consumes query-image, exemplar-image, and
+    exemplar-label SigLIP embeddings. CLIP and scalar retrieval priors are
+    independently switchable ablations. Candidates are deliberately independent:
+    no teacher target, query label, or candidate-set context enters the model.
     """
 
     def __init__(self, config: RerankerConfig) -> None:
@@ -74,27 +97,71 @@ class LabelAwareReranker(nn.Module):
         self.config = config
         hidden = config.hidden_dim
 
-        self.clip_image_tower = _ProjectionTower(
-            config.clip_dim, hidden, config.dropout
-        )
         self.siglip_image_tower = _ProjectionTower(
             config.siglip_dim, hidden, config.dropout
         )
         self.siglip_label_tower = _ProjectionTower(
             config.siglip_dim, hidden, config.dropout
         )
-        self.clip_interactions = _InteractionEncoder(
-            4 * hidden, hidden, config.dropout
-        )
-        self.siglip_interactions = _InteractionEncoder(
-            12 * hidden, hidden, config.dropout
-        )
-        self.metadata_encoder = nn.Sequential(
-            nn.LayerNorm(4),
-            nn.Linear(4, config.metadata_dim),
-            nn.GELU(),
-        )
-        fusion_dim = 2 * hidden + config.metadata_dim
+        if config.architecture == "interaction_mlp":
+            self.siglip_interactions = _InteractionEncoder(
+                12 * hidden, hidden, config.dropout
+            )
+            self.score_token = None
+            self.role_embeddings = None
+            self.transformer = None
+        else:
+            self.siglip_interactions = None
+            self.score_token = nn.Parameter(torch.empty(1, 1, hidden))
+            self.role_embeddings = nn.Parameter(torch.empty(1, 4, hidden))
+            nn.init.normal_(self.score_token, std=0.02)
+            nn.init.normal_(self.role_embeddings, std=0.02)
+            layer = nn.TransformerEncoderLayer(
+                d_model=hidden,
+                nhead=config.transformer_heads,
+                dim_feedforward=config.transformer_ff_dim,
+                dropout=config.dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.transformer = nn.TransformerEncoder(
+                layer,
+                num_layers=config.transformer_layers,
+                norm=nn.LayerNorm(hidden),
+                enable_nested_tensor=False,
+            )
+
+        if config.use_clip_embeddings:
+            self.clip_image_tower = _ProjectionTower(
+                config.clip_dim, hidden, config.dropout
+            )
+            self.clip_interactions = _InteractionEncoder(
+                4 * hidden, hidden, config.dropout
+            )
+        else:
+            self.clip_image_tower = None
+            self.clip_interactions = None
+
+        metadata_count = sum((
+            config.use_clip_similarity,
+            config.use_retrieval_rank,
+            2 * config.use_derived_siglip_similarities,
+        ))
+        if metadata_count:
+            self.metadata_encoder = nn.Sequential(
+                nn.LayerNorm(metadata_count),
+                nn.Linear(metadata_count, config.metadata_dim),
+                nn.GELU(),
+            )
+        else:
+            self.metadata_encoder = None
+
+        fusion_dim = hidden
+        if config.use_clip_embeddings:
+            fusion_dim += hidden
+        if metadata_count:
+            fusion_dim += config.metadata_dim
         self.scorer = nn.Sequential(
             nn.LayerNorm(fusion_dim),
             nn.Linear(fusion_dim, 2 * hidden),
@@ -126,19 +193,47 @@ class LabelAwareReranker(nn.Module):
             raise ValueError(
                 "Candidate features must have shape [batch, candidates, feature_dim]"
             )
-        batch, candidates = candidate_clip.shape[:2]
+        batch, candidates = candidate_siglip.shape[:2]
         expected_prefix = (batch, candidates)
         if (
             query_clip.shape != (batch, self.config.clip_dim)
             or candidate_clip.shape != (*expected_prefix, self.config.clip_dim)
             or query_siglip.shape != (batch, self.config.siglip_dim)
             or candidate_siglip.shape != (*expected_prefix, self.config.siglip_dim)
-            or candidate_label_siglip.shape != (*expected_prefix, self.config.siglip_dim)
+            or candidate_label_siglip.shape
+            != (*expected_prefix, self.config.siglip_dim)
             or clip_similarities.shape != expected_prefix
             or retrieval_ranks.shape != expected_prefix
         ):
             raise ValueError("Reranker input shapes do not match its configuration")
         return batch, candidates
+
+    def _siglip_representation(
+        self,
+        query: torch.Tensor,
+        candidate: torch.Tensor,
+        label: torch.Tensor,
+    ) -> torch.Tensor:
+        candidates = candidate.shape[1]
+        query_projected = self.siglip_image_tower(query).unsqueeze(1).expand(
+            -1, candidates, -1
+        )
+        candidate_projected = self.siglip_image_tower(candidate)
+        label_projected = self.siglip_label_tower(label)
+        if self.config.architecture == "interaction_mlp":
+            return self.siglip_interactions(torch.cat((
+                _pair_features(query_projected, candidate_projected),
+                _pair_features(query_projected, label_projected),
+                _pair_features(candidate_projected, label_projected),
+            ), dim=-1))
+
+        batch = query.shape[0]
+        score = self.score_token.expand(batch * candidates, -1, -1)
+        content = torch.stack(
+            (query_projected, candidate_projected, label_projected), dim=2
+        ).reshape(batch * candidates, 3, -1)
+        tokens = torch.cat((score, content), dim=1) + self.role_embeddings
+        return self.transformer(tokens)[:, 0].reshape(batch, candidates, -1)
 
     def forward(
         self,
@@ -161,56 +256,40 @@ class LabelAwareReranker(nn.Module):
             clip_similarities,
             retrieval_ranks,
         )
+        query_siglip = F.normalize(query_siglip, dim=-1)
+        candidate_siglip = F.normalize(candidate_siglip, dim=-1)
+        candidate_label_siglip = F.normalize(candidate_label_siglip, dim=-1)
+        representations = [self._siglip_representation(
+            query_siglip, candidate_siglip, candidate_label_siglip
+        )]
 
-        query_clip_normalized = F.normalize(query_clip, dim=-1)
-        candidate_clip_normalized = F.normalize(candidate_clip, dim=-1)
-        query_siglip_normalized = F.normalize(query_siglip, dim=-1)
-        candidate_siglip_normalized = F.normalize(candidate_siglip, dim=-1)
-        label_siglip_normalized = F.normalize(candidate_label_siglip, dim=-1)
+        if self.config.use_clip_embeddings:
+            query_clip = F.normalize(query_clip, dim=-1)
+            candidate_clip = F.normalize(candidate_clip, dim=-1)
+            query_projected = self.clip_image_tower(query_clip).unsqueeze(1).expand(
+                -1, candidates, -1
+            )
+            candidate_projected = self.clip_image_tower(candidate_clip)
+            representations.append(self.clip_interactions(
+                _pair_features(query_projected, candidate_projected)
+            ))
 
-        query_clip_projected = self.clip_image_tower(query_clip_normalized)
-        candidate_clip_projected = self.clip_image_tower(candidate_clip_normalized)
-        query_siglip_projected = self.siglip_image_tower(query_siglip_normalized)
-        candidate_siglip_projected = self.siglip_image_tower(
-            candidate_siglip_normalized
-        )
-        label_siglip_projected = self.siglip_label_tower(label_siglip_normalized)
+        metadata = []
+        if self.config.use_clip_similarity:
+            metadata.append(clip_similarities)
+        if self.config.use_retrieval_rank:
+            metadata.append(retrieval_ranks)
+        if self.config.use_derived_siglip_similarities:
+            metadata.extend((
+                torch.sum(
+                    query_siglip.unsqueeze(1) * candidate_label_siglip, dim=-1
+                ),
+                torch.sum(candidate_siglip * candidate_label_siglip, dim=-1),
+            ))
+        if metadata:
+            representations.append(self.metadata_encoder(torch.stack(metadata, dim=-1)))
 
-        query_clip_projected = query_clip_projected.unsqueeze(1).expand(
-            -1, candidates, -1
-        )
-        query_siglip_projected = query_siglip_projected.unsqueeze(1).expand(
-            -1, candidates, -1
-        )
-        clip_representation = self.clip_interactions(
-            _pair_features(query_clip_projected, candidate_clip_projected)
-        )
-        siglip_representation = self.siglip_interactions(torch.cat((
-            _pair_features(query_siglip_projected, candidate_siglip_projected),
-            _pair_features(query_siglip_projected, label_siglip_projected),
-            _pair_features(candidate_siglip_projected, label_siglip_projected),
-        ), dim=-1))
-
-        query_label_similarity = torch.sum(
-            query_siglip_normalized.unsqueeze(1) * label_siglip_normalized, dim=-1
-        )
-        exemplar_label_similarity = torch.sum(
-            candidate_siglip_normalized * label_siglip_normalized, dim=-1
-        )
-        metadata = torch.stack((
-            clip_similarities,
-            retrieval_ranks,
-            query_label_similarity,
-            exemplar_label_similarity,
-        ), dim=-1)
-        metadata_representation = self.metadata_encoder(metadata)
-
-        fused = torch.cat((
-            clip_representation,
-            siglip_representation,
-            metadata_representation,
-        ), dim=-1)
-        return self.scorer(fused).squeeze(-1)
+        return self.scorer(torch.cat(representations, dim=-1)).squeeze(-1)
 
     @staticmethod
     def select(scores: torch.Tensor, candidate_mask: torch.Tensor) -> torch.Tensor:
