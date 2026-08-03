@@ -32,7 +32,8 @@ model:
   transformer_ff_dim: 1024
 
 objective:
-  # pointwise_bce is the paper-aligned baseline. pairwise and huber are ablations.
+  # Options: pointwise_bce, pairwise, listwise_correctness, huber.
+  # listwise_correctness skips queries with no teacher-correct candidate.
   name: pointwise_bce
   pairwise_min_target_gap: 0.02
   pairwise_score_temperature: 1.0

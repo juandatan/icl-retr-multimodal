@@ -25,6 +25,7 @@ from src.data.reranker_dataset import (  # noqa: E402
     RerankerTeacherDataset,
     collate_reranker_queries,
 )
+from src.losses.listwise import MultiplePositiveListwiseLoss  # noqa: E402
 from src.losses.pairwise_ranking import PairwiseRankingLoss  # noqa: E402
 from src.losses.pointwise import MaskedHuberLoss, MaskedSoftLabelBCELoss  # noqa: E402
 from src.models.reranker import LabelAwareReranker, RerankerConfig  # noqa: E402
@@ -85,6 +86,8 @@ def _build_objective(cfg: DictConfig):
             min_target_gap=float(cfg.objective.pairwise_min_target_gap),
             score_temperature=float(cfg.objective.pairwise_score_temperature),
         )
+    if name == "listwise_correctness":
+        return MultiplePositiveListwiseLoss()
     if name == "huber":
         return MaskedHuberLoss(delta=float(cfg.objective.huber_delta))
     raise ValueError(f"Unsupported objective: {name}")
@@ -105,6 +108,12 @@ def _validate_target_objective(target: str, objective: str) -> None:
 
 def _model_scores(model, batch):
     return model(**{name: batch[name] for name in MODEL_INPUTS})
+
+
+def _objective_targets(batch: dict[str, Any], objective_name: str) -> torch.Tensor:
+    if objective_name == "listwise_correctness":
+        return batch["teacher_correct"]
+    return batch["targets"]
 
 
 def _atomic_torch_save(value: Any, path: Path) -> None:
@@ -188,7 +197,9 @@ def _print_final_summary(
 
 
 @torch.no_grad()
-def evaluate(model, loader, objective, device, use_amp: bool) -> dict[str, float]:
+def evaluate(
+    model, loader, objective, objective_name: str, device, use_amp: bool
+) -> dict[str, float]:
     model.eval()
     losses = []
     collected = {name: [] for name in (
@@ -201,7 +212,11 @@ def evaluate(model, loader, objective, device, use_amp: bool) -> dict[str, float
             enabled=use_amp and device.type == "cuda",
         ):
             scores = _model_scores(model, batch)
-            loss = objective(scores, batch["targets"], batch["candidate_mask"])
+            loss = objective(
+                scores,
+                _objective_targets(batch, objective_name),
+                batch["candidate_mask"],
+            )
         losses.append(float(loss.item()))
         values = {
             "scores": scores,
@@ -225,7 +240,14 @@ def evaluate(model, loader, objective, device, use_amp: bool) -> dict[str, float
 
 
 def train_one_epoch(
-    model, loader, objective, optimizer, device, gradient_clip_norm: float, use_amp: bool
+    model,
+    loader,
+    objective,
+    objective_name: str,
+    optimizer,
+    device,
+    gradient_clip_norm: float,
+    use_amp: bool,
 ) -> float:
     model.train()
     losses = []
@@ -237,7 +259,11 @@ def train_one_epoch(
             enabled=use_amp and device.type == "cuda",
         ):
             scores = _model_scores(model, batch)
-            loss = objective(scores, batch["targets"], batch["candidate_mask"])
+            loss = objective(
+                scores,
+                _objective_targets(batch, objective_name),
+                batch["candidate_mask"],
+            )
         loss.backward()
         if gradient_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
@@ -336,13 +362,19 @@ def main(cfg: DictConfig) -> None:
             model,
             train_loader,
             objective,
+            objective_name,
             optimizer,
             device,
             float(cfg.optimization.gradient_clip_norm),
             bool(cfg.optimization.amp),
         )
         metrics = evaluate(
-            model, val_loader, objective, device, bool(cfg.optimization.amp)
+            model,
+            val_loader,
+            objective,
+            objective_name,
+            device,
+            bool(cfg.optimization.amp),
         )
         row = {
             "epoch": epoch,
