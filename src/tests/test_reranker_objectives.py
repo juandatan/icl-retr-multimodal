@@ -2,7 +2,10 @@ import numpy as np
 import pytest
 import torch
 
-from src.losses.listwise import MultiplePositiveListwiseLoss
+from src.losses.listwise import (
+    HybridListwisePairwiseLoss,
+    MultiplePositiveListwiseLoss,
+)
 from src.losses.pointwise import MaskedHuberLoss, MaskedSoftLabelBCELoss
 from src.utils.reranker_metrics import reranker_selection_metrics
 
@@ -66,6 +69,30 @@ def test_multiple_positive_listwise_ignores_padding_and_all_negative_batches():
     zero.backward()
     assert zero.item() == 0.0
     assert torch.all(all_negative_scores.grad == 0)
+
+
+def test_hybrid_adds_listwise_term_and_retains_no_positive_pairwise_loss():
+    scores = torch.zeros((1, 3), requires_grad=True)
+    margins = torch.tensor([[2.0, 0.0, -1.0]])
+    mask = torch.ones(1, 3, dtype=torch.bool)
+    objective = HybridListwisePairwiseLoss(listwise_weight=0.25)
+
+    hybrid = objective(
+        scores,
+        margins,
+        torch.tensor([[True, False, False]]),
+        mask,
+    )
+    expected = np.log(2.0) + 0.25 * np.log(3.0)
+    assert hybrid.item() == pytest.approx(expected)
+
+    no_positive = objective(
+        scores,
+        margins,
+        torch.zeros(1, 3, dtype=torch.bool),
+        mask,
+    )
+    assert no_positive.item() == pytest.approx(np.log(2.0))
 
 
 def test_selection_metrics_report_accuracy_regret_and_rank_agreement():

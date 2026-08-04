@@ -32,9 +32,11 @@ model:
   transformer_ff_dim: 1024
 
 objective:
-  # Options: pointwise_bce, pairwise, listwise_correctness, huber.
+  # Options: pointwise_bce, pairwise, listwise_correctness,
+  # hybrid_listwise_pairwise, huber.
   # listwise_correctness skips queries with no teacher-correct candidate.
   name: pointwise_bce
+  hybrid_listwise_weight: 0.25
   pairwise_min_target_gap: 0.02
   pairwise_score_temperature: 1.0
   huber_delta: 1.0

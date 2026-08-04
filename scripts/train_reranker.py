@@ -25,7 +25,10 @@ from src.data.reranker_dataset import (  # noqa: E402
     RerankerTeacherDataset,
     collate_reranker_queries,
 )
-from src.losses.listwise import MultiplePositiveListwiseLoss  # noqa: E402
+from src.losses.listwise import (  # noqa: E402
+    HybridListwisePairwiseLoss,
+    MultiplePositiveListwiseLoss,
+)
 from src.losses.pairwise_ranking import PairwiseRankingLoss  # noqa: E402
 from src.losses.pointwise import MaskedHuberLoss, MaskedSoftLabelBCELoss  # noqa: E402
 from src.models.reranker import LabelAwareReranker, RerankerConfig  # noqa: E402
@@ -88,6 +91,12 @@ def _build_objective(cfg: DictConfig):
         )
     if name == "listwise_correctness":
         return MultiplePositiveListwiseLoss()
+    if name == "hybrid_listwise_pairwise":
+        return HybridListwisePairwiseLoss(
+            listwise_weight=float(cfg.objective.hybrid_listwise_weight),
+            min_target_gap=float(cfg.objective.pairwise_min_target_gap),
+            score_temperature=float(cfg.objective.pairwise_score_temperature),
+        )
     if name == "huber":
         return MaskedHuberLoss(delta=float(cfg.objective.huber_delta))
     raise ValueError(f"Unsupported objective: {name}")
@@ -104,6 +113,10 @@ def _validate_target_objective(target: str, objective: str) -> None:
         raise ValueError(
             f"pointwise_bce requires a [0,1] target; got {target!r}"
         )
+    if objective == "hybrid_listwise_pairwise" and target != "margin":
+        raise ValueError(
+            "hybrid_listwise_pairwise requires data.target=margin"
+        )
 
 
 def _model_scores(model, batch):
@@ -114,6 +127,32 @@ def _objective_targets(batch: dict[str, Any], objective_name: str) -> torch.Tens
     if objective_name == "listwise_correctness":
         return batch["teacher_correct"]
     return batch["targets"]
+
+
+def _objective_loss(objective, objective_name: str, scores, batch):
+    if objective_name == "hybrid_listwise_pairwise":
+        return objective(
+            scores,
+            batch["targets"],
+            batch["teacher_correct"],
+            batch["candidate_mask"],
+        )
+    return objective(
+        scores,
+        _objective_targets(batch, objective_name),
+        batch["candidate_mask"],
+    )
+
+
+def _hybrid_objective_components(objective, scores, batch) -> dict[str, float]:
+    return {
+        "pairwise_loss_component": float(objective.pairwise(
+            scores, batch["targets"], batch["candidate_mask"]
+        ).item()),
+        "listwise_loss_component": float(objective.listwise(
+            scores, batch["teacher_correct"], batch["candidate_mask"]
+        ).item()),
+    }
 
 
 def _atomic_torch_save(value: Any, path: Path) -> None:
@@ -140,6 +179,12 @@ def _print_epoch_metrics(
         f"  Loss       train {train_loss:.6f}   "
         f"validation {metrics['loss']:.6f}"
     )
+    if "pairwise_loss_component" in metrics:
+        print(
+            "  Components "
+            f"pairwise {metrics['pairwise_loss_component']:.6f}   "
+            f"listwise {metrics['listwise_loss_component']:.6f}"
+        )
     print(
         "  Selection  "
         f"accuracy {metrics['restricted_selected_accuracy']:.3%}   "
@@ -184,6 +229,12 @@ def _print_final_summary(
         f"    loss {best_metrics['loss']:.6f}   "
         f"accuracy {best_metrics['restricted_selected_accuracy']:.3%}"
     )
+    if "pairwise_loss_component" in best_metrics:
+        print(
+            "    loss components  "
+            f"pairwise {best_metrics['pairwise_loss_component']:.6f}   "
+            f"listwise {best_metrics['listwise_loss_component']:.6f}"
+        )
     print(
         f"    selected margin {best_metrics['mean_selected_margin']:.6f}   "
         f"margin regret {best_metrics['mean_margin_regret']:.6f}   "
@@ -202,6 +253,7 @@ def evaluate(
 ) -> dict[str, float]:
     model.eval()
     losses = []
+    component_losses: dict[str, list[float]] = {}
     collected = {name: [] for name in (
         "scores", "targets", "teacher_margins", "teacher_correct", "candidate_mask"
     )}
@@ -212,11 +264,12 @@ def evaluate(
             enabled=use_amp and device.type == "cuda",
         ):
             scores = _model_scores(model, batch)
-            loss = objective(
-                scores,
-                _objective_targets(batch, objective_name),
-                batch["candidate_mask"],
-            )
+            loss = _objective_loss(objective, objective_name, scores, batch)
+            if objective_name == "hybrid_listwise_pairwise":
+                for name, value in _hybrid_objective_components(
+                    objective, scores, batch
+                ).items():
+                    component_losses.setdefault(name, []).append(value)
         losses.append(float(loss.item()))
         values = {
             "scores": scores,
@@ -236,6 +289,10 @@ def evaluate(
         arrays["candidate_mask"],
     )
     metrics["loss"] = float(np.mean(losses))
+    metrics.update({
+        name: float(np.mean(values))
+        for name, values in component_losses.items()
+    })
     return metrics
 
 
@@ -259,11 +316,7 @@ def train_one_epoch(
             enabled=use_amp and device.type == "cuda",
         ):
             scores = _model_scores(model, batch)
-            loss = objective(
-                scores,
-                _objective_targets(batch, objective_name),
-                batch["candidate_mask"],
-            )
+            loss = _objective_loss(objective, objective_name, scores, batch)
         loss.backward()
         if gradient_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
@@ -327,6 +380,15 @@ def main(cfg: DictConfig) -> None:
         f"{len(train_data)} train / {len(val_data)} val queries; "
         f"{parameter_count:,} parameters"
     )
+    run_description = (
+        f"Run {cfg.experiment.name}: seed={seed}, target={target}, "
+        f"objective={objective_name}"
+    )
+    if objective_name == "hybrid_listwise_pairwise":
+        run_description += (
+            f", listwise_weight={float(cfg.objective.hybrid_listwise_weight):g}"
+        )
+    print(run_description)
 
     run_dir = Path(cfg.output.dir) / str(cfg.experiment.name)
     run_dir.mkdir(parents=True, exist_ok=True)
