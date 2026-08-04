@@ -1,0 +1,42 @@
+from copy import deepcopy
+
+from omegaconf import OmegaConf
+
+from scripts.train_reranker import _resolve_experiment_name
+
+
+def _config():
+    return {
+        "experiment": {"name": "auto", "seed": 40},
+        "data": {"artifact_path": "/machine-a/teacher.pkl", "target": "margin"},
+        "model": {"architecture": "interaction_mlp", "hidden_dim": 256},
+        "objective": {
+            "name": "hybrid_listwise_pairwise",
+            "hybrid_listwise_weight": 0.1,
+        },
+        "optimization": {"learning_rate": 3e-4},
+    }
+
+
+def test_auto_experiment_name_is_stable_and_ignores_artifact_location():
+    first = _config()
+    second = deepcopy(first)
+    second["data"]["artifact_path"] = "/machine-b/copied-teacher.pkl"
+    first_name = _resolve_experiment_name(OmegaConf.create(first))
+    second_name = _resolve_experiment_name(OmegaConf.create(second))
+    assert first_name == second_name
+    assert first_name.startswith(
+        "interaction_mlp-margin-hybrid_listwise_pairwise-seed40-"
+    )
+
+
+def test_auto_experiment_name_changes_with_ablation_and_honors_explicit_name():
+    baseline = _config()
+    ablation = deepcopy(baseline)
+    ablation["objective"]["hybrid_listwise_weight"] = 0.5
+    assert _resolve_experiment_name(OmegaConf.create(baseline)) != (
+        _resolve_experiment_name(OmegaConf.create(ablation))
+    )
+
+    baseline["experiment"]["name"] = "my-explicit-run"
+    assert _resolve_experiment_name(OmegaConf.create(baseline)) == "my-explicit-run"

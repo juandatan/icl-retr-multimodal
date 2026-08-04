@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import pickle
 import random
+import re
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -45,6 +47,39 @@ MODEL_INPUTS = (
     "clip_similarities",
     "retrieval_ranks",
 )
+
+
+def _safe_name_component(value: Any) -> str:
+    component = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value)).strip("-._")
+    return component or "unset"
+
+
+def _resolve_experiment_name(cfg: DictConfig) -> str:
+    """Return an explicit name or a stable summary plus config fingerprint."""
+    configured = cfg.experiment.get("name")
+    if configured is not None and str(configured).strip().lower() not in {"", "auto"}:
+        return str(configured)
+
+    data_config = OmegaConf.to_container(cfg.data, resolve=True)
+    # Paths vary across machines without changing the experiment itself.
+    data_config.pop("artifact_path", None)
+    signature = {
+        "seed": int(cfg.experiment.seed),
+        "data": data_config,
+        "model": OmegaConf.to_container(cfg.model, resolve=True),
+        "objective": OmegaConf.to_container(cfg.objective, resolve=True),
+        "optimization": OmegaConf.to_container(cfg.optimization, resolve=True),
+    }
+    encoded = json.dumps(signature, sort_keys=True, separators=(",", ":")).encode()
+    fingerprint = hashlib.sha256(encoded).hexdigest()[:8]
+    parts = (
+        cfg.model.architecture,
+        cfg.data.target,
+        cfg.objective.name,
+        f"seed{int(cfg.experiment.seed)}",
+        fingerprint,
+    )
+    return "-".join(_safe_name_component(part) for part in parts)
 
 
 def _seed_everything(seed: int) -> None:
@@ -328,6 +363,7 @@ def train_one_epoch(
 @hydra.main(version_base=None, config_path="../configs", config_name="train_reranker")
 def main(cfg: DictConfig) -> None:
     seed = int(cfg.experiment.seed)
+    experiment_name = _resolve_experiment_name(cfg)
     _seed_everything(seed)
     target = str(cfg.data.target)
     objective_name = str(cfg.objective.name)
@@ -381,7 +417,7 @@ def main(cfg: DictConfig) -> None:
         f"{parameter_count:,} parameters"
     )
     run_description = (
-        f"Run {cfg.experiment.name}: seed={seed}, target={target}, "
+        f"Run {experiment_name}: seed={seed}, target={target}, "
         f"objective={objective_name}"
     )
     if objective_name == "hybrid_listwise_pairwise":
@@ -390,7 +426,7 @@ def main(cfg: DictConfig) -> None:
         )
     print(run_description)
 
-    run_dir = Path(cfg.output.dir) / str(cfg.experiment.name)
+    run_dir = Path(cfg.output.dir) / experiment_name
     run_dir.mkdir(parents=True, exist_ok=True)
     monitor = str(cfg.optimization.monitor)
     monitor_mode = str(cfg.optimization.monitor_mode)
@@ -409,6 +445,7 @@ def main(cfg: DictConfig) -> None:
     patience = 0
     history = []
     provenance = {
+        "experiment_name": experiment_name,
         "artifact_path": str(artifact_path.resolve()),
         "artifact_sha256": file_sha256(artifact_path),
         "artifact_immutable_args": artifact.get("immutable_args"),
@@ -481,6 +518,7 @@ def main(cfg: DictConfig) -> None:
             "epochs_without_improvement": patience,
         })
         checkpoint = {
+            "experiment_name": experiment_name,
             "model_state_dict": model.state_dict(),
             "model_config": asdict(model_config),
             "resolved_config": OmegaConf.to_container(cfg, resolve=True),

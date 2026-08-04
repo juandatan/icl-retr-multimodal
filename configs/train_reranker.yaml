@@ -1,5 +1,6 @@
 experiment:
-  name: cub_200_siglip_mlp_probability
+  # "auto" derives a readable name plus a stable config fingerprint.
+  name: auto
   seed: 42
 
 data:
