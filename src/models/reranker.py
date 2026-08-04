@@ -24,11 +24,19 @@ class RerankerConfig:
     transformer_layers: int = 2
     transformer_heads: int = 4
     transformer_ff_dim: int = 1024
+    candidate_context_layers: int = 1
+    candidate_context_heads: int = 4
+    candidate_context_ff_dim: int = 512
 
     def __post_init__(self) -> None:
-        if self.architecture not in {"interaction_mlp", "pooled_transformer"}:
+        architectures = {
+            "interaction_mlp",
+            "pooled_transformer",
+            "cross_candidate_attention",
+        }
+        if self.architecture not in architectures:
             raise ValueError(
-                "architecture must be 'interaction_mlp' or 'pooled_transformer'"
+                f"architecture must be one of {sorted(architectures)}"
             )
         dimensions = (
             self.clip_dim,
@@ -38,6 +46,9 @@ class RerankerConfig:
             self.transformer_layers,
             self.transformer_heads,
             self.transformer_ff_dim,
+            self.candidate_context_layers,
+            self.candidate_context_heads,
+            self.candidate_context_ff_dim,
         )
         if min(dimensions) <= 0:
             raise ValueError("All reranker dimensions and layer counts must be positive")
@@ -45,6 +56,10 @@ class RerankerConfig:
             raise ValueError("dropout must be in [0, 1)")
         if self.hidden_dim % self.transformer_heads:
             raise ValueError("hidden_dim must be divisible by transformer_heads")
+        if self.hidden_dim % self.candidate_context_heads:
+            raise ValueError(
+                "hidden_dim must be divisible by candidate_context_heads"
+            )
 
 
 class _ProjectionTower(nn.Module):
@@ -88,8 +103,10 @@ class LabelAwareReranker(nn.Module):
 
     The minimal controlled model consumes query-image, exemplar-image, and
     exemplar-label SigLIP embeddings. CLIP and scalar retrieval priors are
-    independently switchable ablations. Candidates are deliberately independent:
-    no teacher target, query label, or candidate-set context enters the model.
+    independently switchable ablations. The default architectures score
+    candidates independently; ``cross_candidate_attention`` adds masked,
+    permutation-equivariant context across the candidate pool. No teacher
+    target or query label enters any model input.
     """
 
     def __init__(self, config: RerankerConfig) -> None:
@@ -103,7 +120,10 @@ class LabelAwareReranker(nn.Module):
         self.siglip_label_tower = _ProjectionTower(
             config.siglip_dim, hidden, config.dropout
         )
-        if config.architecture == "interaction_mlp":
+        if config.architecture in {
+            "interaction_mlp",
+            "cross_candidate_attention",
+        }:
             self.siglip_interactions = _InteractionEncoder(
                 12 * hidden, hidden, config.dropout
             )
@@ -131,6 +151,25 @@ class LabelAwareReranker(nn.Module):
                 norm=nn.LayerNorm(hidden),
                 enable_nested_tensor=False,
             )
+
+        if config.architecture == "cross_candidate_attention":
+            context_layer = nn.TransformerEncoderLayer(
+                d_model=hidden,
+                nhead=config.candidate_context_heads,
+                dim_feedforward=config.candidate_context_ff_dim,
+                dropout=config.dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.candidate_context = nn.TransformerEncoder(
+                context_layer,
+                num_layers=config.candidate_context_layers,
+                norm=nn.LayerNorm(hidden),
+                enable_nested_tensor=False,
+            )
+        else:
+            self.candidate_context = None
 
         if config.use_clip_embeddings:
             self.clip_image_tower = _ProjectionTower(
@@ -182,6 +221,7 @@ class LabelAwareReranker(nn.Module):
         candidate_label_siglip: torch.Tensor,
         clip_similarities: torch.Tensor,
         retrieval_ranks: torch.Tensor,
+        candidate_mask: torch.Tensor,
     ) -> tuple[int, int]:
         if query_clip.ndim != 2 or query_siglip.ndim != 2:
             raise ValueError("Query features must have shape [batch, feature_dim]")
@@ -204,8 +244,13 @@ class LabelAwareReranker(nn.Module):
             != (*expected_prefix, self.config.siglip_dim)
             or clip_similarities.shape != expected_prefix
             or retrieval_ranks.shape != expected_prefix
+            or candidate_mask.shape != expected_prefix
         ):
             raise ValueError("Reranker input shapes do not match its configuration")
+        if candidate_mask.dtype != torch.bool:
+            raise ValueError("candidate_mask must be boolean")
+        if not candidate_mask.any(dim=1).all():
+            raise ValueError("Every query must have at least one valid candidate")
         return batch, candidates
 
     def _siglip_representation(
@@ -220,7 +265,10 @@ class LabelAwareReranker(nn.Module):
         )
         candidate_projected = self.siglip_image_tower(candidate)
         label_projected = self.siglip_label_tower(label)
-        if self.config.architecture == "interaction_mlp":
+        if self.config.architecture in {
+            "interaction_mlp",
+            "cross_candidate_attention",
+        }:
             return self.siglip_interactions(torch.cat((
                 _pair_features(query_projected, candidate_projected),
                 _pair_features(query_projected, label_projected),
@@ -245,6 +293,7 @@ class LabelAwareReranker(nn.Module):
         candidate_label_siglip: torch.Tensor,
         clip_similarities: torch.Tensor,
         retrieval_ranks: torch.Tensor,
+        candidate_mask: torch.Tensor,
     ) -> torch.Tensor:
         """Return one unbounded utility score per candidate."""
         _, candidates = self._validate_inputs(
@@ -255,13 +304,23 @@ class LabelAwareReranker(nn.Module):
             candidate_label_siglip,
             clip_similarities,
             retrieval_ranks,
+            candidate_mask,
         )
         query_siglip = F.normalize(query_siglip, dim=-1)
         candidate_siglip = F.normalize(candidate_siglip, dim=-1)
         candidate_label_siglip = F.normalize(candidate_label_siglip, dim=-1)
-        representations = [self._siglip_representation(
+        siglip_representation = self._siglip_representation(
             query_siglip, candidate_siglip, candidate_label_siglip
-        )]
+        )
+        if self.candidate_context is not None:
+            siglip_representation = self.candidate_context(
+                siglip_representation,
+                src_key_padding_mask=~candidate_mask,
+            )
+            siglip_representation = siglip_representation.masked_fill(
+                ~candidate_mask.unsqueeze(-1), 0.0
+            )
+        representations = [siglip_representation]
 
         if self.config.use_clip_embeddings:
             query_clip = F.normalize(query_clip, dim=-1)

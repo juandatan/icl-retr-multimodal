@@ -46,6 +46,7 @@ MODEL_INPUTS = (
     "candidate_label_siglip",
     "clip_similarities",
     "retrieval_ranks",
+    "candidate_mask",
 )
 
 
@@ -425,6 +426,23 @@ def main(cfg: DictConfig) -> None:
             f", listwise_weight={float(cfg.objective.hybrid_listwise_weight):g}"
         )
     print(run_description)
+    optional_inputs = [
+        name
+        for name, enabled in (
+            ("clip_embeddings", model_config.use_clip_embeddings),
+            ("clip_similarity", model_config.use_clip_similarity),
+            ("retrieval_rank", model_config.use_retrieval_rank),
+            (
+                "derived_siglip_similarities",
+                model_config.use_derived_siglip_similarities,
+            ),
+        )
+        if enabled
+    ]
+    print(
+        "Optional inputs: "
+        + (", ".join(optional_inputs) if optional_inputs else "none")
+    )
 
     run_dir = Path(cfg.output.dir) / experiment_name
     run_dir.mkdir(parents=True, exist_ok=True)

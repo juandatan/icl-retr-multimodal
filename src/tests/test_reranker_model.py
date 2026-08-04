@@ -17,6 +17,7 @@ def _inputs(batch=2, candidates=4):
         "retrieval_ranks": torch.arange(candidates, dtype=torch.float32)
         .repeat(batch, 1)
         / max(candidates - 1, 1),
+        "candidate_mask": torch.ones(batch, candidates, dtype=torch.bool),
     }
 
 
@@ -54,6 +55,7 @@ def test_candidate_permutation_only_permutes_scores():
         "candidate_label_siglip",
         "clip_similarities",
         "retrieval_ranks",
+        "candidate_mask",
     }
     permuted = {
         key: value[:, permutation] if key in candidate_keys else value
@@ -87,6 +89,77 @@ def test_pooled_transformer_scores_candidates_and_backpropagates():
     scores.sum().backward()
     assert scores.shape == (2, 4)
     assert model.score_token.grad is not None
+
+
+def _cross_candidate_model():
+    return LabelAwareReranker(RerankerConfig(
+        clip_dim=6,
+        siglip_dim=8,
+        architecture="cross_candidate_attention",
+        hidden_dim=16,
+        dropout=0.0,
+        candidate_context_heads=4,
+        candidate_context_layers=1,
+        candidate_context_ff_dim=32,
+    )).eval()
+
+
+def test_cross_candidate_attention_is_permutation_equivariant():
+    model = _cross_candidate_model()
+    inputs = _inputs(batch=1, candidates=4)
+    permutation = torch.tensor([2, 0, 3, 1])
+    candidate_keys = {
+        "candidate_clip",
+        "candidate_siglip",
+        "candidate_label_siglip",
+        "clip_similarities",
+        "retrieval_ranks",
+        "candidate_mask",
+    }
+    permuted = {
+        key: value[:, permutation] if key in candidate_keys else value
+        for key, value in inputs.items()
+    }
+    with torch.no_grad():
+        original_scores = model(**inputs)
+        permuted_scores = model(**permuted)
+    torch.testing.assert_close(permuted_scores, original_scores[:, permutation])
+
+
+def test_cross_candidate_attention_scores_candidates_and_backpropagates():
+    model = _cross_candidate_model().train()
+    scores = model(**_inputs())
+    scores.sum().backward()
+    assert scores.shape == (2, 4)
+    assert all(
+        parameter.grad is not None
+        for parameter in model.candidate_context.parameters()
+        if parameter.requires_grad
+    )
+
+
+def test_cross_candidate_attention_masks_padding_and_uses_other_candidates():
+    model = _cross_candidate_model()
+    inputs = _inputs(batch=1, candidates=4)
+    inputs["candidate_mask"][0, 3] = False
+
+    changed_padding = {key: value.clone() for key, value in inputs.items()}
+    changed_padding["candidate_siglip"][0, 3] = 1000
+    changed_padding["candidate_label_siglip"][0, 3] = -1000
+    with torch.no_grad():
+        original_scores = model(**inputs)
+        changed_padding_scores = model(**changed_padding)
+    torch.testing.assert_close(
+        changed_padding_scores[:, :3], original_scores[:, :3]
+    )
+
+    changed_candidate = {key: value.clone() for key, value in inputs.items()}
+    changed_candidate["candidate_siglip"][0, 1] *= -3
+    with torch.no_grad():
+        changed_candidate_scores = model(**changed_candidate)
+    assert not torch.isclose(
+        changed_candidate_scores[0, 0], original_scores[0, 0]
+    )
 
 
 def test_optional_clip_and_metadata_branches_are_independent_ablation_flags():

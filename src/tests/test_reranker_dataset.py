@@ -152,6 +152,7 @@ def test_dataset_model_and_loss_contract_supports_one_training_step():
         candidate_label_siglip=batch["candidate_label_siglip"],
         clip_similarities=batch["clip_similarities"],
         retrieval_ranks=batch["retrieval_ranks"],
+        candidate_mask=batch["candidate_mask"],
     )
     loss = PairwiseRankingLoss(min_target_gap=0.0)(
         scores,

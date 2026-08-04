@@ -31,6 +31,10 @@ model:
   transformer_layers: 2
   transformer_heads: 4
   transformer_ff_dim: 1024
+  # Used only by cross_candidate_attention. No positional embeddings are added.
+  candidate_context_layers: 1
+  candidate_context_heads: 4
+  candidate_context_ff_dim: 512
 
 objective:
   # Options: pointwise_bce, pairwise, listwise_correctness,
