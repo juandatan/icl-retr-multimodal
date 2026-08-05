@@ -3,14 +3,24 @@
 from __future__ import annotations
 
 import copy
+import json
 from typing import Dict, List, Optional, Tuple
 
 import torch
 from PIL import Image
+from huggingface_hub import hf_hub_download
+from safetensors import safe_open
 from transformers import (
+    AutoConfig,
     AutoModelForImageTextToText,
-    AutoProcessor,
+    AutoTokenizer,
     BitsAndBytesConfig,
+    Idefics2ImageProcessor,
+    Idefics2Processor,
+)
+from transformers.models.idefics2.modeling_idefics2 import (
+    Idefics2Connector,
+    Idefics2VisionTransformer,
 )
 
 FULL_SEQUENCE_SCORING = "full_sequence_batch"
@@ -19,6 +29,174 @@ SUPPORTED_SCORING_MODES = frozenset({
     FULL_SEQUENCE_SCORING,
     PREFIX_KV_CACHE_SCORING,
 })
+FEATURE_WEIGHT_PREFIXES = (
+    "model.vision_model.",
+    "model.connector.",
+)
+FEATURE_EMBEDDING_KEY = "model.text_model.embed_tokens.weight"
+
+
+def _build_idefics2_processor(model_name: str) -> Idefics2Processor:
+    """Build the checkpoint processor without AutoImageProcessor inference.
+
+    These values are the published ``HuggingFaceM4/idefics2-8b``
+    ``preprocessor_config.json`` and ``processor_config.json`` settings. The
+    retained evaluation pipeline disables image splitting immediately after
+    construction, as it did when teacher targets were generated.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    image_processor = Idefics2ImageProcessor(
+        do_convert_rgb=True,
+        do_image_splitting=True,
+        do_normalize=True,
+        do_pad=True,
+        do_rescale=True,
+        do_resize=True,
+        image_mean=[0.5, 0.5, 0.5],
+        image_std=[0.5, 0.5, 0.5],
+        resample=2,
+        rescale_factor=1 / 255,
+        size={"longest_edge": 980, "shortest_edge": 378},
+    )
+    return Idefics2Processor(
+        image_processor=image_processor,
+        tokenizer=tokenizer,
+        image_seq_len=64,
+    )
+
+
+class _Idefics2FeatureOnlyModel(torch.nn.Module):
+    """Idefics2 image path and input embeddings without the language model."""
+
+    def __init__(self, config, *, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.config = config
+        self.vision_model = Idefics2VisionTransformer._from_config(
+            config.vision_config
+        ).to(dtype=dtype)
+        self.connector = Idefics2Connector(config).to(dtype=dtype)
+        self.embed_tokens = torch.nn.Embedding(
+            config.text_config.vocab_size,
+            config.text_config.hidden_size,
+            padding_idx=config.text_config.pad_token_id,
+            dtype=dtype,
+        )
+        self.feature_source_files: list[str] = []
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return next(self.vision_model.parameters()).dtype
+
+    def get_input_embeddings(self) -> torch.nn.Module:
+        return self.embed_tokens
+
+    def get_image_features(
+        self,
+        pixel_values: torch.Tensor,
+        pixel_attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        batch_size, num_images = pixel_values.shape[:2]
+        pixel_values = pixel_values.to(dtype=self.dtype)
+        pixel_values = pixel_values.view(
+            batch_size * num_images, *pixel_values.shape[2:]
+        )
+        values_per_image = pixel_values.shape[1:].numel()
+        real_images = (
+            (pixel_values == 0.0).sum(dim=(-1, -2, -3)) != values_per_image
+        )
+        pixel_values = pixel_values[real_images].contiguous()
+        if pixel_attention_mask is None:
+            pixel_attention_mask = torch.ones(
+                (pixel_values.size(0), pixel_values.size(2), pixel_values.size(3)),
+                dtype=torch.bool,
+                device=pixel_values.device,
+            )
+        else:
+            pixel_attention_mask = pixel_attention_mask.view(
+                batch_size * num_images, *pixel_attention_mask.shape[2:]
+            )[real_images].contiguous()
+
+        patch_size = self.config.vision_config.patch_size
+        patches = pixel_attention_mask.unfold(1, patch_size, patch_size)
+        patches = patches.unfold(2, patch_size, patch_size)
+        patch_attention_mask = (
+            patches.sum(dim=(-1, -2)) == patch_size * patch_size
+        ).bool()
+        image_outputs = self.vision_model(
+            pixel_values=pixel_values,
+            patch_attention_mask=patch_attention_mask,
+        )
+        return self.connector(
+            image_outputs.last_hidden_state,
+            attention_mask=patch_attention_mask.view(pixel_values.size(0), -1),
+        )
+
+
+def _load_module_prefix(
+    handle: safe_open,
+    module: torch.nn.Module,
+    prefix: str,
+) -> None:
+    state = {
+        key.removeprefix(prefix): handle.get_tensor(key)
+        for key in handle.keys()
+        if key.startswith(prefix)
+    }
+    if not state:
+        raise ValueError(f"Feature checkpoint has no tensors under {prefix!r}")
+    module.load_state_dict(state, strict=True)
+
+
+def _load_idefics2_feature_only_model(
+    model_name: str,
+    *,
+    device: str,
+) -> _Idefics2FeatureOnlyModel:
+    """Download and load only shards containing feature-extraction tensors."""
+    config = AutoConfig.from_pretrained(model_name)
+    index_path = hf_hub_download(
+        repo_id=model_name,
+        filename="model.safetensors.index.json",
+    )
+    with open(index_path) as file:
+        weight_map = json.load(file)["weight_map"]
+    required_keys = [
+        key for key in weight_map
+        if key.startswith(FEATURE_WEIGHT_PREFIXES) or key == FEATURE_EMBEDDING_KEY
+    ]
+    if FEATURE_EMBEDDING_KEY not in required_keys:
+        raise ValueError("Feature checkpoint is missing the input embedding table")
+    required_shards = sorted({weight_map[key] for key in required_keys})
+    if not required_shards:
+        raise ValueError("Feature checkpoint index has no Idefics2 visual tensors")
+
+    model = _Idefics2FeatureOnlyModel(config, dtype=torch.float16)
+    loaded_prefixes: set[str] = set()
+    embedding_loaded = False
+    for shard_name in required_shards:
+        shard_path = hf_hub_download(repo_id=model_name, filename=shard_name)
+        with safe_open(shard_path, framework="pt", device="cpu") as handle:
+            keys = set(handle.keys())
+            if any(key.startswith(FEATURE_WEIGHT_PREFIXES[0]) for key in keys):
+                _load_module_prefix(
+                    handle, model.vision_model, FEATURE_WEIGHT_PREFIXES[0]
+                )
+                loaded_prefixes.add(FEATURE_WEIGHT_PREFIXES[0])
+            if any(key.startswith(FEATURE_WEIGHT_PREFIXES[1]) for key in keys):
+                _load_module_prefix(handle, model.connector, FEATURE_WEIGHT_PREFIXES[1])
+                loaded_prefixes.add(FEATURE_WEIGHT_PREFIXES[1])
+            if FEATURE_EMBEDDING_KEY in keys:
+                model.embed_tokens.load_state_dict(
+                    {"weight": handle.get_tensor(FEATURE_EMBEDDING_KEY)},
+                    strict=True,
+                )
+                embedding_loaded = True
+        model.feature_source_files.append(shard_name)
+    if loaded_prefixes != set(FEATURE_WEIGHT_PREFIXES) or not embedding_loaded:
+        raise ValueError("Feature checkpoint did not supply every required component")
+    model.to(device)
+    model.eval()
+    return model
 
 
 class Idefics2Wrapper:
@@ -30,10 +208,14 @@ class Idefics2Wrapper:
         device: Optional[str] = None,
         load_in_8bit: bool = False,
         scoring_mode: str = FULL_SEQUENCE_SCORING,
+        feature_only: bool = False,
     ) -> None:
         self.model_name = model_name
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.load_in_8bit = load_in_8bit
+        self.feature_only = feature_only
+        if feature_only and load_in_8bit:
+            raise ValueError("feature_only and load_in_8bit cannot be combined")
         if scoring_mode not in SUPPORTED_SCORING_MODES:
             raise ValueError(
                 f"Unsupported scoring mode {scoring_mode!r}; expected one of "
@@ -50,36 +232,46 @@ class Idefics2Wrapper:
         if load_in_8bit:
             print("Using 8-bit quantization")
 
-        self.processor = AutoProcessor.from_pretrained(model_name)
+        # This wrapper is intentionally Idefics2-specific. Constructing the
+        # concrete image processor bypasses ProcessorMixin's internal
+        # AutoImageProcessor call, which can reject otherwise valid Idefics2
+        # checkpoints under mixed Hub-cache/Transformers versions.
+        self.processor = _build_idefics2_processor(model_name)
         self.processor.image_processor.do_image_splitting = False
 
-        model_kwargs: dict = {}
-        if load_in_8bit:
-            model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_8bit=True
-            )
-            model_kwargs["device_map"] = (
-                {"": self.device}
-                if self.device.startswith("cuda:")
-                else "auto"
+        if feature_only:
+            self.model = _load_idefics2_feature_only_model(
+                model_name,
+                device=self.device,
             )
         else:
-            model_kwargs["torch_dtype"] = (
-                torch.float16
-                if self.device.startswith("cuda")
-                else torch.float32
-            )
-            if self.device.startswith("cuda:"):
-                model_kwargs["device_map"] = {"": self.device}
-            elif self.device.startswith("cuda"):
-                model_kwargs["device_map"] = "auto"
+            model_kwargs: dict = {}
+            if load_in_8bit:
+                model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_8bit=True
+                )
+                model_kwargs["device_map"] = (
+                    {"": self.device}
+                    if self.device.startswith("cuda:")
+                    else "auto"
+                )
+            else:
+                model_kwargs["dtype"] = (
+                    torch.float16
+                    if self.device.startswith("cuda")
+                    else torch.float32
+                )
+                if self.device.startswith("cuda:"):
+                    model_kwargs["device_map"] = {"": self.device}
+                elif self.device.startswith("cuda"):
+                    model_kwargs["device_map"] = "auto"
 
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            model_name,
-            **model_kwargs,
-        )
-        if not load_in_8bit and not self.device.startswith("cuda"):
-            self.model = self.model.to(self.device)
+            self.model = AutoModelForImageTextToText.from_pretrained(
+                model_name,
+                **model_kwargs,
+            )
+            if not load_in_8bit and not self.device.startswith("cuda"):
+                self.model = self.model.to(self.device)
         self.model.eval()
         print("✓ Model loaded successfully\n")
 

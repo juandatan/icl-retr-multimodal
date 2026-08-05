@@ -5,6 +5,9 @@ experiment:
 
 data:
   artifact_path: /workspace/icl-artifacts/cub-200-reranker-teacher-data-v2/reranker_teacher_data.pkl
+  # Required only by visual_token_cross_encoder. This directory is produced by
+  # scripts/build_reranker_visual_token_cache.py.
+  visual_token_cache_path: null
   train_split: train
   val_split: val
   # Paper-aligned first target. Controlled alternatives: bounded_margin,
@@ -35,6 +38,12 @@ model:
   candidate_context_layers: 1
   candidate_context_heads: 4
   candidate_context_ff_dim: 512
+  # Used only by visual_token_cross_encoder. Idefics2 token dimensions are read
+  # from the cache rather than configured manually.
+  visual_token_layers: 2
+  visual_token_heads: 4
+  visual_token_ff_dim: 1024
+  visual_candidate_chunk_size: 10
 
 objective:
   # Options: pointwise_bce, pairwise, listwise_correctness,
@@ -59,6 +68,12 @@ optimization:
   secondary_monitor: mean_margin_regret
   secondary_monitor_mode: min
   amp: false
+
+logging:
+  # Visual-token epochs can be long. Emit a flushed train/validation heartbeat
+  # at this interval; the complete metrics block is still printed once per epoch.
+  # Set to 0 to disable heartbeats.
+  progress_every_seconds: 60
 
 output:
   dir: outputs/reranker_training

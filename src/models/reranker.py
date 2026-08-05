@@ -27,12 +27,20 @@ class RerankerConfig:
     candidate_context_layers: int = 1
     candidate_context_heads: int = 4
     candidate_context_ff_dim: int = 512
+    visual_token_dim: int = 0
+    visual_token_count: int = 0
+    visual_label_token_count: int = 0
+    visual_token_layers: int = 2
+    visual_token_heads: int = 4
+    visual_token_ff_dim: int = 1024
+    visual_candidate_chunk_size: int = 10
 
     def __post_init__(self) -> None:
         architectures = {
             "interaction_mlp",
             "pooled_transformer",
             "cross_candidate_attention",
+            "visual_token_cross_encoder",
         }
         if self.architecture not in architectures:
             raise ValueError(
@@ -49,6 +57,10 @@ class RerankerConfig:
             self.candidate_context_layers,
             self.candidate_context_heads,
             self.candidate_context_ff_dim,
+            self.visual_token_layers,
+            self.visual_token_heads,
+            self.visual_token_ff_dim,
+            self.visual_candidate_chunk_size,
         )
         if min(dimensions) <= 0:
             raise ValueError("All reranker dimensions and layer counts must be positive")
@@ -59,6 +71,25 @@ class RerankerConfig:
         if self.hidden_dim % self.candidate_context_heads:
             raise ValueError(
                 "hidden_dim must be divisible by candidate_context_heads"
+            )
+        if self.hidden_dim % self.visual_token_heads:
+            raise ValueError("hidden_dim must be divisible by visual_token_heads")
+        if self.architecture == "visual_token_cross_encoder" and min(
+            self.visual_token_dim,
+            self.visual_token_count,
+            self.visual_label_token_count,
+        ) <= 0:
+            raise ValueError(
+                "visual_token_cross_encoder requires positive visual-token dimensions"
+            )
+        if self.architecture == "visual_token_cross_encoder" and any((
+            self.use_clip_embeddings,
+            self.use_clip_similarity,
+            self.use_retrieval_rank,
+            self.use_derived_siglip_similarities,
+        )):
+            raise ValueError(
+                "visual_token_cross_encoder does not combine pooled optional inputs"
             )
 
 
@@ -105,8 +136,10 @@ class LabelAwareReranker(nn.Module):
     exemplar-label SigLIP embeddings. CLIP and scalar retrieval priors are
     independently switchable ablations. The default architectures score
     candidates independently; ``cross_candidate_attention`` adds masked,
-    permutation-equivariant context across the candidate pool. No teacher
-    target or query label enters any model input.
+    permutation-equivariant context across the candidate pool, while
+    ``visual_token_cross_encoder`` jointly encodes one query/exemplar pair
+    using frozen Idefics2 visual and label-token states. No teacher target or
+    query label enters any model input.
     """
 
     def __init__(self, config: RerankerConfig) -> None:
@@ -114,12 +147,17 @@ class LabelAwareReranker(nn.Module):
         self.config = config
         hidden = config.hidden_dim
 
-        self.siglip_image_tower = _ProjectionTower(
-            config.siglip_dim, hidden, config.dropout
-        )
-        self.siglip_label_tower = _ProjectionTower(
-            config.siglip_dim, hidden, config.dropout
-        )
+        if config.architecture != "visual_token_cross_encoder":
+            self.siglip_image_tower = _ProjectionTower(
+                config.siglip_dim, hidden, config.dropout
+            )
+            self.siglip_label_tower = _ProjectionTower(
+                config.siglip_dim, hidden, config.dropout
+            )
+        else:
+            self.siglip_image_tower = None
+            self.siglip_label_tower = None
+
         if config.architecture in {
             "interaction_mlp",
             "cross_candidate_attention",
@@ -130,7 +168,7 @@ class LabelAwareReranker(nn.Module):
             self.score_token = None
             self.role_embeddings = None
             self.transformer = None
-        else:
+        elif config.architecture == "pooled_transformer":
             self.siglip_interactions = None
             self.score_token = nn.Parameter(torch.empty(1, 1, hidden))
             self.role_embeddings = nn.Parameter(torch.empty(1, 4, hidden))
@@ -151,6 +189,11 @@ class LabelAwareReranker(nn.Module):
                 norm=nn.LayerNorm(hidden),
                 enable_nested_tensor=False,
             )
+        else:
+            self.siglip_interactions = None
+            self.score_token = None
+            self.role_embeddings = None
+            self.transformer = None
 
         if config.architecture == "cross_candidate_attention":
             context_layer = nn.TransformerEncoderLayer(
@@ -170,6 +213,58 @@ class LabelAwareReranker(nn.Module):
             )
         else:
             self.candidate_context = None
+
+        if config.architecture == "visual_token_cross_encoder":
+            self.visual_image_projection = nn.Sequential(
+                nn.LayerNorm(config.visual_token_dim),
+                nn.Linear(config.visual_token_dim, hidden),
+                nn.GELU(),
+                nn.LayerNorm(hidden),
+            )
+            self.visual_label_projection = nn.Sequential(
+                nn.LayerNorm(config.visual_token_dim),
+                nn.Linear(config.visual_token_dim, hidden),
+                nn.GELU(),
+                nn.LayerNorm(hidden),
+            )
+            self.visual_utility_token = nn.Parameter(torch.empty(1, 1, hidden))
+            self.visual_role_embeddings = nn.Parameter(torch.empty(3, hidden))
+            self.visual_label_positions = nn.Parameter(torch.empty(
+                1, config.visual_label_token_count, hidden
+            ))
+            nn.init.normal_(self.visual_utility_token, std=0.02)
+            nn.init.normal_(self.visual_role_embeddings, std=0.02)
+            nn.init.normal_(self.visual_label_positions, std=0.02)
+            visual_layer = nn.TransformerEncoderLayer(
+                d_model=hidden,
+                nhead=config.visual_token_heads,
+                dim_feedforward=config.visual_token_ff_dim,
+                dropout=config.dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.visual_cross_encoder = nn.TransformerEncoder(
+                visual_layer,
+                num_layers=config.visual_token_layers,
+                norm=nn.LayerNorm(hidden),
+                enable_nested_tensor=False,
+            )
+            self.visual_scorer = nn.Sequential(
+                nn.LayerNorm(hidden),
+                nn.Linear(hidden, hidden),
+                nn.GELU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(hidden, 1),
+            )
+        else:
+            self.visual_image_projection = None
+            self.visual_label_projection = None
+            self.visual_utility_token = None
+            self.visual_role_embeddings = None
+            self.visual_label_positions = None
+            self.visual_cross_encoder = None
+            self.visual_scorer = None
 
         if config.use_clip_embeddings:
             self.clip_image_tower = _ProjectionTower(
@@ -201,15 +296,19 @@ class LabelAwareReranker(nn.Module):
             fusion_dim += hidden
         if metadata_count:
             fusion_dim += config.metadata_dim
-        self.scorer = nn.Sequential(
-            nn.LayerNorm(fusion_dim),
-            nn.Linear(fusion_dim, 2 * hidden),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(2 * hidden, hidden),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(hidden, 1),
+        self.scorer = (
+            None
+            if config.architecture == "visual_token_cross_encoder"
+            else nn.Sequential(
+                nn.LayerNorm(fusion_dim),
+                nn.Linear(fusion_dim, 2 * hidden),
+                nn.GELU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(2 * hidden, hidden),
+                nn.GELU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(hidden, 1),
+            )
         )
 
     def _validate_inputs(
@@ -283,19 +382,167 @@ class LabelAwareReranker(nn.Module):
         tokens = torch.cat((score, content), dim=1) + self.role_embeddings
         return self.transformer(tokens)[:, 0].reshape(batch, candidates, -1)
 
+    def _visual_token_scores(
+        self,
+        query_visual_tokens: torch.Tensor,
+        candidate_visual_tokens: torch.Tensor,
+        candidate_label_tokens: torch.Tensor,
+        candidate_label_token_mask: torch.Tensor,
+        candidate_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Jointly encode each query/exemplar pair without candidate-set context."""
+        if query_visual_tokens.ndim != 3:
+            raise ValueError(
+                "query_visual_tokens must have shape [batch, tokens, hidden]"
+            )
+        if candidate_visual_tokens.ndim != 4:
+            raise ValueError(
+                "candidate_visual_tokens must have shape "
+                "[batch, candidates, tokens, hidden]"
+            )
+        if candidate_label_tokens.ndim != 4:
+            raise ValueError(
+                "candidate_label_tokens must have shape "
+                "[batch, candidates, tokens, hidden]"
+            )
+        batch, candidates, visual_tokens, token_dim = (
+            candidate_visual_tokens.shape
+        )
+        expected_prefix = (batch, candidates)
+        if (
+            query_visual_tokens.shape
+            != (batch, self.config.visual_token_count, self.config.visual_token_dim)
+            or visual_tokens != self.config.visual_token_count
+            or token_dim != self.config.visual_token_dim
+            or candidate_label_tokens.shape
+            != (
+                batch,
+                candidates,
+                self.config.visual_label_token_count,
+                self.config.visual_token_dim,
+            )
+            or candidate_label_token_mask.shape
+            != (*expected_prefix, self.config.visual_label_token_count)
+            or candidate_mask.shape != expected_prefix
+        ):
+            raise ValueError("Visual-token inputs do not match model configuration")
+        if candidate_label_token_mask.dtype != torch.bool:
+            raise ValueError("candidate_label_token_mask must be boolean")
+        if candidate_mask.dtype != torch.bool:
+            raise ValueError("candidate_mask must be boolean")
+        if not candidate_mask.any(dim=1).all():
+            raise ValueError("Every query must have at least one valid candidate")
+
+        # Cached states are float16 to keep the sidecar compact. Outside CUDA
+        # autocast, match the float32 trainable projections explicitly.
+        if not torch.is_autocast_enabled():
+            projection_dtype = self.visual_image_projection[1].weight.dtype
+            query_visual_tokens = query_visual_tokens.to(projection_dtype)
+            candidate_visual_tokens = candidate_visual_tokens.to(projection_dtype)
+            candidate_label_tokens = candidate_label_tokens.to(projection_dtype)
+
+        query_projected = self.visual_image_projection(query_visual_tokens)
+        chunk_size = self.config.visual_candidate_chunk_size
+        chunk_scores = []
+        for start in range(0, candidates, chunk_size):
+            stop = min(start + chunk_size, candidates)
+            width = stop - start
+            flat_count = batch * width
+            exemplar = self.visual_image_projection(
+                candidate_visual_tokens[:, start:stop]
+            ).reshape(flat_count, visual_tokens, -1)
+            label = self.visual_label_projection(
+                candidate_label_tokens[:, start:stop]
+            ).reshape(
+                flat_count, self.config.visual_label_token_count, -1
+            )
+            label = (
+                label
+                + self.visual_role_embeddings[0]
+                + self.visual_label_positions
+            )
+            query = query_projected.unsqueeze(1).expand(
+                -1, width, -1, -1
+            ).reshape(flat_count, visual_tokens, -1)
+            query = query + self.visual_role_embeddings[1]
+            exemplar = exemplar + self.visual_role_embeddings[2]
+            utility = self.visual_utility_token.expand(flat_count, -1, -1)
+            tokens = torch.cat((utility, label, query, exemplar), dim=1)
+
+            label_valid = candidate_label_token_mask[:, start:stop].reshape(
+                flat_count, self.config.visual_label_token_count
+            )
+            padding_mask = torch.cat((
+                torch.zeros(
+                    flat_count,
+                    1,
+                    dtype=torch.bool,
+                    device=tokens.device,
+                ),
+                ~label_valid,
+                torch.zeros(
+                    flat_count,
+                    2 * visual_tokens,
+                    dtype=torch.bool,
+                    device=tokens.device,
+                ),
+            ), dim=1)
+            encoded = self.visual_cross_encoder(
+                tokens,
+                src_key_padding_mask=padding_mask,
+            )
+            chunk_scores.append(
+                self.visual_scorer(encoded[:, 0]).reshape(batch, width)
+            )
+        return torch.cat(chunk_scores, dim=1).masked_fill(~candidate_mask, 0.0)
+
     def forward(
         self,
         *,
-        query_clip: torch.Tensor,
-        candidate_clip: torch.Tensor,
-        query_siglip: torch.Tensor,
-        candidate_siglip: torch.Tensor,
-        candidate_label_siglip: torch.Tensor,
-        clip_similarities: torch.Tensor,
-        retrieval_ranks: torch.Tensor,
+        query_clip: torch.Tensor | None = None,
+        candidate_clip: torch.Tensor | None = None,
+        query_siglip: torch.Tensor | None = None,
+        candidate_siglip: torch.Tensor | None = None,
+        candidate_label_siglip: torch.Tensor | None = None,
+        clip_similarities: torch.Tensor | None = None,
+        retrieval_ranks: torch.Tensor | None = None,
         candidate_mask: torch.Tensor,
+        query_visual_tokens: torch.Tensor | None = None,
+        candidate_visual_tokens: torch.Tensor | None = None,
+        candidate_label_tokens: torch.Tensor | None = None,
+        candidate_label_token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return one unbounded utility score per candidate."""
+        if self.config.architecture == "visual_token_cross_encoder":
+            visual_inputs = (
+                query_visual_tokens,
+                candidate_visual_tokens,
+                candidate_label_tokens,
+                candidate_label_token_mask,
+            )
+            if any(value is None for value in visual_inputs):
+                raise ValueError(
+                    "visual_token_cross_encoder requires visual and label tokens"
+                )
+            return self._visual_token_scores(
+                query_visual_tokens,
+                candidate_visual_tokens,
+                candidate_label_tokens,
+                candidate_label_token_mask,
+                candidate_mask,
+            )
+
+        pooled_inputs = (
+            query_clip,
+            candidate_clip,
+            query_siglip,
+            candidate_siglip,
+            candidate_label_siglip,
+            clip_similarities,
+            retrieval_ranks,
+        )
+        if any(value is None for value in pooled_inputs):
+            raise ValueError("Pooled reranker architecture requires pooled inputs")
         _, candidates = self._validate_inputs(
             query_clip,
             candidate_clip,

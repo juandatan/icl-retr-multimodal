@@ -174,3 +174,73 @@ def test_optional_clip_and_metadata_branches_are_independent_ablation_flags():
         use_derived_siglip_similarities=True,
     ))
     assert model(**_inputs()).shape == (2, 4)
+
+
+def _visual_token_model():
+    return LabelAwareReranker(RerankerConfig(
+        clip_dim=6,
+        siglip_dim=8,
+        architecture="visual_token_cross_encoder",
+        hidden_dim=8,
+        dropout=0.0,
+        visual_token_dim=10,
+        visual_token_count=3,
+        visual_label_token_count=2,
+        visual_token_heads=2,
+        visual_token_layers=1,
+        visual_token_ff_dim=16,
+        visual_candidate_chunk_size=2,
+    ))
+
+
+def _visual_inputs(batch=2, candidates=4):
+    generator = torch.Generator().manual_seed(19)
+    label_mask = torch.ones(batch, candidates, 2, dtype=torch.bool)
+    label_mask[:, :, 1] = False
+    return {
+        "query_visual_tokens": torch.randn(
+            batch, 3, 10, generator=generator, dtype=torch.float16
+        ),
+        "candidate_visual_tokens": torch.randn(
+            batch, candidates, 3, 10, generator=generator, dtype=torch.float16
+        ),
+        "candidate_label_tokens": torch.randn(
+            batch, candidates, 2, 10, generator=generator, dtype=torch.float16
+        ),
+        "candidate_label_token_mask": label_mask,
+        "candidate_mask": torch.ones(batch, candidates, dtype=torch.bool),
+    }
+
+
+def test_visual_token_cross_encoder_scores_candidates_and_backpropagates():
+    model = _visual_token_model().train()
+    scores = model(**_visual_inputs())
+    scores.sum().backward()
+
+    assert scores.shape == (2, 4)
+    assert torch.isfinite(scores).all()
+    assert all(
+        parameter.grad is not None
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+
+
+def test_visual_token_cross_encoder_is_candidate_independent_and_masks_labels():
+    model = _visual_token_model().eval()
+    inputs = _visual_inputs(batch=1, candidates=4)
+    with torch.no_grad():
+        original = model(**inputs)
+
+    changed_padding = {key: value.clone() for key, value in inputs.items()}
+    changed_padding["candidate_label_tokens"][:, :, 1] = 1000
+    with torch.no_grad():
+        padding_scores = model(**changed_padding)
+    torch.testing.assert_close(padding_scores, original)
+
+    changed_candidate = {key: value.clone() for key, value in inputs.items()}
+    changed_candidate["candidate_visual_tokens"][:, 1] *= -5
+    with torch.no_grad():
+        changed_scores = model(**changed_candidate)
+    torch.testing.assert_close(changed_scores[:, [0, 2, 3]], original[:, [0, 2, 3]])
+    assert not torch.isclose(changed_scores[0, 1], original[0, 1])

@@ -1,6 +1,7 @@
 """Dataset adapter for the bundled reranker teacher artifact."""
 
 from collections.abc import Mapping, Sequence
+import json
 from pathlib import Path
 import pickle
 from typing import Any
@@ -39,6 +40,151 @@ def _as_float_tensor(value: Any, name: str) -> torch.Tensor:
     return tensor
 
 
+def _load_visual_token_cache(
+    cache_path: str | Path,
+    *,
+    payload: Mapping[str, Any],
+    required_splits: set[str],
+) -> tuple[
+    dict[str, np.ndarray],
+    dict[str, np.ndarray] | None,
+    np.ndarray,
+    np.ndarray,
+    dict[str, Any],
+]:
+    """Open a completed memory-mapped Idefics2 visual-token sidecar."""
+    cache_dir = Path(cache_path)
+    metadata_path = cache_dir / "metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(
+            f"Visual-token cache metadata not found: {metadata_path}"
+        )
+    with metadata_path.open() as file:
+        metadata = json.load(file)
+    if metadata.get("method") != "idefics2_reranker_visual_token_cache":
+        raise ValueError("Not an Idefics2 reranker visual-token cache")
+    schema_version = int(metadata.get("schema_version", -1))
+    if schema_version not in {1, 2}:
+        raise ValueError(
+            "Unsupported visual-token cache schema version: "
+            f"{metadata.get('schema_version')}"
+        )
+    if not bool(metadata.get("complete", False)):
+        raise ValueError(
+            "Visual-token cache is incomplete; resume feature extraction first"
+        )
+
+    immutable = payload["immutable_args"]
+    expected_model = immutable.get("idefics2_model")
+    if expected_model and metadata.get("idefics2_model") != expected_model:
+        raise ValueError(
+            "Visual-token cache and teacher artifact use different Idefics2 models"
+        )
+    expected_split_hash = immutable.get("image_split_sha256")
+    if (
+        expected_split_hash
+        and metadata.get("image_split_sha256") != expected_split_hash
+    ):
+        raise ValueError(
+            "Visual-token cache and teacher artifact use different image splits"
+        )
+
+    tables = payload["feature_tables"]
+    expected_class_names = list(tables.get("class_names", []))
+    if list(metadata.get("class_names", [])) != expected_class_names:
+        raise ValueError(
+            "Visual-token cache class ordering differs from the teacher artifact"
+        )
+
+    image_tokens: dict[str, np.ndarray] = {}
+    image_token_scales: dict[str, np.ndarray] | None = (
+        {} if metadata.get("dtype") == "int8" else None
+    )
+    quantization = metadata.get("quantization")
+    if image_token_scales is not None:
+        if (
+            schema_version < 2
+            or not isinstance(quantization, Mapping)
+            or quantization.get("scheme") != "symmetric_per_visual_token"
+        ):
+            raise ValueError("Visual-token cache has unsupported int8 quantization")
+    split_rows = metadata.get("split_rows", {})
+    for split in required_splits:
+        path = cache_dir / f"image_tokens_{split}.npy"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Visual-token cache is missing split {split!r}: {path}"
+            )
+        values = np.load(path, mmap_mode="c")
+        expected_rows = len(tables["siglip_image_embeddings_by_split"][split])
+        if values.ndim != 3 or values.shape[0] != expected_rows:
+            raise ValueError(
+                f"Visual tokens for {split!r} must have shape "
+                f"[{expected_rows}, tokens, hidden]"
+            )
+        if int(split_rows.get(split, -1)) != expected_rows:
+            raise ValueError(
+                f"Visual-token metadata row count differs for split {split!r}"
+            )
+        if image_token_scales is None:
+            if not np.issubdtype(values.dtype, np.floating):
+                raise ValueError(
+                    f"Visual tokens for {split!r} are not floating point"
+                )
+        else:
+            if values.dtype != np.int8:
+                raise ValueError(f"Visual tokens for {split!r} are not int8")
+            scales_path = cache_dir / f"image_token_scales_{split}.npy"
+            if not scales_path.exists():
+                raise FileNotFoundError(
+                    f"Visual-token cache is missing scales for {split!r}"
+                )
+            scales = np.load(scales_path, mmap_mode="c")
+            if (
+                scales.shape != (*values.shape[:2], 1)
+                or not np.issubdtype(scales.dtype, np.floating)
+            ):
+                raise ValueError(
+                    f"Visual-token scales for {split!r} have invalid shape or dtype"
+                )
+            image_token_scales[split] = scales
+        image_tokens[split] = values
+
+    label_tokens_path = cache_dir / "label_token_embeddings.npy"
+    label_mask_path = cache_dir / "label_token_mask.npy"
+    if not label_tokens_path.exists() or not label_mask_path.exists():
+        raise FileNotFoundError("Visual-token cache is missing label-token files")
+    label_tokens = np.load(label_tokens_path, mmap_mode="c")
+    label_mask = np.load(label_mask_path, mmap_mode="c")
+    if (
+        label_tokens.ndim != 3
+        or label_tokens.shape[0] != len(expected_class_names)
+        or label_mask.shape != label_tokens.shape[:2]
+        or label_mask.dtype != np.bool_
+    ):
+        raise ValueError("Visual-token cache has invalid label-token tensors")
+    hidden_dims = {values.shape[2] for values in image_tokens.values()}
+    if hidden_dims != {label_tokens.shape[2]}:
+        raise ValueError(
+            "Image and label tokens in the visual-token cache have different widths"
+        )
+    return image_tokens, image_token_scales, label_tokens, label_mask, metadata
+
+
+def _dequantize_visual_tokens(
+    values: np.ndarray,
+    scales: np.ndarray | None,
+) -> np.ndarray:
+    """Return model-ready FP16 visual tokens from either cache format."""
+    values = np.asarray(values)
+    if scales is None:
+        return values
+    reconstructed = values.astype(np.float32) * np.asarray(
+        scales, dtype=np.float32
+    )
+    return reconstructed.astype(np.float16)
+
+
 class RerankerTeacherDataset(Dataset):
     """Expose one query and its complete candidate pool per item.
 
@@ -55,6 +201,7 @@ class RerankerTeacherDataset(Dataset):
         target: str = "true_probability",
         target_temperature: float = 1.0,
         incremental_lambda: float = 1.0,
+        visual_token_cache_path: str | Path | None = None,
     ) -> None:
         if target not in SUPPORTED_TARGETS:
             choices = ", ".join(sorted(SUPPORTED_TARGETS))
@@ -106,6 +253,23 @@ class RerankerTeacherDataset(Dataset):
             tables.get("siglip_class_text_embeddings"),
             "SigLIP class-text features",
         )
+        self.visual_tokens: dict[str, np.ndarray] | None = None
+        self.visual_token_scales: dict[str, np.ndarray] | None = None
+        self.label_token_embeddings: np.ndarray | None = None
+        self.label_token_mask: np.ndarray | None = None
+        self.visual_token_cache_metadata: dict[str, Any] | None = None
+        if visual_token_cache_path is not None:
+            (
+                self.visual_tokens,
+                self.visual_token_scales,
+                self.label_token_embeddings,
+                self.label_token_mask,
+                self.visual_token_cache_metadata,
+            ) = _load_visual_token_cache(
+                visual_token_cache_path,
+                payload=payload,
+                required_splits=required_splits,
+            )
         self.records = [
             record for record in payload.get("records", [])
             if str(record.query_split) == split
@@ -120,6 +284,21 @@ class RerankerTeacherDataset(Dataset):
         self.incremental_lambda = float(incremental_lambda)
         self.clip_dim = self.clip_features[split].shape[1]
         self.siglip_dim = self.siglip_features[split].shape[1]
+        self.visual_token_dim = (
+            int(self.label_token_embeddings.shape[2])
+            if self.label_token_embeddings is not None
+            else 0
+        )
+        self.visual_token_count = (
+            int(self.visual_tokens[split].shape[1])
+            if self.visual_tokens is not None
+            else 0
+        )
+        self.label_token_count = (
+            int(self.label_token_embeddings.shape[1])
+            if self.label_token_embeddings is not None
+            else 0
+        )
         self._validate_tables()
         for record in self.records:
             self._validate_record(record)
@@ -205,7 +384,7 @@ class RerankerTeacherDataset(Dataset):
         candidate_count = len(candidate_indices)
         rank_denominator = max(candidate_count - 1, 1)
 
-        return {
+        item = {
             "query_split": self.split,
             "query_idx": query_idx,
             "candidate_indices": candidate_indices,
@@ -233,6 +412,44 @@ class RerankerTeacherDataset(Dataset):
                 np.asarray(record.candidate_metrics["correct"]), dtype=torch.bool
             ),
         }
+        if self.visual_tokens is not None:
+            # mmap_mode="c" exposes writable, copy-on-write NumPy views, which
+            # torch can wrap safely. Collation performs the actual batch copy.
+            item.update({
+                "query_visual_tokens": torch.from_numpy(
+                    _dequantize_visual_tokens(
+                        self.visual_tokens[self.split][query_idx],
+                        (
+                            self.visual_token_scales[self.split][query_idx]
+                            if self.visual_token_scales is not None
+                            else None
+                        ),
+                    )
+                ),
+                "candidate_visual_tokens": torch.from_numpy(
+                    _dequantize_visual_tokens(
+                        self.visual_tokens[self.retrieval_split][
+                            candidate_indices.numpy()
+                        ],
+                        (
+                            self.visual_token_scales[self.retrieval_split][
+                                candidate_indices.numpy()
+                            ]
+                            if self.visual_token_scales is not None
+                            else None
+                        ),
+                    )
+                ),
+                "candidate_label_tokens": torch.from_numpy(
+                    np.asarray(
+                        self.label_token_embeddings[candidate_classes.numpy()]
+                    )
+                ),
+                "candidate_label_token_mask": torch.from_numpy(
+                    np.asarray(self.label_token_mask[candidate_classes.numpy()])
+                ),
+            })
+        return item
 
 
 def collate_reranker_queries(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -258,7 +475,7 @@ def collate_reranker_queries(items: Sequence[Mapping[str, Any]]) -> dict[str, An
             padding_value=padding_value,
         )
 
-    return {
+    batch = {
         "query_split": [str(item["query_split"]) for item in items],
         "query_idx": torch.as_tensor([item["query_idx"] for item in items], dtype=torch.long),
         "candidate_counts": candidate_counts,
@@ -277,3 +494,15 @@ def collate_reranker_queries(items: Sequence[Mapping[str, Any]]) -> dict[str, An
         "teacher_probabilities": pad("teacher_probabilities"),
         "teacher_correct": pad("teacher_correct"),
     }
+    if "query_visual_tokens" in items[0]:
+        if not all("query_visual_tokens" in item for item in items):
+            raise ValueError("Batch mixes items with and without visual tokens")
+        batch.update({
+            "query_visual_tokens": stack("query_visual_tokens"),
+            "candidate_visual_tokens": pad("candidate_visual_tokens"),
+            "candidate_label_tokens": pad("candidate_label_tokens"),
+            "candidate_label_token_mask": pad(
+                "candidate_label_token_mask", False
+            ),
+        })
+    return batch

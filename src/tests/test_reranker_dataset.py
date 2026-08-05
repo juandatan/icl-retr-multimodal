@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import json
 
 import numpy as np
 import pytest
@@ -66,6 +67,47 @@ def _artifact():
     }
 
 
+def _visual_token_cache(tmp_path, *, complete=True, dtype="float16"):
+    cache_dir = tmp_path / "visual_tokens"
+    cache_dir.mkdir()
+    raw_tokens = np.arange(6 * 3 * 7, dtype=np.float32).reshape(6, 3, 7)
+    if dtype == "int8":
+        scales = (
+            np.max(np.abs(raw_tokens), axis=-1, keepdims=True) / 127.0
+        ).astype(np.float16)
+        scales[scales == 0] = 1
+        stored_tokens = np.clip(
+            np.rint(raw_tokens / scales.astype(np.float32)), -127, 127
+        ).astype(np.int8)
+        np.save(cache_dir / "image_token_scales_train.npy", scales)
+    else:
+        stored_tokens = raw_tokens.astype(np.float16)
+    np.save(cache_dir / "image_tokens_train.npy", stored_tokens)
+    np.save(
+        cache_dir / "label_token_embeddings.npy",
+        np.arange(4 * 2 * 7, dtype=np.float16).reshape(4, 2, 7),
+    )
+    np.save(
+        cache_dir / "label_token_mask.npy",
+        np.asarray([[True, True], [True, False], [True, True], [True, False]]),
+    )
+    metadata = {
+        "method": "idefics2_reranker_visual_token_cache",
+        "schema_version": 2 if dtype == "int8" else 1,
+        "complete": complete,
+        "class_names": ["a", "b", "c", "d"],
+        "split_rows": {"train": 6},
+        "dtype": dtype,
+        "quantization": (
+            {"scheme": "symmetric_per_visual_token"}
+            if dtype == "int8"
+            else None
+        ),
+    }
+    (cache_dir / "metadata.json").write_text(json.dumps(metadata))
+    return cache_dir
+
+
 def test_dataset_resolves_query_candidate_and_label_features():
     dataset = RerankerTeacherDataset(_artifact(), split="train", target="margin")
     item = dataset[0]
@@ -101,6 +143,70 @@ def test_collator_pads_variable_candidate_pools_and_builds_mask():
     ]
     assert batch["candidate_indices"][1, 2].item() == -1
     assert batch["targets"][1, 2].item() == 0.0
+
+
+def test_dataset_and_collator_expose_memory_mapped_visual_tokens(tmp_path):
+    cache_dir = _visual_token_cache(tmp_path)
+    dataset = RerankerTeacherDataset(
+        _artifact(),
+        split="train",
+        visual_token_cache_path=cache_dir,
+    )
+    item = dataset[0]
+    batch = collate_reranker_queries([dataset[0], dataset[1]])
+
+    assert dataset.visual_token_dim == 7
+    assert dataset.visual_token_count == 3
+    assert dataset.label_token_count == 2
+    assert item["query_visual_tokens"].shape == (3, 7)
+    assert item["candidate_visual_tokens"].shape == (3, 3, 7)
+    assert item["candidate_label_tokens"].shape == (3, 2, 7)
+    assert batch["candidate_visual_tokens"].shape == (2, 3, 3, 7)
+    assert batch["candidate_label_token_mask"].dtype == torch.bool
+    assert not batch["candidate_label_token_mask"][1, 2].any()
+
+
+def test_dataset_transparently_dequantizes_int8_visual_tokens(tmp_path):
+    cache_dir = _visual_token_cache(tmp_path, dtype="int8")
+    dataset = RerankerTeacherDataset(
+        _artifact(),
+        split="train",
+        visual_token_cache_path=cache_dir,
+    )
+    item = dataset[0]
+
+    expected = np.arange(6 * 3 * 7, dtype=np.float32).reshape(6, 3, 7)
+    assert item["query_visual_tokens"].dtype == torch.float16
+    np.testing.assert_allclose(
+        item["query_visual_tokens"].float().numpy(), expected[0], atol=0.5
+    )
+    np.testing.assert_allclose(
+        item["candidate_visual_tokens"].float().numpy(),
+        expected[[1, 2, 3]],
+        atol=0.5,
+    )
+
+
+def test_dataset_rejects_int8_cache_without_scales(tmp_path):
+    cache_dir = _visual_token_cache(tmp_path, dtype="int8")
+    (cache_dir / "image_token_scales_train.npy").unlink()
+
+    with pytest.raises(FileNotFoundError, match="missing scales"):
+        RerankerTeacherDataset(
+            _artifact(),
+            split="train",
+            visual_token_cache_path=cache_dir,
+        )
+
+
+def test_dataset_rejects_incomplete_visual_token_cache(tmp_path):
+    cache_dir = _visual_token_cache(tmp_path, complete=False)
+    with pytest.raises(ValueError, match="incomplete"):
+        RerankerTeacherDataset(
+            _artifact(),
+            split="train",
+            visual_token_cache_path=cache_dir,
+        )
 
 
 def test_dataset_rejects_unknown_target_and_missing_split():

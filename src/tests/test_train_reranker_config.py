@@ -30,6 +30,16 @@ def test_auto_experiment_name_is_stable_and_ignores_artifact_location():
     )
 
 
+def test_auto_experiment_name_ignores_visual_cache_location():
+    first = _config()
+    first["data"]["visual_token_cache_path"] = "/machine-a/tokens"
+    second = deepcopy(first)
+    second["data"]["visual_token_cache_path"] = "/machine-b/tokens"
+    assert _resolve_experiment_name(OmegaConf.create(first)) == (
+        _resolve_experiment_name(OmegaConf.create(second))
+    )
+
+
 def test_auto_experiment_name_changes_with_ablation_and_honors_explicit_name():
     baseline = _config()
     ablation = deepcopy(baseline)

@@ -1,0 +1,31 @@
+# Cache frozen Idefics2 visual and label-token states for patch-level reranking.
+
+dataset:
+  name: cub_200
+  splits: [train, val]
+  image_split_path: data/cub_200/image_split.json
+  teacher_artifact_path: /workspace/icl-artifacts/cub-200-reranker-teacher-data-v2/reranker_teacher_data.pkl
+
+model:
+  # Model that generated the teacher scores. Its identity and architecture are
+  # retained even when a storage-efficient, feature-equivalent source is used.
+  idefics2_model: HuggingFaceM4/idefics2-8b
+  # The official AWQ checkpoint leaves the vision model and connector in FP16,
+  # and all required tensors live in its first 4.99 GB shard.
+  feature_source_model: HuggingFaceM4/idefics2-8b-AWQ
+  # Load only the vision model, connector, and input embedding table. This
+  # bypasses AutoAWQ and never downloads the second language-model shard.
+  feature_only: true
+  load_in_8bit: false
+
+output:
+  cache_dir: outputs/reranker_visual_tokens
+  # int8 uses symmetric per-visual-token quantization with FP16 scales. The
+  # loader transparently reconstructs FP16 tensors for training.
+  dtype: int8
+  checkpoint_every_images: 50
+
+limits:
+  # Per-split cap for smoke tests. A limited cache remains intentionally
+  # incomplete and cannot be used for full training until extraction resumes.
+  max_images_per_split: null
