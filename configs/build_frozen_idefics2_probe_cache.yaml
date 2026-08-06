@@ -1,0 +1,38 @@
+# Cache pair-conditioned frozen-Idefics2 hidden states once, then train cheap probes.
+
+dataset:
+  teacher_artifact_path: /workspace/icl-artifacts/cub-200-reranker-teacher-data-v2/reranker_teacher_data.pkl
+  visual_token_cache_path: /workspace/icl-artifacts/cub-200-reranker-visual-tokens
+  splits: [train, val]
+
+model:
+  # Teacher identity is validated against the teacher-data artifact.
+  idefics2_model: HuggingFaceM4/idefics2-8b
+  # The original checkpoint is 33.6 GB even when bitsandbytes quantizes it
+  # after loading. The official pre-quantized checkpoint is much smaller and
+  # matches the validated source used to build the visual-token cache.
+  probe_model: HuggingFaceM4/idefics2-8b-AWQ
+  device: cuda:0
+  # Keep false for AWQ. Set probe_model=HuggingFaceM4/idefics2-8b and this to
+  # true only for the exact-teacher, full-checkpoint storage ablation.
+  load_in_8bit: false
+  # The checkpoint uses AWQ GEMM weights. Explicit Triton selection avoids
+  # GPTQModel AUTO choosing Marlin, whose JIT requires a matching system nvcc.
+  # Use torch_awq only as a slower, kernel-independent fallback.
+  awq_backend: gemm_triton
+  amp: true
+  pair_batch_size: 4
+
+output:
+  cache_dir: outputs/frozen_idefics2_probe_cache
+  # About 1.15 GiB (1.23 GB) for all 300,630 pair states, versus 2.29 GiB
+  # for float16, plus small scale/completion arrays.
+  dtype: int8
+  checkpoint_every_queries: 10
+
+limits:
+  # Use small values for a resumable smoke test. A limited cache is intentionally
+  # marked incomplete and cannot be used for probe training.
+  max_queries_per_split:
+    train: null
+    val: null

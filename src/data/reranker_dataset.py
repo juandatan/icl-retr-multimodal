@@ -27,6 +27,8 @@ RAW_TARGETS = frozenset({
 SUPPORTED_TARGETS = RAW_TARGETS | frozenset({
     "bounded_margin",
     "bounded_incremental_margin",
+    "mean_token_probability",
+    "normalized_incremental_mean_token_probability",
     "normalized_incremental_probability",
 })
 
@@ -361,6 +363,25 @@ class RerankerTeacherDataset(Dataset):
             values = np.asarray(metrics["incremental_margin"], dtype=np.float64)
             scaled = np.clip(values / self.target_temperature, -80, 80)
             return (1 / (1 + np.exp(-scaled))).astype(np.float32)
+        if self.target in {
+            "mean_token_probability",
+            "normalized_incremental_mean_token_probability",
+        }:
+            # Idefics2 teacher scores are mean-token log likelihoods. Their
+            # exponent is an output-label probability that does not normalize
+            # over the K=32 label set, matching the selector's deployment
+            # contract more closely than candidate-set softmax probability.
+            one_shot_scores = np.asarray(metrics["true_score"], dtype=np.float64)
+            zero_shot_score = float(record.zero_shot_metrics["true_score"])
+            if np.any(one_shot_scores > 1e-5) or zero_shot_score > 1e-5:
+                raise ValueError("Mean-token log probabilities must be non-positive")
+            one_shot = np.exp(np.clip(one_shot_scores, -80, 0))
+            if self.target == "mean_token_probability":
+                return one_shot.astype(np.float32)
+            zero_shot = float(np.exp(np.clip(zero_shot_score, -80, 0)))
+            denominator = np.maximum(one_shot, zero_shot) ** self.incremental_lambda
+            ratio = (one_shot - zero_shot) / np.maximum(denominator, 1e-12)
+            return np.clip((ratio + 1) / 2, 0, 1).astype(np.float32)
         if self.target == "normalized_incremental_probability":
             one_shot = np.asarray(metrics["true_probability"], dtype=np.float64)
             zero_shot = float(record.zero_shot_metrics["true_probability"])

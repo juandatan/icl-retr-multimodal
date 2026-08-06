@@ -1,0 +1,30 @@
+experiment:
+  name: auto
+  seed: 40
+
+data:
+  artifact_path: /workspace/icl-artifacts/cub-200-reranker-teacher-data-v2/reranker_teacher_data.pkl
+  probe_cache_path: /workspace/icl-artifacts/frozen-idefics2-probe-cache
+  # Paper-aligned choices without a K-way score softmax:
+  #   mean_token_probability
+  #   normalized_incremental_mean_token_probability
+  # The existing true_probability variants are K=32 softmax ablations.
+  target: mean_token_probability
+  target_temperature: 1.0
+  incremental_lambda: 1.0
+  batch_size: 128
+  num_workers: 0
+
+model:
+  # A linear head is intentional: this first experiment asks whether the frozen
+  # pair-conditioned Idefics2 state already linearly exposes exemplar utility.
+  dropout: 0.0
+
+optimization:
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  early_stopping_patience: 8
+
+output:
+  dir: outputs/frozen_idefics2_probe_training

@@ -153,6 +153,8 @@ def _validate_target_objective(target: str, objective: str) -> None:
         "true_probability",
         "bounded_margin",
         "bounded_incremental_margin",
+        "mean_token_probability",
+        "normalized_incremental_mean_token_probability",
         "normalized_incremental_probability",
     }
     if objective == "pointwise_bce" and target not in bounded:

@@ -10,8 +10,9 @@ data:
   visual_token_cache_path: null
   train_split: train
   val_split: val
-  # Paper-aligned first target. Controlled alternatives: bounded_margin,
-  # bounded_incremental_margin, normalized_incremental_probability.
+  # K=32 closed-set default retained for existing experiments. The frozen
+  # Idefics2 probe instead defaults to mean_token_probability; controlled
+  # alternatives also include bounded margins and normalized increments.
   target: true_probability
   target_temperature: 1.0
   incremental_lambda: 1.0

@@ -13,6 +13,23 @@ dynamic = ["dependencies"]
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]}
 
+[project.optional-dependencies]
+# Full language-model inference for the frozen Idefics2 AWQ probe. Transformers
+# 5 uses GPTQModel as its AWQ linear backend; installing this extra lets pip
+# resolve that backend and all of its runtime dependencies as one set.
+# GPTQModel permits any torchao>=0.16, but torchao releases track PyTorch
+# minors closely. 0.16 is the release supporting our pinned PyTorch 2.8 line.
+# GPTQModel also eagerly imports InternVL definitions that import torchvision,
+# even though this probe never invokes those definitions or image transforms.
+awq = [
+    "GPTQModel==7.2.0",
+    "torchao==0.16.0",
+    "torchvision==0.23.0",
+]
+# Only scripts/build_clip_embeddings.py needs the OpenAI CLIP Python package.
+# The AWQ extra already supplies the torchvision version GPTQModel imports.
+clip = ["openai-clip", "torchvision>=0.23,<0.24"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*", "scripts*"]
