@@ -16,9 +16,26 @@ data:
   num_workers: 0
 
 model:
-  # A linear head is intentional: this first experiment asks whether the frozen
-  # pair-conditioned Idefics2 state already linearly exposes exemplar utility.
+  # Options: linear, layernorm_mlp. Keep linear for the original accessibility
+  # probe; layernorm_mlp tests nonlinear extraction from the identical cache.
+  architecture: linear
+  hidden_dim: 256
   dropout: 0.0
+
+objective:
+  # Options: pointwise_bce, pairwise, pointwise_pairwise,
+  # hybrid_listwise_pairwise. Pairwise comparisons are formed only within each
+  # query's retrieved exemplar pool.
+  name: pointwise_bce
+  hybrid_pairwise_weight: 0.1
+  hybrid_listwise_weight: 0.1
+  pairwise_min_target_gap: 0.02
+  pairwise_score_temperature: 1.0
+  # Optional top-of-order weighting. When set, a query-local softmax over
+  # teacher probabilities weights pairs containing high-utility candidates.
+  # Lower values concentrate weight more strongly. Keep null for the first
+  # hybrid run so only the objective composition changes.
+  pairwise_teacher_weight_temperature: null
 
 optimization:
   epochs: 100

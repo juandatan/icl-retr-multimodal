@@ -3,6 +3,7 @@ import json
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
 from src.data.idefics2_probe_dataset import (
     FrozenIdefics2ProbeDataset,
@@ -20,6 +21,11 @@ from src.models.idefics2_probe import (
 )
 from src.utils.reranker_teacher_data import derive_candidate_metrics
 from scripts.build_frozen_idefics2_probe_cache import _validate_probe_model_source
+from scripts.train_frozen_idefics2_probe import _build_objective, _objective_loss
+from src.losses.listwise import HybridListwisePairwiseLoss
+from src.losses.pairwise_ranking import PairwiseRankingLoss
+from src.losses.pointwise import MaskedSoftLabelBCELoss
+from src.losses.pointwise import HybridPointwisePairwiseLoss
 
 
 def _record(query_idx: int, split: str):
@@ -212,6 +218,110 @@ def test_linear_probe_scores_each_candidate_and_masks_padding():
     assert scores.shape == (2, 3)
     assert torch.isfinite(scores[mask]).all()
     assert (scores[~mask] == torch.finfo(scores.dtype).min).all()
+
+
+def test_layernorm_mlp_probe_scores_candidates_and_backpropagates():
+    model = FrozenIdefics2UtilityProbe(
+        input_dim=4,
+        architecture="layernorm_mlp",
+        hidden_dim=8,
+        dropout=0.1,
+    )
+    representations = torch.randn(2, 3, 4, requires_grad=True)
+    mask = torch.tensor([[True, True, False], [True, True, True]])
+    scores = model(representations, mask)
+    scores[mask].sum().backward()
+
+    assert scores.shape == (2, 3)
+    assert torch.isfinite(scores[mask]).all()
+    assert (scores[~mask] == torch.finfo(scores.dtype).min).all()
+    assert representations.grad is not None
+    assert torch.isfinite(representations.grad).all()
+    assert sum(parameter.numel() for parameter in model.parameters()) == 57
+
+
+def test_frozen_probe_objective_factory_supports_pointwise_and_pairwise():
+    pointwise = _build_objective(OmegaConf.create({
+        "objective": {
+            "name": "pointwise_bce",
+            "pairwise_min_target_gap": 0.02,
+            "pairwise_score_temperature": 1.0,
+        }
+    }))
+    pairwise = _build_objective(OmegaConf.create({
+        "objective": {
+            "name": "pairwise",
+            "pairwise_min_target_gap": 0.03,
+            "pairwise_score_temperature": 0.5,
+        }
+    }))
+    hybrid = _build_objective(OmegaConf.create({
+        "objective": {
+            "name": "pointwise_pairwise",
+            "hybrid_pairwise_weight": 0.1,
+            "pairwise_min_target_gap": 0.02,
+            "pairwise_score_temperature": 1.0,
+            "pairwise_teacher_weight_temperature": None,
+        }
+    }))
+    listwise_hybrid = _build_objective(OmegaConf.create({
+        "objective": {
+            "name": "hybrid_listwise_pairwise",
+            "hybrid_listwise_weight": 0.1,
+            "pairwise_min_target_gap": 0.02,
+            "pairwise_score_temperature": 1.0,
+            "pairwise_teacher_weight_temperature": None,
+        }
+    }))
+
+    assert isinstance(pointwise, MaskedSoftLabelBCELoss)
+    assert isinstance(pairwise, PairwiseRankingLoss)
+    assert isinstance(hybrid, HybridPointwisePairwiseLoss)
+    assert isinstance(listwise_hybrid, HybridListwisePairwiseLoss)
+    assert pairwise.min_target_gap == 0.03
+    assert pairwise.score_temperature == 0.5
+    assert hybrid.pairwise_weight == 0.1
+    assert listwise_hybrid.listwise_weight == 0.1
+
+
+def test_hybrid_probe_loss_is_weighted_sum_of_components():
+    objective = HybridPointwisePairwiseLoss(
+        pairwise_weight=0.1,
+        min_target_gap=0.0,
+    )
+    scores = torch.tensor([[0.2, -0.1, 0.3]], requires_grad=True)
+    targets = torch.tensor([[0.8, 0.2, 0.6]])
+    mask = torch.ones_like(scores, dtype=torch.bool)
+    expected = objective.pointwise(scores, targets, mask) + 0.1 * objective.pairwise(
+        scores, targets, mask
+    )
+    actual = objective(scores, targets, mask)
+    torch.testing.assert_close(actual, expected)
+    actual.backward()
+    assert scores.grad is not None
+
+
+def test_frozen_probe_routes_correctness_to_listwise_hybrid():
+    objective = HybridListwisePairwiseLoss(
+        listwise_weight=0.1,
+        min_target_gap=0.0,
+    )
+    scores = torch.tensor([[0.2, -0.1, 0.3]], requires_grad=True)
+    batch = {
+        "targets": torch.tensor([[0.8, 0.2, 0.6]]),
+        "teacher_correct": torch.tensor([[True, False, True]]),
+        "candidate_mask": torch.ones_like(scores, dtype=torch.bool),
+    }
+    expected = objective(
+        scores,
+        batch["targets"],
+        batch["teacher_correct"],
+        batch["candidate_mask"],
+    )
+    actual = _objective_loss(objective, scores, batch)
+    torch.testing.assert_close(actual, expected)
+    actual.backward()
+    assert scores.grad is not None
 
 
 def test_probe_model_source_accepts_exact_teacher_and_validated_awq():

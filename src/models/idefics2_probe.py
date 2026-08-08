@@ -283,17 +283,42 @@ def dequantize_probe_representations(
 
 
 class FrozenIdefics2UtilityProbe(nn.Module):
-    """A scalar linear probe over frozen, pair-conditioned Idefics2 states."""
+    """A scalar probe over frozen, pair-conditioned Idefics2 states."""
 
-    def __init__(self, input_dim: int, dropout: float = 0.0) -> None:
+    def __init__(
+        self,
+        input_dim: int,
+        dropout: float = 0.0,
+        *,
+        architecture: str = "linear",
+        hidden_dim: int = 256,
+    ) -> None:
         super().__init__()
         if input_dim <= 0:
             raise ValueError("input_dim must be positive")
         if not 0 <= dropout < 1:
             raise ValueError("dropout must be in [0, 1)")
+        if architecture not in {"linear", "layernorm_mlp"}:
+            raise ValueError("architecture must be linear or layernorm_mlp")
+        if hidden_dim <= 0:
+            raise ValueError("hidden_dim must be positive")
         self.input_dim = int(input_dim)
-        self.dropout = nn.Dropout(float(dropout))
-        self.scorer = nn.Linear(self.input_dim, 1)
+        self.architecture = architecture
+        self.hidden_dim = int(hidden_dim)
+        if architecture == "linear":
+            # Retain the original module names so existing linear checkpoints
+            # continue to load with ``scorer.weight`` and ``scorer.bias``.
+            self.dropout = nn.Dropout(float(dropout))
+            self.scorer = nn.Linear(self.input_dim, 1)
+        else:
+            self.dropout = None
+            self.scorer = nn.Sequential(
+                nn.LayerNorm(self.input_dim),
+                nn.Linear(self.input_dim, self.hidden_dim),
+                nn.GELU(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(self.hidden_dim, 1),
+            )
 
     def forward(
         self,
@@ -308,5 +333,8 @@ class FrozenIdefics2UtilityProbe(nn.Module):
             raise ValueError("pair representation width differs from input_dim")
         if candidate_mask.shape != pair_representations.shape[:2]:
             raise ValueError("candidate_mask shape does not match representations")
-        scores = self.scorer(self.dropout(pair_representations.float())).squeeze(-1)
+        features = pair_representations.float()
+        if self.dropout is not None:
+            features = self.dropout(features)
+        scores = self.scorer(features).squeeze(-1)
         return scores.masked_fill(~candidate_mask.bool(), torch.finfo(scores.dtype).min)

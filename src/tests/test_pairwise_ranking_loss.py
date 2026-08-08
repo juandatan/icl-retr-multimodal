@@ -46,3 +46,16 @@ def test_empty_pair_loss_remains_differentiable():
     loss.backward()
     assert scores.grad is not None
     assert scores.grad.item() == 0.0
+
+
+def test_teacher_relevance_weighting_prioritizes_top_candidate_pairs():
+    targets = torch.tensor([[1.0, 0.5, 0.0]])
+    # Both pairs containing the top candidate are correct; the only incorrect
+    # ordering is between the two lower-utility candidates.
+    scores = torch.tensor([[1.0, -1.0, 0.0]])
+    uniform = PairwiseRankingLoss(min_target_gap=0.0)(scores, targets)
+    top_weighted = PairwiseRankingLoss(
+        min_target_gap=0.0,
+        teacher_weight_temperature=0.1,
+    )(scores, targets)
+    assert top_weighted < uniform

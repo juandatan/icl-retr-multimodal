@@ -16,7 +16,6 @@ import hydra
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
-from torch.nn import functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
@@ -26,12 +25,19 @@ from src.data.idefics2_probe_dataset import (  # noqa: E402
     FrozenIdefics2ProbeDataset,
     collate_frozen_idefics2_probe_queries,
 )
+from src.losses.listwise import HybridListwisePairwiseLoss  # noqa: E402
+from src.losses.pairwise_ranking import PairwiseRankingLoss  # noqa: E402
+from src.losses.pointwise import (  # noqa: E402
+    HybridPointwisePairwiseLoss,
+    MaskedSoftLabelBCELoss,
+)
 from src.models.idefics2_probe import FrozenIdefics2UtilityProbe  # noqa: E402
 from src.utils.reranker_metrics import reranker_selection_metrics  # noqa: E402
 from src.utils.runtime import file_sha256, git_revision  # noqa: E402
 
 
 SUPPORTED_TARGETS = {
+    "margin",
     "mean_token_probability",
     "normalized_incremental_mean_token_probability",
     # Retained as K=32 closed-set ablations, not as paper-faithful defaults.
@@ -68,8 +74,8 @@ def _experiment_name(cfg: DictConfig) -> str:
         json.dumps(signature, sort_keys=True).encode("utf-8")
     ).hexdigest()[:8]
     return (
-        f"frozen_idefics2_probe-{cfg.data.target}-"
-        f"seed{int(cfg.experiment.seed)}-{digest}"
+        f"frozen_idefics2_probe-{cfg.model.architecture}-{cfg.data.target}-"
+        f"{cfg.objective.name}-seed{int(cfg.experiment.seed)}-{digest}"
     )
 
 
@@ -82,22 +88,67 @@ def _move(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     }
 
 
-def _pointwise_loss(
-    scores: torch.Tensor,
-    targets: torch.Tensor,
-    mask: torch.Tensor,
-) -> torch.Tensor:
-    return F.binary_cross_entropy_with_logits(scores[mask], targets[mask])
+def _build_objective(cfg: DictConfig):
+    name = str(cfg.objective.name)
+    configured_teacher_temperature = cfg.objective.get(
+        "pairwise_teacher_weight_temperature", None
+    )
+    teacher_temperature = (
+        None
+        if configured_teacher_temperature is None
+        else float(configured_teacher_temperature)
+    )
+    if name == "pointwise_bce":
+        return MaskedSoftLabelBCELoss()
+    if name == "pairwise":
+        return PairwiseRankingLoss(
+            min_target_gap=float(cfg.objective.pairwise_min_target_gap),
+            score_temperature=float(cfg.objective.pairwise_score_temperature),
+            teacher_weight_temperature=teacher_temperature,
+        )
+    if name == "pointwise_pairwise":
+        return HybridPointwisePairwiseLoss(
+            pairwise_weight=float(cfg.objective.hybrid_pairwise_weight),
+            min_target_gap=float(cfg.objective.pairwise_min_target_gap),
+            score_temperature=float(cfg.objective.pairwise_score_temperature),
+            teacher_weight_temperature=teacher_temperature,
+        )
+    if name == "hybrid_listwise_pairwise":
+        if teacher_temperature is not None:
+            raise ValueError(
+                "pairwise_teacher_weight_temperature is not supported by "
+                "hybrid_listwise_pairwise"
+            )
+        return HybridListwisePairwiseLoss(
+            listwise_weight=float(cfg.objective.hybrid_listwise_weight),
+            min_target_gap=float(cfg.objective.pairwise_min_target_gap),
+            score_temperature=float(cfg.objective.pairwise_score_temperature),
+        )
+    raise ValueError(
+        "objective.name must be pointwise_bce, pairwise, pointwise_pairwise, "
+        "or hybrid_listwise_pairwise"
+    )
 
 
-def train_one_epoch(model, loader, optimizer, device) -> float:
+def _objective_loss(objective, scores, batch) -> torch.Tensor:
+    if isinstance(objective, HybridListwisePairwiseLoss):
+        return objective(
+            scores,
+            batch["targets"],
+            batch["teacher_correct"],
+            batch["candidate_mask"],
+        )
+    return objective(scores, batch["targets"], batch["candidate_mask"])
+
+
+def train_one_epoch(model, loader, optimizer, objective, device) -> float:
     model.train()
     losses = []
     for batch in loader:
         batch = _move(batch, device)
         optimizer.zero_grad(set_to_none=True)
         scores = model(batch["pair_representations"], batch["candidate_mask"])
-        loss = _pointwise_loss(scores, batch["targets"], batch["candidate_mask"])
+        loss = _objective_loss(objective, scores, batch)
         loss.backward()
         optimizer.step()
         losses.append(float(loss.item()))
@@ -105,9 +156,10 @@ def train_one_epoch(model, loader, optimizer, device) -> float:
 
 
 @torch.no_grad()
-def evaluate(model, loader, device) -> dict[str, float]:
+def evaluate(model, loader, objective, device) -> dict[str, float]:
     model.eval()
     losses = []
+    component_losses: dict[str, list[float]] = {}
     collected = {
         name: []
         for name in (
@@ -121,8 +173,30 @@ def evaluate(model, loader, device) -> dict[str, float]:
     for batch in loader:
         batch = _move(batch, device)
         scores = model(batch["pair_representations"], batch["candidate_mask"])
-        loss = _pointwise_loss(scores, batch["targets"], batch["candidate_mask"])
+        loss = _objective_loss(objective, scores, batch)
         losses.append(float(loss.item()))
+        if isinstance(objective, HybridPointwisePairwiseLoss):
+            components = {
+                "pointwise_loss_component": objective.pointwise(
+                    scores, batch["targets"], batch["candidate_mask"]
+                ),
+                "pairwise_loss_component": objective.pairwise(
+                    scores, batch["targets"], batch["candidate_mask"]
+                ),
+            }
+            for name, value in components.items():
+                component_losses.setdefault(name, []).append(float(value.item()))
+        elif isinstance(objective, HybridListwisePairwiseLoss):
+            components = {
+                "pairwise_loss_component": objective.pairwise(
+                    scores, batch["targets"], batch["candidate_mask"]
+                ),
+                "listwise_loss_component": objective.listwise(
+                    scores, batch["teacher_correct"], batch["candidate_mask"]
+                ),
+            }
+            for name, value in components.items():
+                component_losses.setdefault(name, []).append(float(value.item()))
         values = {
             "scores": scores,
             "targets": batch["targets"],
@@ -141,6 +215,10 @@ def evaluate(model, loader, device) -> dict[str, float]:
         arrays["candidate_mask"],
     )
     metrics["loss"] = float(np.mean(losses))
+    metrics.update({
+        name: float(np.mean(values))
+        for name, values in component_losses.items()
+    })
     return metrics
 
 
@@ -163,6 +241,18 @@ def _print_epoch(
     marker = "  new best" if improved else ""
     print(f"\nEpoch {epoch}/{total_epochs}{marker}")
     print(f"  Loss       train {train_loss:.6f}   validation {metrics['loss']:.6f}")
+    if "pointwise_loss_component" in metrics:
+        print(
+            "  Components "
+            f"pointwise {metrics['pointwise_loss_component']:.6f}   "
+            f"pairwise {metrics['pairwise_loss_component']:.6f}"
+        )
+    elif "listwise_loss_component" in metrics:
+        print(
+            "  Components "
+            f"pairwise {metrics['pairwise_loss_component']:.6f}   "
+            f"listwise {metrics['listwise_loss_component']:.6f}"
+        )
     print(
         "  Selection  "
         f"accuracy {metrics['restricted_selected_accuracy']:.3%}   "
@@ -195,6 +285,17 @@ def main(cfg: DictConfig) -> None:
         raise ValueError(
             f"Frozen probe target must be one of {sorted(SUPPORTED_TARGETS)}"
         )
+    objective_name = str(cfg.objective.name)
+    if objective_name == "pointwise_bce" and target == "margin":
+        raise ValueError("pointwise_bce requires a probability target, not margin")
+    if objective_name == "pointwise_pairwise" and target == "margin":
+        raise ValueError(
+            "pointwise_pairwise includes BCE and requires a probability target"
+        )
+    if objective_name == "hybrid_listwise_pairwise" and target != "margin":
+        raise ValueError(
+            "hybrid_listwise_pairwise requires data.target=margin"
+        )
     artifact_path = Path(cfg.data.artifact_path)
     with artifact_path.open("rb") as file:
         artifact = pickle.load(file)
@@ -222,25 +323,30 @@ def main(cfg: DictConfig) -> None:
     val_loader = DataLoader(val_data, shuffle=False, **loader_kwargs)
 
     device = _device()
+    architecture = str(cfg.model.architecture)
     model = FrozenIdefics2UtilityProbe(
         input_dim=train_data.input_dim,
         dropout=float(cfg.model.dropout),
+        architecture=architecture,
+        hidden_dim=int(cfg.model.hidden_dim),
     ).to(device)
     optimizer = AdamW(
         model.parameters(),
         lr=float(cfg.optimization.learning_rate),
         weight_decay=float(cfg.optimization.weight_decay),
     )
+    objective = _build_objective(cfg)
     run_name = _experiment_name(cfg)
     run_dir = Path(cfg.output.dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     print(
-        f"Training frozen Idefics2 linear probe on {device}: "
+        f"Training frozen Idefics2 {architecture} probe on {device}: "
         f"{len(train_data)} train / {len(val_data)} val queries; "
         f"{sum(parameter.numel() for parameter in model.parameters()):,} parameters"
     )
     print(
-        f"Run {run_name}: target={target}, seed={seed}, "
+        f"Run {run_name}: architecture={architecture}, target={target}, seed={seed}, "
+        f"objective={objective_name}, "
         "inputs=[exemplar image, exemplar label, query image]"
     )
     print("K=32 labels and query ground truth are supervision only, never model inputs")
@@ -264,8 +370,10 @@ def main(cfg: DictConfig) -> None:
         "git_revision": git_revision(),
     }
     for epoch in range(1, total_epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device)
-        metrics = evaluate(model, val_loader, device)
+        train_loss = train_one_epoch(
+            model, train_loader, optimizer, objective, device
+        )
+        metrics = evaluate(model, val_loader, objective, device)
         accuracy = float(metrics["restricted_selected_accuracy"])
         regret = float(metrics["mean_margin_regret"])
         improved = accuracy > best_accuracy or (
@@ -293,6 +401,8 @@ def main(cfg: DictConfig) -> None:
             "model_state_dict": model.state_dict(),
             "model_config": {
                 "input_dim": train_data.input_dim,
+                "architecture": architecture,
+                "hidden_dim": int(cfg.model.hidden_dim),
                 "dropout": float(cfg.model.dropout),
             },
             "resolved_config": OmegaConf.to_container(cfg, resolve=True),
@@ -324,7 +434,7 @@ def main(cfg: DictConfig) -> None:
     print(f"\nTraining complete: {stop_reason}")
     print(
         f"  Stopped at epoch {stop_epoch}; selected epoch {best_epoch}; "
-        f"target {target}"
+        f"architecture {architecture}; target {target}; objective {objective_name}"
     )
     print(
         "  Fixed K=32 baselines  "
@@ -342,6 +452,18 @@ def main(cfg: DictConfig) -> None:
         f"target-oracle {best_metrics['target_oracle_agreement']:.3%}   "
         f"target regret {best_metrics['mean_target_regret']:.6f}"
     )
+    if "pointwise_loss_component" in best_metrics:
+        print(
+            "    loss components  "
+            f"pointwise {best_metrics['pointwise_loss_component']:.6f}   "
+            f"pairwise {best_metrics['pairwise_loss_component']:.6f}"
+        )
+    elif "listwise_loss_component" in best_metrics:
+        print(
+            "    loss components  "
+            f"pairwise {best_metrics['pairwise_loss_component']:.6f}   "
+            f"listwise {best_metrics['listwise_loss_component']:.6f}"
+        )
     sys.stdout.flush()
 
 

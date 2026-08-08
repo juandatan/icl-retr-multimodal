@@ -4,6 +4,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from src.losses.pairwise_ranking import PairwiseRankingLoss
+
 
 class MaskedSoftLabelBCELoss(nn.Module):
     """Binary cross entropy between score logits and dense utilities in [0, 1]."""
@@ -52,3 +54,36 @@ class MaskedHuberLoss(nn.Module):
         return F.huber_loss(
             scores[candidate_mask], targets[candidate_mask], delta=self.delta
         )
+
+
+class HybridPointwisePairwiseLoss(nn.Module):
+    """Combine calibrated soft-label prediction with within-query ranking."""
+
+    def __init__(
+        self,
+        *,
+        pairwise_weight: float = 0.1,
+        min_target_gap: float = 0.02,
+        score_temperature: float = 1.0,
+        teacher_weight_temperature: float | None = None,
+    ) -> None:
+        super().__init__()
+        if pairwise_weight < 0:
+            raise ValueError("pairwise_weight must be non-negative")
+        self.pairwise_weight = float(pairwise_weight)
+        self.pointwise = MaskedSoftLabelBCELoss()
+        self.pairwise = PairwiseRankingLoss(
+            min_target_gap=min_target_gap,
+            score_temperature=score_temperature,
+            teacher_weight_temperature=teacher_weight_temperature,
+        )
+
+    def forward(
+        self,
+        scores: torch.Tensor,
+        targets: torch.Tensor,
+        candidate_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        pointwise_loss = self.pointwise(scores, targets, candidate_mask)
+        pairwise_loss = self.pairwise(scores, targets, candidate_mask)
+        return pointwise_loss + self.pairwise_weight * pairwise_loss

@@ -57,14 +57,18 @@ class PairwiseRankingLoss(nn.Module):
         self,
         min_target_gap: float = 0.02,
         score_temperature: float = 1.0,
+        teacher_weight_temperature: float | None = None,
     ) -> None:
         super().__init__()
         if min_target_gap < 0:
             raise ValueError("min_target_gap must be non-negative")
         if score_temperature <= 0:
             raise ValueError("score_temperature must be positive")
+        if teacher_weight_temperature is not None and teacher_weight_temperature <= 0:
+            raise ValueError("teacher_weight_temperature must be positive or None")
         self.min_target_gap = min_target_gap
         self.score_temperature = score_temperature
+        self.teacher_weight_temperature = teacher_weight_temperature
 
     def forward(
         self,
@@ -79,7 +83,29 @@ class PairwiseRankingLoss(nn.Module):
             return scores.sum() * 0.0
         preference = torch.sign(target_differences[valid_pairs])
         predicted_difference = score_differences[valid_pairs] / self.score_temperature
-        return F.softplus(-preference * predicted_difference).mean()
+        losses = F.softplus(-preference * predicted_difference)
+        if self.teacher_weight_temperature is None:
+            return losses.mean()
+
+        # Query-local teacher relevance emphasizes pairs containing candidates
+        # near the top of the target ordering. Normalizing retained weights to
+        # mean one preserves the overall loss scale.
+        candidate_mask = (
+            candidate_mask
+            if candidate_mask is not None
+            else torch.ones_like(scores, dtype=torch.bool)
+        )
+        relevance = torch.softmax(
+            targets.masked_fill(~candidate_mask, -torch.inf)
+            / self.teacher_weight_temperature,
+            dim=1,
+        )
+        pair_weights = relevance.unsqueeze(2) + relevance.unsqueeze(1)
+        retained_weights = pair_weights[valid_pairs]
+        retained_weights = retained_weights / retained_weights.mean().clamp_min(
+            torch.finfo(retained_weights.dtype).eps
+        )
+        return (losses * retained_weights).mean()
 
 
 @torch.no_grad()
