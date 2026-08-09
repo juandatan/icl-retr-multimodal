@@ -2,7 +2,10 @@ from copy import deepcopy
 
 from omegaconf import OmegaConf
 
-from scripts.train_reranker import _resolve_experiment_name
+from scripts.train_reranker import (
+    _resolve_experiment_name,
+    _stratified_training_subset,
+)
 
 
 def _config():
@@ -50,3 +53,29 @@ def test_auto_experiment_name_changes_with_ablation_and_honors_explicit_name():
 
     baseline["experiment"]["name"] = "my-explicit-run"
     assert _resolve_experiment_name(OmegaConf.create(baseline)) == "my-explicit-run"
+
+
+def test_training_subset_is_class_stratified_and_reproducible():
+    class Dataset:
+        records = [
+            type("Record", (), {"true_class_idx": label})()
+            for label in ([0] * 8 + [1] * 2)
+        ]
+
+        def __len__(self):
+            return len(self.records)
+
+        def __getitem__(self, index):
+            return index
+
+    first = _stratified_training_subset(
+        Dataset(), max_queries=None, fraction=0.5, seed=7
+    )
+    second = _stratified_training_subset(
+        Dataset(), max_queries=None, fraction=0.5, seed=7
+    )
+    labels = [Dataset.records[index].true_class_idx for index in first.indices]
+
+    assert first.indices == second.indices
+    assert labels.count(0) == 4
+    assert labels.count(1) == 1

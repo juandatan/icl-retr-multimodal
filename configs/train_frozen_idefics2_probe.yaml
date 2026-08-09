@@ -14,6 +14,10 @@ data:
   incremental_lambda: 1.0
   batch_size: 128
   num_workers: 0
+  # Set one for proportional class-stratified learning curves.
+  max_train_queries: null
+  train_fraction: null
+  stratified_subset_seed: ${experiment.seed}
 
 model:
   # Options: linear, layernorm_mlp. Keep linear for the original accessibility
@@ -24,13 +28,14 @@ model:
 
 objective:
   # Options: pointwise_bce, pairwise, pointwise_pairwise,
-  # hybrid_listwise_pairwise. Pairwise comparisons are formed only within each
-  # query's retrieved exemplar pool.
+  # hybrid_listwise_pairwise, correctness_crossing_pairwise. Pairwise
+  # comparisons are formed only within each query's retrieved exemplar pool.
   name: pointwise_bce
   hybrid_pairwise_weight: 0.1
   hybrid_listwise_weight: 0.1
   pairwise_min_target_gap: 0.02
   pairwise_score_temperature: 1.0
+  correctness_margin_aux_weight: 0.0
   # Optional top-of-order weighting. When set, a query-local softmax over
   # teacher probabilities weights pairs containing high-utility candidates.
   # Lower values concentrate weight more strongly. Keep null for the first
@@ -42,6 +47,9 @@ optimization:
   learning_rate: 0.001
   weight_decay: 0.0001
   early_stopping_patience: 8
+
+logging:
+  evaluate_train_metrics: true
 
 output:
   dir: outputs/frozen_idefics2_probe_training

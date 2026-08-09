@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -26,14 +26,21 @@ from src.data.idefics2_probe_dataset import (  # noqa: E402
     collate_frozen_idefics2_probe_queries,
 )
 from src.losses.listwise import HybridListwisePairwiseLoss  # noqa: E402
-from src.losses.pairwise_ranking import PairwiseRankingLoss  # noqa: E402
+from src.losses.pairwise_ranking import (  # noqa: E402
+    CorrectnessCrossingPairwiseLoss,
+    PairwiseRankingLoss,
+)
 from src.losses.pointwise import (  # noqa: E402
     HybridPointwisePairwiseLoss,
     MaskedSoftLabelBCELoss,
 )
 from src.models.idefics2_probe import FrozenIdefics2UtilityProbe  # noqa: E402
 from src.utils.reranker_metrics import reranker_selection_metrics  # noqa: E402
-from src.utils.runtime import file_sha256, git_revision  # noqa: E402
+from src.utils.runtime import (  # noqa: E402
+    file_sha256,
+    git_revision,
+    stratified_sample_indices,
+)
 
 
 SUPPORTED_TARGETS = {
@@ -88,6 +95,33 @@ def _move(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     }
 
 
+def _stratified_training_subset(
+    dataset: FrozenIdefics2ProbeDataset,
+    *,
+    max_queries: int | None,
+    fraction: float | None,
+    seed: int,
+):
+    if max_queries is not None and fraction is not None:
+        raise ValueError("Set only one of max_train_queries and train_fraction")
+    if fraction is not None:
+        fraction = float(fraction)
+        if not 0 < fraction <= 1:
+            raise ValueError("train_fraction must be in (0, 1]")
+        count = max(1, int(round(len(dataset) * fraction)))
+    elif max_queries is not None:
+        count = int(max_queries)
+        if count <= 0:
+            raise ValueError("max_train_queries must be positive or null")
+        count = min(count, len(dataset))
+    else:
+        count = len(dataset)
+    if count == len(dataset):
+        return dataset
+    labels = [int(record.true_class_idx) for record in dataset.teacher.records]
+    return Subset(dataset, stratified_sample_indices(labels, count, seed))
+
+
 def _build_objective(cfg: DictConfig):
     name = str(cfg.objective.name)
     configured_teacher_temperature = cfg.objective.get(
@@ -124,9 +158,20 @@ def _build_objective(cfg: DictConfig):
             min_target_gap=float(cfg.objective.pairwise_min_target_gap),
             score_temperature=float(cfg.objective.pairwise_score_temperature),
         )
+    if name == "correctness_crossing_pairwise":
+        if teacher_temperature is not None:
+            raise ValueError(
+                "pairwise_teacher_weight_temperature is not supported by "
+                "correctness_crossing_pairwise"
+            )
+        return CorrectnessCrossingPairwiseLoss(
+            score_temperature=float(cfg.objective.pairwise_score_temperature),
+            margin_aux_weight=float(cfg.objective.correctness_margin_aux_weight),
+            margin_min_target_gap=float(cfg.objective.pairwise_min_target_gap),
+        )
     raise ValueError(
         "objective.name must be pointwise_bce, pairwise, pointwise_pairwise, "
-        "or hybrid_listwise_pairwise"
+        "hybrid_listwise_pairwise, or correctness_crossing_pairwise"
     )
 
 
@@ -135,6 +180,13 @@ def _objective_loss(objective, scores, batch) -> torch.Tensor:
         return objective(
             scores,
             batch["targets"],
+            batch["teacher_correct"],
+            batch["candidate_mask"],
+        )
+    if isinstance(objective, CorrectnessCrossingPairwiseLoss):
+        return objective(
+            scores,
+            batch["teacher_margins"],
             batch["teacher_correct"],
             batch["candidate_mask"],
         )
@@ -197,6 +249,21 @@ def evaluate(model, loader, objective, device) -> dict[str, float]:
             }
             for name, value in components.items():
                 component_losses.setdefault(name, []).append(float(value.item()))
+        elif isinstance(objective, CorrectnessCrossingPairwiseLoss):
+            components = {
+                "correctness_loss_component": objective.correctness(
+                    scores,
+                    batch["teacher_correct"],
+                    batch["candidate_mask"],
+                ),
+                "margin_aux_loss_component": objective.margin(
+                    scores,
+                    batch["teacher_margins"],
+                    batch["candidate_mask"],
+                ),
+            }
+            for name, value in components.items():
+                component_losses.setdefault(name, []).append(float(value.item()))
         values = {
             "scores": scores,
             "targets": batch["targets"],
@@ -232,6 +299,7 @@ def _print_epoch(
     epoch: int,
     total_epochs: int,
     train_loss: float,
+    train_metrics: dict[str, float] | None,
     metrics: dict[str, float],
     *,
     improved: bool,
@@ -240,7 +308,15 @@ def _print_epoch(
 ) -> None:
     marker = "  new best" if improved else ""
     print(f"\nEpoch {epoch}/{total_epochs}{marker}")
-    print(f"  Loss       train {train_loss:.6f}   validation {metrics['loss']:.6f}")
+    eval_train_loss = (
+        f"   train-eval {train_metrics['loss']:.6f}"
+        if train_metrics is not None
+        else ""
+    )
+    print(
+        f"  Loss       optimization {train_loss:.6f}{eval_train_loss}   "
+        f"validation {metrics['loss']:.6f}"
+    )
     if "pointwise_loss_component" in metrics:
         print(
             "  Components "
@@ -253,9 +329,21 @@ def _print_epoch(
             f"pairwise {metrics['pairwise_loss_component']:.6f}   "
             f"listwise {metrics['listwise_loss_component']:.6f}"
         )
+    elif "correctness_loss_component" in metrics:
+        print(
+            "  Components "
+            f"correctness {metrics['correctness_loss_component']:.6f}   "
+            f"margin-aux {metrics['margin_aux_loss_component']:.6f}"
+        )
+    train_accuracy = (
+        f"train {train_metrics['restricted_selected_accuracy']:.3%}   "
+        if train_metrics is not None
+        else ""
+    )
     print(
         "  Selection  "
-        f"accuracy {metrics['restricted_selected_accuracy']:.3%}   "
+        f"accuracy {train_accuracy}validation "
+        f"{metrics['restricted_selected_accuracy']:.3%}   "
         f"margin {metrics['mean_selected_margin']:.6f}   "
         f"regret {metrics['mean_margin_regret']:.6f}"
     )
@@ -310,6 +398,14 @@ def main(cfg: DictConfig) -> None:
     val_data = FrozenIdefics2ProbeDataset(split="val", **dataset_kwargs)
     if train_data.input_dim != val_data.input_dim:
         raise ValueError("Train and validation probe representations differ in width")
+    input_dim = train_data.input_dim
+    cache_metadata = train_data.metadata
+    train_data = _stratified_training_subset(
+        train_data,
+        max_queries=cfg.data.get("max_train_queries", None),
+        fraction=cfg.data.get("train_fraction", None),
+        seed=int(cfg.data.get("stratified_subset_seed", seed)),
+    )
     generator = torch.Generator().manual_seed(seed)
     loader_kwargs = {
         "batch_size": int(cfg.data.batch_size),
@@ -320,12 +416,13 @@ def main(cfg: DictConfig) -> None:
     train_loader = DataLoader(
         train_data, shuffle=True, generator=generator, **loader_kwargs
     )
+    train_eval_loader = DataLoader(train_data, shuffle=False, **loader_kwargs)
     val_loader = DataLoader(val_data, shuffle=False, **loader_kwargs)
 
     device = _device()
     architecture = str(cfg.model.architecture)
     model = FrozenIdefics2UtilityProbe(
-        input_dim=train_data.input_dim,
+        input_dim=input_dim,
         dropout=float(cfg.model.dropout),
         architecture=architecture,
         hidden_dim=int(cfg.model.hidden_dim),
@@ -358,6 +455,7 @@ def main(cfg: DictConfig) -> None:
     best_regret = math.inf
     best_epoch = 0
     best_metrics: dict[str, float] = {}
+    best_train_metrics: dict[str, float] | None = None
     patience = 0
     history = []
     stop_reason = f"reached the {total_epochs}-epoch limit"
@@ -366,12 +464,17 @@ def main(cfg: DictConfig) -> None:
         "artifact_path": str(artifact_path.resolve()),
         "artifact_sha256": file_sha256(artifact_path),
         "probe_cache_path": str(Path(cfg.data.probe_cache_path).resolve()),
-        "probe_cache_metadata": train_data.metadata,
+        "probe_cache_metadata": cache_metadata,
         "git_revision": git_revision(),
     }
     for epoch in range(1, total_epochs + 1):
         train_loss = train_one_epoch(
             model, train_loader, optimizer, objective, device
+        )
+        train_metrics = (
+            evaluate(model, train_eval_loader, objective, device)
+            if bool(cfg.logging.get("evaluate_train_metrics", True))
+            else None
         )
         metrics = evaluate(model, val_loader, objective, device)
         accuracy = float(metrics["restricted_selected_accuracy"])
@@ -385,12 +488,25 @@ def main(cfg: DictConfig) -> None:
             best_regret = regret
             best_epoch = epoch
             best_metrics = {name: float(value) for name, value in metrics.items()}
+            best_train_metrics = (
+                {name: float(value) for name, value in train_metrics.items()}
+                if train_metrics is not None
+                else None
+            )
             patience = 0
         else:
             patience += 1
         row = {
             "epoch": epoch,
             "train_loss": train_loss,
+            **(
+                {
+                    f"train_eval_{name}": float(value)
+                    for name, value in train_metrics.items()
+                }
+                if train_metrics is not None
+                else {}
+            ),
             **metrics,
             "best_epoch": best_epoch,
             "epochs_without_improvement": patience,
@@ -400,7 +516,7 @@ def main(cfg: DictConfig) -> None:
             "experiment_name": run_name,
             "model_state_dict": model.state_dict(),
             "model_config": {
-                "input_dim": train_data.input_dim,
+                "input_dim": input_dim,
                 "architecture": architecture,
                 "hidden_dim": int(cfg.model.hidden_dim),
                 "dropout": float(cfg.model.dropout),
@@ -408,9 +524,11 @@ def main(cfg: DictConfig) -> None:
             "resolved_config": OmegaConf.to_container(cfg, resolve=True),
             "epoch": epoch,
             "metrics": metrics,
+            "train_metrics": train_metrics,
             "history": history,
             "best_epoch": best_epoch,
             "best_metrics": best_metrics,
+            "best_train_metrics": best_train_metrics,
             "provenance": provenance,
         }
         _atomic_save(checkpoint, run_dir / "last.pt")
@@ -421,6 +539,7 @@ def main(cfg: DictConfig) -> None:
             epoch,
             total_epochs,
             train_loss,
+            train_metrics,
             metrics,
             improved=improved,
             best_epoch=best_epoch,
@@ -444,7 +563,12 @@ def main(cfg: DictConfig) -> None:
     print(
         "  Selected-checkpoint metrics\n"
         f"    loss {best_metrics['loss']:.6f}   "
-        f"accuracy {best_metrics['restricted_selected_accuracy']:.3%}\n"
+        + (
+            f"train accuracy {best_train_metrics['restricted_selected_accuracy']:.3%}   "
+            if best_train_metrics is not None
+            else ""
+        )
+        + f"validation accuracy {best_metrics['restricted_selected_accuracy']:.3%}\n"
         f"    selected margin {best_metrics['mean_selected_margin']:.6f}   "
         f"margin regret {best_metrics['mean_margin_regret']:.6f}   "
         f"Spearman {best_metrics['mean_margin_spearman']:.6f}\n"
@@ -463,6 +587,12 @@ def main(cfg: DictConfig) -> None:
             "    loss components  "
             f"pairwise {best_metrics['pairwise_loss_component']:.6f}   "
             f"listwise {best_metrics['listwise_loss_component']:.6f}"
+        )
+    elif "correctness_loss_component" in best_metrics:
+        print(
+            "    loss components  "
+            f"correctness {best_metrics['correctness_loss_component']:.6f}   "
+            f"margin-aux {best_metrics['margin_aux_loss_component']:.6f}"
         )
     sys.stdout.flush()
 

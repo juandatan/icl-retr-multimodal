@@ -108,6 +108,92 @@ class PairwiseRankingLoss(nn.Module):
         return (losses * retained_weights).mean()
 
 
+class TeacherCorrectnessCrossingLoss(nn.Module):
+    """Query-balanced Bradley–Terry loss over positive/negative pairs only."""
+
+    def __init__(self, score_temperature: float = 1.0) -> None:
+        super().__init__()
+        if score_temperature <= 0:
+            raise ValueError("score_temperature must be positive")
+        self.score_temperature = float(score_temperature)
+
+    def forward(
+        self,
+        scores: torch.Tensor,
+        teacher_correct: torch.Tensor,
+        candidate_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if teacher_correct.shape != scores.shape or teacher_correct.dtype != torch.bool:
+            raise ValueError("teacher_correct must be boolean and match scores")
+        score_differences, target_differences, valid_pairs = _pairwise_differences(
+            scores,
+            teacher_correct.to(dtype=scores.dtype),
+            candidate_mask,
+            min_target_gap=0.0,
+        )
+        if not valid_pairs.any():
+            return scores.sum() * 0.0
+        preferences = torch.sign(target_differences[valid_pairs])
+        losses = F.softplus(
+            -preferences
+            * score_differences[valid_pairs]
+            / self.score_temperature
+        )
+        query_indices = valid_pairs.nonzero(as_tuple=False)[:, 0]
+        loss_sums = scores.new_zeros(scores.shape[0])
+        pair_counts = scores.new_zeros(scores.shape[0])
+        loss_sums.scatter_add_(0, query_indices, losses)
+        pair_counts.scatter_add_(0, query_indices, torch.ones_like(losses))
+        eligible = pair_counts > 0
+        return (loss_sums[eligible] / pair_counts[eligible]).mean()
+
+
+class CorrectnessCrossingPairwiseLoss(nn.Module):
+    """Prefer every teacher-correct candidate over every incorrect candidate.
+
+    Comparisons within the correct set or within the incorrect set are omitted:
+    neither can change top-1 correctness. Queries with no crossing pair produce
+    zero correctness loss. A raw-margin auxiliary can optionally retain teacher
+    utility ordering, including on all-incorrect queries.
+    """
+
+    def __init__(
+        self,
+        *,
+        score_temperature: float = 1.0,
+        margin_aux_weight: float = 0.0,
+        margin_min_target_gap: float = 0.02,
+    ) -> None:
+        super().__init__()
+        if margin_aux_weight < 0:
+            raise ValueError("margin_aux_weight must be non-negative")
+        self.margin_aux_weight = float(margin_aux_weight)
+        self.correctness = TeacherCorrectnessCrossingLoss(score_temperature)
+        self.margin = PairwiseRankingLoss(
+            min_target_gap=margin_min_target_gap,
+            score_temperature=score_temperature,
+        )
+
+    def forward(
+        self,
+        scores: torch.Tensor,
+        margin_targets: torch.Tensor,
+        teacher_correct: torch.Tensor,
+        candidate_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if teacher_correct.shape != scores.shape or teacher_correct.dtype != torch.bool:
+            raise ValueError("teacher_correct must be boolean and match scores")
+        correctness_loss = self.correctness(
+            scores,
+            teacher_correct,
+            candidate_mask,
+        )
+        if self.margin_aux_weight == 0:
+            return correctness_loss
+        margin_loss = self.margin(scores, margin_targets, candidate_mask)
+        return correctness_loss + self.margin_aux_weight * margin_loss
+
+
 @torch.no_grad()
 def pairwise_ranking_accuracy(
     scores: torch.Tensor,

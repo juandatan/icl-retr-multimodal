@@ -24,6 +24,7 @@ from scripts.build_frozen_idefics2_probe_cache import _validate_probe_model_sour
 from scripts.train_frozen_idefics2_probe import _build_objective, _objective_loss
 from src.losses.listwise import HybridListwisePairwiseLoss
 from src.losses.pairwise_ranking import PairwiseRankingLoss
+from src.losses.pairwise_ranking import CorrectnessCrossingPairwiseLoss
 from src.losses.pointwise import MaskedSoftLabelBCELoss
 from src.losses.pointwise import HybridPointwisePairwiseLoss
 
@@ -273,15 +274,26 @@ def test_frozen_probe_objective_factory_supports_pointwise_and_pairwise():
             "pairwise_teacher_weight_temperature": None,
         }
     }))
+    correctness = _build_objective(OmegaConf.create({
+        "objective": {
+            "name": "correctness_crossing_pairwise",
+            "correctness_margin_aux_weight": 0.1,
+            "pairwise_min_target_gap": 0.02,
+            "pairwise_score_temperature": 1.0,
+            "pairwise_teacher_weight_temperature": None,
+        }
+    }))
 
     assert isinstance(pointwise, MaskedSoftLabelBCELoss)
     assert isinstance(pairwise, PairwiseRankingLoss)
     assert isinstance(hybrid, HybridPointwisePairwiseLoss)
     assert isinstance(listwise_hybrid, HybridListwisePairwiseLoss)
+    assert isinstance(correctness, CorrectnessCrossingPairwiseLoss)
     assert pairwise.min_target_gap == 0.03
     assert pairwise.score_temperature == 0.5
     assert hybrid.pairwise_weight == 0.1
     assert listwise_hybrid.listwise_weight == 0.1
+    assert correctness.margin_aux_weight == 0.1
 
 
 def test_hybrid_probe_loss_is_weighted_sum_of_components():

@@ -89,6 +89,52 @@ def stratified_query_indices(
     return selected
 
 
+def stratified_sample_indices(
+    labels: Sequence[int],
+    sample_count: int,
+    seed: int,
+) -> list[int]:
+    """Return a reproducible proportional stratified sample of row indices."""
+    labels = [int(label) for label in labels]
+    if not labels:
+        raise ValueError("labels must not be empty")
+    if sample_count <= 0 or sample_count > len(labels):
+        raise ValueError("sample_count must be in [1, len(labels)]")
+    if sample_count == len(labels):
+        return list(range(len(labels)))
+
+    by_class: dict[int, list[int]] = defaultdict(list)
+    for index, label in enumerate(labels):
+        by_class[label].append(index)
+
+    rng = np.random.default_rng(seed)
+    classes = sorted(by_class)
+    expected = {
+        label: sample_count * len(by_class[label]) / len(labels)
+        for label in classes
+    }
+    allocations = {label: int(np.floor(expected[label])) for label in classes}
+    remaining = sample_count - sum(allocations.values())
+    # Random tie-breaking avoids systematically favoring low class indices.
+    tie_breakers = {label: float(rng.random()) for label in classes}
+    priority = sorted(
+        classes,
+        key=lambda label: (expected[label] - allocations[label], tie_breakers[label]),
+        reverse=True,
+    )
+    for label in priority[:remaining]:
+        allocations[label] += 1
+
+    selected: list[int] = []
+    for label in classes:
+        candidates = np.asarray(by_class[label], dtype=np.int64)
+        count = allocations[label]
+        if count:
+            chosen = rng.choice(candidates, size=count, replace=False)
+            selected.extend(int(index) for index in chosen)
+    return sorted(selected)
+
+
 def _count_gpus_without_cuda_init() -> int:
     """Count GPUs without initializing CUDA in the parent process."""
     try:

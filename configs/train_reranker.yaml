@@ -19,6 +19,11 @@ data:
   batch_size: 64
   num_workers: 0
   max_train_queries: null
+  # Set one of these for proportional class-stratified learning curves. The
+  # full-data default leaves both null. Examples: train_fraction=0.25 or
+  # max_train_queries=2061.
+  train_fraction: null
+  stratified_subset_seed: ${experiment.seed}
   max_val_queries: null
 
 model:
@@ -48,12 +53,16 @@ model:
 
 objective:
   # Options: pointwise_bce, pairwise, listwise_correctness,
-  # hybrid_listwise_pairwise, huber.
+  # hybrid_listwise_pairwise, correctness_crossing_pairwise, huber.
   # listwise_correctness skips queries with no teacher-correct candidate.
   name: pointwise_bce
   hybrid_listwise_weight: 0.25
   pairwise_min_target_gap: 0.02
   pairwise_score_temperature: 1.0
+  # Used only by correctness_crossing_pairwise. Zero trains solely on
+  # teacher-correct versus teacher-incorrect pairs. A small value retains raw
+  # margin ordering as an auxiliary, including for all-incorrect queries.
+  correctness_margin_aux_weight: 0.0
   huber_delta: 1.0
 
 optimization:
@@ -71,6 +80,9 @@ optimization:
   amp: false
 
 logging:
+  # Run deterministic inference on the training subset after every epoch so
+  # train/validation selection accuracy and generalization gap are visible.
+  evaluate_train_metrics: true
   # Visual-token epochs can be long. Emit a flushed train/validation heartbeat
   # at this interval; the complete metrics block is still printed once per epoch.
   # Set to 0 to disable heartbeats.

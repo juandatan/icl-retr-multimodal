@@ -1,6 +1,7 @@
 import torch
 
 from src.losses.pairwise_ranking import (
+    CorrectnessCrossingPairwiseLoss,
     PairwiseRankingLoss,
     pairwise_ranking_accuracy,
 )
@@ -59,3 +60,28 @@ def test_teacher_relevance_weighting_prioritizes_top_candidate_pairs():
         teacher_weight_temperature=0.1,
     )(scores, targets)
     assert top_weighted < uniform
+
+
+def test_correctness_crossing_ignores_within_status_ordering():
+    correct = torch.tensor([[True, True, False, False]])
+    margins = torch.tensor([[2.0, 1.0, -1.0, -2.0]])
+    mask = torch.ones_like(correct)
+    objective = CorrectnessCrossingPairwiseLoss()
+
+    first = objective(
+        torch.tensor([[2.0, 1.0, -1.0, -2.0]]), margins, correct, mask
+    )
+    second = objective(
+        torch.tensor([[1.0, 2.0, -2.0, -1.0]]), margins, correct, mask
+    )
+    torch.testing.assert_close(first, second)
+
+
+def test_correctness_crossing_skips_queries_without_both_statuses():
+    scores = torch.zeros((2, 3), requires_grad=True)
+    correct = torch.tensor([[True, True, True], [False, False, False]])
+    mask = torch.ones_like(correct)
+    loss = CorrectnessCrossingPairwiseLoss()(scores, scores.detach(), correct, mask)
+    loss.backward()
+    assert loss.item() == 0.0
+    assert torch.all(scores.grad == 0)

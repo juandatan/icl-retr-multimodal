@@ -15,6 +15,7 @@ from src.models.idefics2_wrapper import (
     PREFIX_KV_CACHE_SCORING,
     Idefics2Wrapper,
 )
+from src.utils.runtime import stratified_sample_indices
 
 
 def test_stratified_sample_balances_classes_and_is_reproducible():
@@ -29,6 +30,18 @@ def test_stratified_sample_balances_classes_and_is_reproducible():
     assert first == second
     assert len(first) == len(set(first)) == 8
     assert counts.max() - counts.min() <= 1
+
+
+def test_proportional_stratified_rows_preserve_imbalanced_class_ratio():
+    labels = [0] * 8 + [1] * 2
+    first = stratified_sample_indices(labels, sample_count=5, seed=7)
+    second = stratified_sample_indices(labels, sample_count=5, seed=7)
+    selected_labels = np.asarray(labels)[first]
+
+    assert first == second
+    assert len(first) == len(set(first)) == 5
+    assert np.sum(selected_labels == 0) == 4
+    assert np.sum(selected_labels == 1) == 1
 
 
 def test_closed_set_metrics_reports_rank_margin_and_probability():

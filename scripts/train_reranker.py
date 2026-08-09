@@ -32,11 +32,18 @@ from src.losses.listwise import (  # noqa: E402
     HybridListwisePairwiseLoss,
     MultiplePositiveListwiseLoss,
 )
-from src.losses.pairwise_ranking import PairwiseRankingLoss  # noqa: E402
+from src.losses.pairwise_ranking import (  # noqa: E402
+    CorrectnessCrossingPairwiseLoss,
+    PairwiseRankingLoss,
+)
 from src.losses.pointwise import MaskedHuberLoss, MaskedSoftLabelBCELoss  # noqa: E402
 from src.models.reranker import LabelAwareReranker, RerankerConfig  # noqa: E402
 from src.utils.reranker_metrics import reranker_selection_metrics  # noqa: E402
-from src.utils.runtime import file_sha256, git_revision  # noqa: E402
+from src.utils.runtime import (  # noqa: E402
+    file_sha256,
+    git_revision,
+    stratified_sample_indices,
+)
 
 
 POOLED_MODEL_INPUTS = (
@@ -117,6 +124,35 @@ def _limit(dataset, count: int | None):
     return Subset(dataset, range(int(count)))
 
 
+def _stratified_training_subset(
+    dataset,
+    *,
+    max_queries: int | None,
+    fraction: float | None,
+    seed: int,
+):
+    """Build a proportional class-stratified learning-curve subset."""
+    if max_queries is not None and fraction is not None:
+        raise ValueError("Set only one of max_train_queries and train_fraction")
+    if fraction is not None:
+        fraction = float(fraction)
+        if not 0 < fraction <= 1:
+            raise ValueError("train_fraction must be in (0, 1]")
+        count = max(1, int(round(len(dataset) * fraction)))
+    elif max_queries is not None:
+        count = int(max_queries)
+        if count <= 0:
+            raise ValueError("max_train_queries must be positive or null")
+        count = min(count, len(dataset))
+    else:
+        count = len(dataset)
+    if count == len(dataset):
+        return dataset
+    labels = [int(record.true_class_idx) for record in dataset.records]
+    indices = stratified_sample_indices(labels, count, seed)
+    return Subset(dataset, indices)
+
+
 def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return {
         key: value.to(device, non_blocking=True)
@@ -142,6 +178,12 @@ def _build_objective(cfg: DictConfig):
             listwise_weight=float(cfg.objective.hybrid_listwise_weight),
             min_target_gap=float(cfg.objective.pairwise_min_target_gap),
             score_temperature=float(cfg.objective.pairwise_score_temperature),
+        )
+    if name == "correctness_crossing_pairwise":
+        return CorrectnessCrossingPairwiseLoss(
+            score_temperature=float(cfg.objective.pairwise_score_temperature),
+            margin_aux_weight=float(cfg.objective.correctness_margin_aux_weight),
+            margin_min_target_gap=float(cfg.objective.pairwise_min_target_gap),
         )
     if name == "huber":
         return MaskedHuberLoss(delta=float(cfg.objective.huber_delta))
@@ -183,10 +225,17 @@ def _objective_targets(batch: dict[str, Any], objective_name: str) -> torch.Tens
 
 
 def _objective_loss(objective, objective_name: str, scores, batch):
-    if objective_name == "hybrid_listwise_pairwise":
+    if objective_name in {
+        "hybrid_listwise_pairwise",
+        "correctness_crossing_pairwise",
+    }:
         return objective(
             scores,
-            batch["targets"],
+            batch[
+                "teacher_margins"
+                if objective_name == "correctness_crossing_pairwise"
+                else "targets"
+            ],
             batch["teacher_correct"],
             batch["candidate_mask"],
         )
@@ -208,11 +257,52 @@ def _hybrid_objective_components(objective, scores, batch) -> dict[str, float]:
     }
 
 
+def _correctness_objective_components(objective, scores, batch) -> dict[str, float]:
+    return {
+        "correctness_loss_component": float(objective.correctness(
+            scores,
+            batch["teacher_correct"],
+            batch["candidate_mask"],
+        ).item()),
+        "margin_aux_loss_component": float(objective.margin(
+            scores, batch["teacher_margins"], batch["candidate_mask"]
+        ).item()),
+    }
+
+
 def _atomic_torch_save(value: Any, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(value, temporary)
     os.replace(temporary, path)
+
+
+def _emit_console_block(lines: list[str]) -> None:
+    """Write a metrics block with explicit terminal-safe line endings.
+
+    Some notebook ``%%bash`` pseudo-terminals interpret LF as a vertical cursor
+    movement without returning to column zero.  Explicit CRLF prevents each
+    subsequent line from being circularly shifted by the previous line width.
+    """
+    payload = ("\r\n".join(lines) + "\r\n").encode("utf-8")
+    try:
+        # Keep any output written by imported libraries ordered ahead of this
+        # direct file-descriptor write.
+        sys.stdout.flush()
+        file_descriptor = sys.stdout.fileno()
+        written = os.write(file_descriptor, payload)
+        if written != len(payload):
+            os.write(file_descriptor, payload[written:])
+    except (AttributeError, OSError):
+        sys.stdout.write(payload.decode("utf-8"))
+        sys.stdout.flush()
+
+
+def _write_log_block(path: Path, lines: list[str], *, append: bool = True) -> None:
+    """Persist the complete readable output without notebook stream handling."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a" if append else "w", encoding="utf-8", newline="\n") as file:
+        file.write("\n".join(lines) + "\n")
 
 
 def _print_phase_progress(
@@ -227,12 +317,10 @@ def _print_phase_progress(
 ) -> None:
     """Emit a flushed heartbeat during long train and validation passes."""
     percent = 100.0 * batch_number / max(total_batches, 1)
-    print(
-        f"Epoch {epoch}/{total_epochs}  {phase} "
-        f"{batch_number}/{total_batches} batches ({percent:.1f}%)  "
-        f"running loss {running_loss:.6f}  elapsed {elapsed_seconds / 60:.1f}m",
-        flush=True,
-    )
+    _emit_console_block([
+        f"E{epoch:03d} {phase} {batch_number}/{total_batches} "
+        f"({percent:.1f}%) L={running_loss:.4f} t={elapsed_seconds / 60:.1f}m"
+    ])
 
 
 def _print_epoch_metrics(
@@ -240,45 +328,76 @@ def _print_epoch_metrics(
     epoch: int,
     total_epochs: int,
     train_loss: float,
+    train_metrics: dict[str, float] | None,
     metrics: dict[str, float],
     improved: bool,
     best_epoch: int,
     epochs_without_improvement: int,
+    log_path: Path | None = None,
 ) -> None:
     """Print changing validation metrics in a compact human-readable layout."""
     marker = "  new best" if improved else ""
-    print(f"\nEpoch {epoch}/{total_epochs}{marker}")
-    print(
-        f"  Loss       train {train_loss:.6f}   "
-        f"validation {metrics['loss']:.6f}"
+    lines = ["", f"Epoch {epoch}/{total_epochs}{marker}"]
+    evaluation_train_loss = (
+        f"   train-eval {train_metrics['loss']:.6f}"
+        if train_metrics is not None
+        else ""
     )
+    lines.append(
+        f"  Loss       opt {train_loss:.6f}{evaluation_train_loss}"
+    )
+    lines.append(f"             validation {metrics['loss']:.6f}")
     if "pairwise_loss_component" in metrics:
-        print(
+        lines.append(
             "  Components "
             f"pairwise {metrics['pairwise_loss_component']:.6f}   "
             f"listwise {metrics['listwise_loss_component']:.6f}"
         )
-    print(
+    elif "correctness_loss_component" in metrics:
+        lines.append(
+            "  Components "
+            f"correctness {metrics['correctness_loss_component']:.6f}   "
+            f"margin-aux {metrics['margin_aux_loss_component']:.6f}"
+        )
+    if train_metrics is not None:
+        lines.append(
+            "  Accuracy   "
+            f"train {train_metrics['restricted_selected_accuracy']:.3%}   "
+            f"validation {metrics['restricted_selected_accuracy']:.3%}"
+        )
+    else:
+        lines.append(
+            "  Accuracy   "
+            f"validation {metrics['restricted_selected_accuracy']:.3%}"
+        )
+    lines.append(
         "  Selection  "
-        f"accuracy {metrics['restricted_selected_accuracy']:.3%}   "
         f"margin {metrics['mean_selected_margin']:.6f}   "
         f"regret {metrics['mean_margin_regret']:.6f}"
     )
-    print(
-        "  Ranking    "
-        f"Spearman {metrics['mean_margin_spearman']:.6f}   "
-        f"margin-oracle {metrics['margin_oracle_agreement']:.3%}   "
-        f"target-oracle {metrics['target_oracle_agreement']:.3%}"
+    lines.append(f"  Ranking    Spearman {metrics['mean_margin_spearman']:.6f}")
+    lines.append(
+        "  Oracles    "
+        f"margin {metrics['margin_oracle_agreement']:.3%}   "
+        f"target {metrics['target_oracle_agreement']:.3%}"
     )
-    print(f"  Target     regret {metrics['mean_target_regret']:.6f}")
-    print(
-        f"  Checkpoint best epoch {best_epoch}   "
-        f"epochs without improvement {epochs_without_improvement}"
+    lines.append(f"  Target     regret {metrics['mean_target_regret']:.6f}")
+    lines.append(f"  Checkpoint best epoch {best_epoch}")
+    lines.append(f"             epochs without improvement {epochs_without_improvement}")
+    if log_path is not None:
+        _write_log_block(log_path, lines)
+    train_accuracy = (
+        train_metrics["restricted_selected_accuracy"]
+        if train_metrics is not None
+        else float("nan")
     )
-    # Notebook shell commands commonly attach Python to a non-interactive pipe,
-    # where stdout is block-buffered. Flush the complete epoch block explicitly
-    # so long-running jobs expose progress as soon as validation finishes.
-    sys.stdout.flush()
+    compact_marker = "*" if improved else " "
+    _emit_console_block([
+        f"E{epoch:03d}{compact_marker} "
+        f"T/V={train_accuracy:.2%}/{metrics['restricted_selected_accuracy']:.2%} "
+        f"L={metrics['loss']:.4f} R={metrics['mean_margin_regret']:.4f} "
+        f"S={metrics['mean_margin_spearman']:.4f}"
+    ])
 
 
 def _print_final_summary(
@@ -287,42 +406,71 @@ def _print_final_summary(
     stop_epoch: int,
     best_epoch: int,
     best_metrics: dict[str, float],
+    best_train_metrics: dict[str, float] | None,
     early_stopping_patience: int,
     learning_rate: float,
+    log_path: Path | None = None,
 ) -> None:
     """Print constants and the complete selected-checkpoint result once."""
-    print(f"\nTraining complete: {stop_reason}")
-    print(
-        f"  Stopped at epoch {stop_epoch}; selected epoch {best_epoch}; "
-        f"patience {early_stopping_patience}; learning rate {learning_rate:g}"
+    lines = ["", f"Training complete: {stop_reason}"]
+    lines.append(
+        f"  Epochs     stopped {stop_epoch}   selected {best_epoch}"
     )
-    print(
-        "  Fixed K=32 baselines  "
-        f"CLIP top-1 {best_metrics['restricted_clip_top1_accuracy']:.3%}   "
-        f"pool oracle {best_metrics['restricted_pool_oracle_accuracy']:.3%}"
+    lines.append(
+        f"  Schedule   patience {early_stopping_patience}   lr {learning_rate:g}"
     )
-    print("  Selected-checkpoint metrics")
-    print(
-        f"    loss {best_metrics['loss']:.6f}   "
-        f"accuracy {best_metrics['restricted_selected_accuracy']:.3%}"
+    lines.append(
+        "  Baselines  K=32   "
+        f"CLIP {best_metrics['restricted_clip_top1_accuracy']:.3%}   "
+        f"oracle {best_metrics['restricted_pool_oracle_accuracy']:.3%}"
     )
+    lines.append("  Selected-checkpoint metrics")
+    lines.append(f"    loss {best_metrics['loss']:.6f}")
+    if best_train_metrics is not None:
+        lines.append(
+            "    accuracy train "
+            f"{best_train_metrics['restricted_selected_accuracy']:.3%}   "
+            f"validation {best_metrics['restricted_selected_accuracy']:.3%}"
+        )
+    else:
+        lines.append(
+            f"    accuracy validation "
+            f"{best_metrics['restricted_selected_accuracy']:.3%}"
+        )
     if "pairwise_loss_component" in best_metrics:
-        print(
+        lines.append(
             "    loss components  "
             f"pairwise {best_metrics['pairwise_loss_component']:.6f}   "
             f"listwise {best_metrics['listwise_loss_component']:.6f}"
         )
-    print(
-        f"    selected margin {best_metrics['mean_selected_margin']:.6f}   "
-        f"margin regret {best_metrics['mean_margin_regret']:.6f}   "
+    elif "correctness_loss_component" in best_metrics:
+        lines.append(
+            "    loss components  "
+            f"correctness {best_metrics['correctness_loss_component']:.6f}   "
+            f"margin-aux {best_metrics['margin_aux_loss_component']:.6f}"
+        )
+    lines.append(f"    selected margin {best_metrics['mean_selected_margin']:.6f}")
+    lines.append(
+        f"    margin regret {best_metrics['mean_margin_regret']:.6f}   "
         f"Spearman {best_metrics['mean_margin_spearman']:.6f}"
     )
-    print(
-        f"    margin-oracle {best_metrics['margin_oracle_agreement']:.3%}   "
-        f"target-oracle {best_metrics['target_oracle_agreement']:.3%}   "
-        f"target regret {best_metrics['mean_target_regret']:.6f}"
+    lines.append(
+        f"    oracles margin {best_metrics['margin_oracle_agreement']:.3%}   "
+        f"target {best_metrics['target_oracle_agreement']:.3%}"
     )
-    sys.stdout.flush()
+    lines.append(f"    target regret {best_metrics['mean_target_regret']:.6f}")
+    if log_path is not None:
+        _write_log_block(log_path, lines)
+    train_accuracy = (
+        best_train_metrics["restricted_selected_accuracy"]
+        if best_train_metrics is not None
+        else float("nan")
+    )
+    _emit_console_block([
+        f"Done: {stop_reason}; stop={stop_epoch} best={best_epoch} "
+        f"T/V={train_accuracy:.2%}/"
+        f"{best_metrics['restricted_selected_accuracy']:.2%}"
+    ])
 
 
 @torch.no_grad()
@@ -337,6 +485,7 @@ def evaluate(
     epoch: int = 0,
     total_epochs: int = 0,
     progress_every_seconds: float = 0.0,
+    phase: str = "validation",
 ) -> dict[str, float]:
     model.eval()
     losses = []
@@ -360,6 +509,11 @@ def evaluate(
                     objective, scores, batch
                 ).items():
                     component_losses.setdefault(name, []).append(value)
+            elif objective_name == "correctness_crossing_pairwise":
+                for name, value in _correctness_objective_components(
+                    objective, scores, batch
+                ).items():
+                    component_losses.setdefault(name, []).append(value)
         losses.append(float(loss.item()))
         values = {
             "scores": scores,
@@ -375,7 +529,7 @@ def evaluate(
             _print_phase_progress(
                 epoch=epoch,
                 total_epochs=total_epochs,
-                phase="validation",
+                phase=phase,
                 batch_number=batch_number,
                 total_batches=total_batches,
                 running_loss=float(np.mean(losses)),
@@ -484,7 +638,12 @@ def main(cfg: DictConfig) -> None:
     val_data = RerankerTeacherDataset(
         split=str(cfg.data.val_split), **dataset_kwargs
     )
-    train_data = _limit(train_data, cfg.data.max_train_queries)
+    train_data = _stratified_training_subset(
+        train_data,
+        max_queries=cfg.data.max_train_queries,
+        fraction=cfg.data.get("train_fraction", None),
+        seed=int(cfg.data.get("stratified_subset_seed", seed)),
+    )
     val_data = _limit(val_data, cfg.data.max_val_queries)
 
     generator = torch.Generator().manual_seed(seed)
@@ -497,6 +656,7 @@ def main(cfg: DictConfig) -> None:
     train_loader = DataLoader(
         train_data, shuffle=True, generator=generator, **loader_kwargs
     )
+    train_eval_loader = DataLoader(train_data, shuffle=False, **loader_kwargs)
     val_loader = DataLoader(val_data, shuffle=False, **loader_kwargs)
 
     underlying_train_data = (
@@ -532,20 +692,24 @@ def main(cfg: DictConfig) -> None:
     except (AttributeError, TypeError):  # Compatibility with older PyTorch.
         scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
-    print(
-        f"Training {model_config.architecture} on {device}: "
-        f"{len(train_data)} train / {len(val_data)} val queries; "
-        f"{parameter_count:,} parameters"
-    )
-    run_description = (
-        f"Run {experiment_name}: seed={seed}, target={target}, "
-        f"objective={objective_name}"
-    )
+    run_dir = Path(cfg.output.dir) / experiment_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = run_dir / "training.log"
+    startup_lines = [
+        f"Training {model_config.architecture} on {device}",
+        f"  Data       {len(train_data)} train / {len(val_data)} validation queries",
+        f"  Parameters {parameter_count:,}",
+    ]
+    startup_lines.extend([
+        f"Run {experiment_name}",
+        f"  Config     seed={seed}   target={target}",
+        f"             objective={objective_name}",
+    ])
     if objective_name == "hybrid_listwise_pairwise":
-        run_description += (
-            f", listwise_weight={float(cfg.objective.hybrid_listwise_weight):g}"
+        startup_lines.append(
+            "             listwise weight="
+            f"{float(cfg.objective.hybrid_listwise_weight):g}"
         )
-    print(run_description)
     optional_inputs = [
         name
         for name, enabled in (
@@ -564,20 +728,21 @@ def main(cfg: DictConfig) -> None:
             "idefics2_visual_tokens"
             f"[{model_config.visual_token_count}x{model_config.visual_token_dim}]"
         )
-    print(
-        "Optional inputs: "
+    startup_lines.append(
+        "  Inputs     "
         + (", ".join(optional_inputs) if optional_inputs else "none")
     )
     progress_every_seconds = float(cfg.logging.progress_every_seconds)
     if progress_every_seconds > 0:
-        print(
-            "Progress: train/validation heartbeat every "
-            f"{progress_every_seconds:g}s; metrics after each complete epoch"
-        )
-    sys.stdout.flush()
-
-    run_dir = Path(cfg.output.dir) / experiment_name
-    run_dir.mkdir(parents=True, exist_ok=True)
+        startup_lines.extend([
+            f"  Progress   heartbeat every {progress_every_seconds:g}s",
+            "             metrics after each complete epoch",
+        ])
+    _write_log_block(log_path, startup_lines, append=False)
+    _emit_console_block([
+        f"Training {model_config.architecture}: "
+        f"T={len(train_data)} V={len(val_data)} P={parameter_count:,}"
+    ])
     monitor = str(cfg.optimization.monitor)
     monitor_mode = str(cfg.optimization.monitor_mode)
     if monitor_mode not in {"min", "max"}:
@@ -592,6 +757,7 @@ def main(cfg: DictConfig) -> None:
     best_secondary = math.inf if secondary_mode == "min" else -math.inf
     best_epoch = 0
     best_metrics: dict[str, float] = {}
+    best_train_metrics: dict[str, float] | None = None
     patience = 0
     history = []
     provenance = {
@@ -622,6 +788,20 @@ def main(cfg: DictConfig) -> None:
             total_epochs=total_epochs,
             progress_every_seconds=progress_every_seconds,
         )
+        train_metrics = None
+        if bool(cfg.logging.get("evaluate_train_metrics", True)):
+            train_metrics = evaluate(
+                model,
+                train_eval_loader,
+                objective,
+                objective_name,
+                device,
+                bool(cfg.optimization.amp),
+                epoch=epoch,
+                total_epochs=total_epochs,
+                progress_every_seconds=progress_every_seconds,
+                phase="train-eval",
+            )
         metrics = evaluate(
             model,
             val_loader,
@@ -632,11 +812,20 @@ def main(cfg: DictConfig) -> None:
             epoch=epoch,
             total_epochs=total_epochs,
             progress_every_seconds=progress_every_seconds,
+            phase="validation",
         )
         row = {
             "epoch": epoch,
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
             "train_loss": train_loss,
+            **(
+                {
+                    f"train_eval_{name}": float(metric_value)
+                    for name, metric_value in train_metrics.items()
+                }
+                if train_metrics is not None
+                else {}
+            ),
             **metrics,
         }
         history.append(row)
@@ -666,6 +855,14 @@ def main(cfg: DictConfig) -> None:
                 name: float(metric_value)
                 for name, metric_value in metrics.items()
             }
+            best_train_metrics = (
+                {
+                    name: float(metric_value)
+                    for name, metric_value in train_metrics.items()
+                }
+                if train_metrics is not None
+                else None
+            )
             patience = 0
         else:
             patience += 1
@@ -682,6 +879,7 @@ def main(cfg: DictConfig) -> None:
             "resolved_config": OmegaConf.to_container(cfg, resolve=True),
             "epoch": epoch,
             "metrics": metrics,
+            "train_metrics": train_metrics,
             "history": history,
             "early_stopping": {
                 "monitor": monitor,
@@ -690,6 +888,7 @@ def main(cfg: DictConfig) -> None:
                 "best_secondary_value": best_secondary,
                 "best_epoch": best_epoch,
                 "best_metrics": best_metrics,
+                "best_train_metrics": best_train_metrics,
                 "epochs_without_improvement": patience,
             },
             "provenance": provenance,
@@ -701,10 +900,12 @@ def main(cfg: DictConfig) -> None:
             epoch=epoch,
             total_epochs=total_epochs,
             train_loss=train_loss,
+            train_metrics=train_metrics,
             metrics=metrics,
             improved=improved,
             best_epoch=best_epoch,
             epochs_without_improvement=patience,
+            log_path=log_path,
         )
         (run_dir / "history.json").write_text(json.dumps(history, indent=2))
         stop_epoch = epoch
@@ -717,8 +918,10 @@ def main(cfg: DictConfig) -> None:
         stop_epoch=stop_epoch,
         best_epoch=best_epoch,
         best_metrics=best_metrics,
+        best_train_metrics=best_train_metrics,
         early_stopping_patience=early_stopping_patience,
         learning_rate=float(optimizer.param_groups[0]["lr"]),
+        log_path=log_path,
     )
 
 
