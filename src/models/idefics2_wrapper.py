@@ -36,7 +36,10 @@ FEATURE_WEIGHT_PREFIXES = (
 FEATURE_EMBEDDING_KEY = "model.text_model.embed_tokens.weight"
 
 
-def _build_idefics2_processor(model_name: str) -> Idefics2Processor:
+def _build_idefics2_processor(
+    model_name: str,
+    cache_dir: Optional[str] = None,
+) -> Idefics2Processor:
     """Build the checkpoint processor without AutoImageProcessor inference.
 
     These values are the published ``HuggingFaceM4/idefics2-8b``
@@ -44,7 +47,7 @@ def _build_idefics2_processor(model_name: str) -> Idefics2Processor:
     retained evaluation pipeline disables image splitting immediately after
     construction, as it did when teacher targets were generated.
     """
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
     image_processor = Idefics2ImageProcessor(
         do_convert_rgb=True,
         do_image_splitting=True,
@@ -151,12 +154,14 @@ def _load_idefics2_feature_only_model(
     model_name: str,
     *,
     device: str,
+    cache_dir: Optional[str] = None,
 ) -> _Idefics2FeatureOnlyModel:
     """Download and load only shards containing feature-extraction tensors."""
-    config = AutoConfig.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir)
     index_path = hf_hub_download(
         repo_id=model_name,
         filename="model.safetensors.index.json",
+        cache_dir=cache_dir,
     )
     with open(index_path) as file:
         weight_map = json.load(file)["weight_map"]
@@ -174,7 +179,11 @@ def _load_idefics2_feature_only_model(
     loaded_prefixes: set[str] = set()
     embedding_loaded = False
     for shard_name in required_shards:
-        shard_path = hf_hub_download(repo_id=model_name, filename=shard_name)
+        shard_path = hf_hub_download(
+            repo_id=model_name,
+            filename=shard_name,
+            cache_dir=cache_dir,
+        )
         with safe_open(shard_path, framework="pt", device="cpu") as handle:
             keys = set(handle.keys())
             if any(key.startswith(FEATURE_WEIGHT_PREFIXES[0]) for key in keys):
@@ -209,11 +218,13 @@ class Idefics2Wrapper:
         load_in_8bit: bool = False,
         scoring_mode: str = FULL_SEQUENCE_SCORING,
         feature_only: bool = False,
+        cache_dir: Optional[str] = None,
     ) -> None:
         self.model_name = model_name
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.load_in_8bit = load_in_8bit
         self.feature_only = feature_only
+        self.cache_dir = cache_dir
         if feature_only and load_in_8bit:
             raise ValueError("feature_only and load_in_8bit cannot be combined")
         if scoring_mode not in SUPPORTED_SCORING_MODES:
@@ -236,13 +247,14 @@ class Idefics2Wrapper:
         # concrete image processor bypasses ProcessorMixin's internal
         # AutoImageProcessor call, which can reject otherwise valid Idefics2
         # checkpoints under mixed Hub-cache/Transformers versions.
-        self.processor = _build_idefics2_processor(model_name)
+        self.processor = _build_idefics2_processor(model_name, cache_dir=cache_dir)
         self.processor.image_processor.do_image_splitting = False
 
         if feature_only:
             self.model = _load_idefics2_feature_only_model(
                 model_name,
                 device=self.device,
+                cache_dir=cache_dir,
             )
         else:
             model_kwargs: dict = {}
@@ -268,6 +280,7 @@ class Idefics2Wrapper:
 
             self.model = AutoModelForImageTextToText.from_pretrained(
                 model_name,
+                cache_dir=cache_dir,
                 **model_kwargs,
             )
             if not load_in_8bit and not self.device.startswith("cuda"):

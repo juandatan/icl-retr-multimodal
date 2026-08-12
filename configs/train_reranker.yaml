@@ -18,6 +18,9 @@ data:
   incremental_lambda: 1.0
   batch_size: 64
   num_workers: 0
+  # Use only the highest-ranked M candidates from a larger teacher artifact.
+  # For example, set 50 to train/evaluate M=50 from an M=100 artifact.
+  max_candidates: null
   max_train_queries: null
   # Set one of these for proportional class-stratified learning curves. The
   # full-data default leaves both null. Examples: train_fraction=0.25 or

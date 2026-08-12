@@ -124,6 +124,33 @@ def test_dataset_resolves_query_candidate_and_label_features():
     np.testing.assert_allclose(item["targets"].numpy(), [1.0, 2.0, 3.0])
 
 
+def test_dataset_can_select_ranked_prefix_from_larger_artifact():
+    dataset = RerankerTeacherDataset(
+        _artifact(), split="train", target="margin", max_candidates=2
+    )
+    item = dataset[0]
+
+    assert item["candidate_indices"].tolist() == [1, 2]
+    assert item["candidate_class_indices"].tolist() == [0, 1]
+    assert item["targets"].tolist() == [1.0, 2.0]
+    assert item["teacher_margins"].shape == (2,)
+    np.testing.assert_allclose(item["retrieval_ranks"].numpy(), [0.0, 1.0])
+
+
+def test_dataset_rejects_candidate_limit_larger_than_artifact():
+    with pytest.raises(ValueError, match="only 2 candidates"):
+        RerankerTeacherDataset(
+            _artifact(), split="train", max_candidates=3
+        )
+
+
+def test_dataset_rejects_incomplete_teacher_artifact():
+    artifact = _artifact()
+    artifact["complete"] = False
+    with pytest.raises(ValueError, match="artifact is incomplete"):
+        RerankerTeacherDataset(artifact, split="train")
+
+
 def test_dataset_rejects_legacy_schema_v1():
     artifact = _artifact()
     artifact["immutable_args"]["schema_version"] = 1

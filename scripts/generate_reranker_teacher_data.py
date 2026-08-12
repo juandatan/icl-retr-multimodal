@@ -40,6 +40,7 @@ from src.utils.kaggle_utils import kaggle_upload_eval_results
 from src.utils.reranker_teacher_data import (
     derive_candidate_metrics,
     summarize_teacher_records,
+    validate_teacher_record,
 )
 from src.utils.runtime import (
     atomic_pickle_dump as _atomic_pickle_dump,
@@ -54,6 +55,44 @@ def _task_key(value) -> tuple[str, int]:
     if isinstance(value, dict):
         return str(value["query_split"]), int(value["query_idx"])
     return str(value.query_split), int(value.query_idx)
+
+
+def _candidate_count(record) -> int:
+    return len(np.asarray(record.candidate_indices))
+
+
+def _task_is_complete(record, pool_size: int) -> bool:
+    return _candidate_count(record) == pool_size
+
+
+def _validate_record_prefix(record, task: dict, pool_size: int) -> int:
+    """Validate a resumable candidate prefix and return its scored length."""
+    key = _task_key(record)
+    prefix_size = _candidate_count(record)
+    if prefix_size <= 0 or prefix_size > pool_size:
+        raise ValueError(
+            f"Resume query {key} has {prefix_size} candidates; expected 1..{pool_size}"
+        )
+    prefix_fields = (
+        ("candidate_indices", np.asarray(record.candidate_indices)),
+        ("candidate_similarities", np.asarray(record.candidate_similarities)),
+    )
+    for name, actual in prefix_fields:
+        expected = np.asarray(task[name])[:prefix_size]
+        if not np.array_equal(actual, expected):
+            raise ValueError(
+                f"Resume artifact {name} is not the reconstructed top-{prefix_size} "
+                f"prefix for query {key}"
+            )
+    if not np.array_equal(record.label_class_indices, task["label_class_indices"]):
+        raise ValueError(f"Label set changed for query {key}")
+    scores = np.asarray(record.candidate_scores)
+    classes = np.asarray(record.candidate_class_indices)
+    if scores.shape != (prefix_size, len(record.label_class_indices)):
+        raise ValueError(f"Resume artifact has invalid candidate scores for query {key}")
+    if classes.shape != (prefix_size,):
+        raise ValueError(f"Resume artifact has invalid candidate classes for query {key}")
+    return prefix_size
 
 
 def load_siglip_split(cfg: DictConfig, split: str):
@@ -195,6 +234,7 @@ def score_teacher_tasks(
         device="cuda:0",
         load_in_8bit=bool(cfg.model.load_in_8bit),
         scoring_mode=scoring_mode,
+        cache_dir=cfg.model.get("cache_dir", None),
     )
 
     records = []
@@ -230,18 +270,37 @@ def score_teacher_tasks(
         true_local_idx = int(np.flatnonzero(label_indices == query.label)[0])
 
         query_features = model.encode_full_label_scoring_images([query_image])
-        zero_by_label = model.score_candidate_labels_with_image_features(
-            query_features,
-            [],
-            labels,
-            batch_size=int(cfg.scoring.candidate_batch_size),
-        )
-        zero_scores = np.asarray([zero_by_label[label] for label in labels], dtype=np.float32)
+        prefix_record = task.get("prefix_record")
+        candidate_start = int(task.get("candidate_start", 0))
+        if prefix_record is None:
+            zero_by_label = model.score_candidate_labels_with_image_features(
+                query_features,
+                [],
+                labels,
+                batch_size=int(cfg.scoring.candidate_batch_size),
+            )
+            zero_scores = np.asarray(
+                [zero_by_label[label] for label in labels], dtype=np.float32
+            )
+            candidate_scores = []
+            candidate_classes = []
+        else:
+            zero_scores = np.asarray(
+                prefix_record.zero_shot_scores, dtype=np.float32
+            ).copy()
+            candidate_scores = list(np.asarray(
+                prefix_record.candidate_scores, dtype=np.float32
+            ))
+            candidate_classes = list(np.asarray(
+                prefix_record.candidate_class_indices, dtype=np.int16
+            ))
+            if candidate_start != len(candidate_scores):
+                raise ValueError(
+                    f"Candidate prefix length changed for {split}:{query_idx}"
+                )
 
-        candidate_scores = []
-        candidate_classes = []
         for candidate_position, candidate_idx in enumerate(
-            task["candidate_indices"], start=1
+            task["candidate_indices"][candidate_start:], start=candidate_start + 1
         ):
             candidate, candidate_image = retrieval_dataset[int(candidate_idx)]
             cache_key = int(candidate_idx)
@@ -334,11 +393,21 @@ def _merge_records(existing_records, shard_records, task_keys):
     return [by_key[key] for key in task_keys if key in by_key]
 
 
-def _resume_argument_differences(previous: dict, current: dict) -> dict:
+def _resume_argument_differences(
+    previous: dict,
+    current: dict,
+    *,
+    allow_candidate_pool_expansion: bool = False,
+) -> dict:
     """Return substantive resume incompatibilities, excluding provenance only."""
     ignored_keys = {"git_revision"}
     differences = {}
     for key in sorted((set(previous) | set(current)) - ignored_keys):
+        if key == "candidate_pool_size" and allow_candidate_pool_expansion:
+            previous_size = int(previous.get(key, -1))
+            current_size = int(current.get(key, -1))
+            if 0 < previous_size <= current_size:
+                continue
         if previous.get(key) != current.get(key):
             differences[key] = {
                 "checkpoint": previous.get(key),
@@ -354,6 +423,7 @@ def run_workers(
     existing_records: list[RerankerTeacherQueryRecord],
     task_keys: list[tuple[str, int]],
     progress_callback: Optional[Callable[[list, bool], None]] = None,
+    completion_predicate: Optional[Callable[[object], bool]] = None,
 ) -> list[RerankerTeacherQueryRecord]:
     """Run isolated workers and merge their atomic progress files."""
     shards = [pending_tasks[gpu_id::num_gpus] for gpu_id in range(num_gpus)]
@@ -392,7 +462,9 @@ def run_workers(
             ))
             output_paths.append(output_path)
 
-        last_count = len(existing_records)
+        if completion_predicate is None:
+            completion_predicate = lambda record: True
+        last_count = sum(completion_predicate(record) for record in existing_records)
         try:
             while True:
                 failed = [
@@ -408,11 +480,17 @@ def run_workers(
                     else:
                         progress_shards.append([])
                 merged = _merge_records(existing_records, progress_shards, task_keys)
-                if len(merged) > last_count:
-                    print(f"Merged teacher progress: {len(merged)}/{len(task_keys)} queries")
+                completed_count = sum(
+                    completion_predicate(record) for record in merged
+                )
+                if completed_count > last_count:
+                    print(
+                        f"Merged teacher progress: {completed_count}/"
+                        f"{len(task_keys)} queries"
+                    )
                     if progress_callback:
                         progress_callback(merged, bool(failed))
-                    last_count = len(merged)
+                    last_count = completed_count
                 elif failed and progress_callback and merged:
                     # Preserve the latest known merged state even when it has not
                     # reached the normal publication cadence.
@@ -577,17 +655,68 @@ def main(cfg: DictConfig):
     }
 
     records = []
+    expansion_metadata = None
     resume_from = cfg.limits.get("resume_from", None)
     if resume_from:
         with open(resume_from, "rb") as file:
             previous = pickle.load(file)
         previous_args = previous.get("immutable_args", {})
-        argument_differences = _resume_argument_differences(previous_args, immutable_args)
+        previous_pool_size = int(previous_args.get("candidate_pool_size", -1))
+        allow_expansion = bool(
+            cfg.limits.get("allow_candidate_pool_expansion", False)
+        )
+        argument_differences = _resume_argument_differences(
+            previous_args,
+            immutable_args,
+            allow_candidate_pool_expansion=allow_expansion,
+        )
         if argument_differences:
             raise ValueError(
                 "Resume artifact has incompatible scoring/data arguments: "
                 f"{json.dumps(_json_safe(argument_differences), indent=2)}"
             )
+        if previous_pool_size < pool_size:
+            if not allow_expansion:
+                raise ValueError(
+                    "Resume artifact has a smaller candidate pool. Set "
+                    "limits.allow_candidate_pool_expansion=true to explicitly "
+                    "authorize append-only prefix expansion."
+                )
+            if not bool(previous.get("complete", False)):
+                raise ValueError(
+                    "A smaller-pool source artifact must be complete before expansion"
+                )
+            source_kaggle_dataset = (
+                previous.get("resolved_config", {})
+                .get("output", {})
+                .get("kaggle_dataset")
+            )
+            target_kaggle_dataset = cfg.output.get("kaggle_dataset", None)
+            if (
+                source_kaggle_dataset
+                and target_kaggle_dataset == source_kaggle_dataset
+                and not bool(cfg.output.get("allow_overwrite_source_dataset", False))
+            ):
+                raise ValueError(
+                    "Candidate-pool expansion must publish to a new Kaggle dataset; "
+                    f"source and target are both {source_kaggle_dataset!r}. Override "
+                    "output.allow_overwrite_source_dataset=true only if intentional."
+                )
+            expansion_metadata = {
+                "source_artifact": str(Path(resume_from).resolve()),
+                "source_artifact_sha256": _file_sha256(resume_from),
+                "source_candidate_pool_size": previous_pool_size,
+                "target_candidate_pool_size": pool_size,
+                "source_kaggle_dataset": source_kaggle_dataset,
+                "target_kaggle_dataset": target_kaggle_dataset,
+                "policy": "append_ranked_clip_prefix",
+            }
+            print(
+                f"Expanding complete M={previous_pool_size} artifact to M={pool_size}; "
+                f"only ranks {previous_pool_size + 1}-{pool_size} will be scored."
+            )
+        else:
+            expansion_metadata = previous.get("expansion")
         if previous_args.get("git_revision") != immutable_args.get("git_revision"):
             print(
                 "Resume note: Git revision changed "
@@ -610,51 +739,93 @@ def main(cfg: DictConfig):
                     "Resume artifact contains unsupported scoring mode "
                     f"{record.scoring_mode!r} for query {_task_key(record)}"
                 )
+            if record.scoring_mode != str(cfg.scoring.mode):
+                raise ValueError(
+                    "Resume artifact scoring mode differs for query "
+                    f"{_task_key(record)}: {record.scoring_mode!r} != "
+                    f"{str(cfg.scoring.mode)!r}"
+                )
         if len({_task_key(record) for record in records}) != len(records):
             raise ValueError("Resume artifact contains duplicate query records")
+        if previous_pool_size < pool_size and len(records) != len(task_keys):
+            raise ValueError(
+                "Complete smaller-pool artifact does not contain every requested query"
+            )
         for record in records:
             key = _task_key(record)
             if key not in task_by_key:
                 raise ValueError(f"Resume artifact contains unexpected query {key}")
             task = task_by_key[key]
-            if not np.array_equal(record.candidate_indices, task["candidate_indices"]):
-                raise ValueError(f"Candidate pool changed for query {key}")
-            if not np.array_equal(record.label_class_indices, task["label_class_indices"]):
-                raise ValueError(f"Label set changed for query {key}")
+            prefix_size = _validate_record_prefix(record, task, pool_size)
+            validate_teacher_record(
+                record,
+                k,
+                prefix_size,
+                float(cfg.targets.temperature),
+            )
+            expected_classes = np.asarray([
+                retrieval_dataset.examples[int(index)].label
+                for index in task["candidate_indices"][:prefix_size]
+            ], dtype=np.int16)
+            if not np.array_equal(record.candidate_class_indices, expected_classes):
+                raise ValueError(
+                    f"Resume artifact candidate classes changed for query {key}"
+                )
+            if prefix_size < pool_size:
+                task["prefix_record"] = record
+                task["candidate_start"] = prefix_size
 
     def checkpoint(current_records, complete: bool):
         current_records = _merge_records([], [current_records], task_keys)
-        summary = summarize_teacher_records(
-            current_records, k, pool_size, float(cfg.targets.temperature)
+        completed_records = [
+            record for record in current_records
+            if _task_is_complete(record, pool_size)
+        ]
+        summary = (
+            summarize_teacher_records(
+                completed_records, k, pool_size, float(cfg.targets.temperature)
+            )
+            if completed_records
+            else None
         )
+        if complete and len(completed_records) != len(task_keys):
+            raise ValueError("Cannot publish a complete artifact with partial records")
         payload = {
             "method": "reranker_teacher_data",
             "run_id": run_id,
             "complete": complete,
-            "completed_queries": len(current_records),
+            "completed_queries": len(completed_records),
             "requested_queries": len(task_keys),
             "results": summary,
             "immutable_args": immutable_args,
             "resolved_config": OmegaConf.to_container(cfg, resolve=True),
             "records": current_records,
             "feature_tables": feature_tables,
+            "expansion": expansion_metadata,
         }
         _write_outputs(output_path, payload)
-        print(f"Checkpoint: {len(current_records)}/{len(task_keys)} queries -> {output_path}")
+        print(
+            f"Checkpoint: {len(completed_records)}/{len(task_keys)} queries "
+            f"at M={pool_size} -> {output_path}"
+        )
         dataset_name = cfg.output.get("kaggle_dataset", None)
         should_upload = complete or bool(cfg.output.get("upload_every_checkpoint", True))
         if dataset_name and should_upload:
             uploaded = kaggle_upload_eval_results(
                 output_dir,
                 str(dataset_name),
-                title=f"CUB-200 Reranker Teacher Data (K={k})",
+                title=f"CUB-200 Reranker Teacher Data (K={k}, M={pool_size})",
             )
             if not uploaded and bool(cfg.output.get("require_upload_success", True)):
                 raise RuntimeError(
                     f"Checkpoint was saved locally but upload to {dataset_name} failed"
                 )
 
-    completed = {_task_key(record) for record in records}
+    records_by_key = {_task_key(record): record for record in records}
+    completed = {
+        key for key, record in records_by_key.items()
+        if _task_is_complete(record, pool_size)
+    }
     pending = [task for task in tasks if _task_key(task) not in completed]
     requested_gpus = int(cfg.hardware.num_gpus)
     device, num_gpus, _ = _setup_device(requested_gpus)
@@ -668,28 +839,40 @@ def main(cfg: DictConfig):
         f"K={k}, {len(completed)} completed"
     )
     checkpoint_every = int(cfg.output.checkpoint_every_queries)
-    last_saved_count = len(records)
+    last_saved_count = len(completed)
 
     def save_progress(merged, force: bool = False):
         nonlocal last_saved_count
+        completed_count = sum(
+            _task_is_complete(record, pool_size) for record in merged
+        )
         if (
             force
             or (
                 checkpoint_every > 0
-                and len(merged) < len(task_keys)
-                and len(merged) - last_saved_count >= checkpoint_every
+                and completed_count < len(task_keys)
+                and completed_count - last_saved_count >= checkpoint_every
             )
         ):
             checkpoint(merged, complete=False)
-            last_saved_count = len(merged)
+            last_saved_count = completed_count
 
     if pending:
         records = run_workers(
-            cfg, pending, num_gpus, records, task_keys, progress_callback=save_progress
+            cfg,
+            pending,
+            num_gpus,
+            records,
+            task_keys,
+            progress_callback=save_progress,
+            completion_predicate=lambda record: _task_is_complete(record, pool_size),
         )
     records = _merge_records([], [records], task_keys)
-    if len(records) != len(task_keys):
-        raise RuntimeError(f"Only completed {len(records)}/{len(task_keys)} teacher queries")
+    completed_count = sum(_task_is_complete(record, pool_size) for record in records)
+    if completed_count != len(task_keys):
+        raise RuntimeError(
+            f"Only completed {completed_count}/{len(task_keys)} teacher queries"
+        )
     checkpoint(records, complete=True)
     print(f"Teacher data complete: {output_path}")
 

@@ -204,6 +204,7 @@ class RerankerTeacherDataset(Dataset):
         target_temperature: float = 1.0,
         incremental_lambda: float = 1.0,
         visual_token_cache_path: str | Path | None = None,
+        max_candidates: int | None = None,
     ) -> None:
         if target not in SUPPORTED_TARGETS:
             choices = ", ".join(sorted(SUPPORTED_TARGETS))
@@ -212,6 +213,8 @@ class RerankerTeacherDataset(Dataset):
             raise ValueError("target_temperature must be positive")
         if not 0 <= incremental_lambda <= 1:
             raise ValueError("incremental_lambda must be in [0, 1]")
+        if max_candidates is not None and int(max_candidates) <= 0:
+            raise ValueError("max_candidates must be positive or null")
 
         if isinstance(artifact, (str, Path)):
             with Path(artifact).open("rb") as file:
@@ -223,6 +226,10 @@ class RerankerTeacherDataset(Dataset):
 
         if payload.get("method") != "reranker_teacher_data":
             raise ValueError("Not a reranker teacher-data artifact")
+        if not bool(payload.get("complete", True)):
+            raise ValueError(
+                "Teacher artifact is incomplete; resume generation before training"
+            )
         schema_version = int(payload.get("immutable_args", {}).get("schema_version", -1))
         if schema_version != 2:
             raise ValueError(f"Unsupported teacher artifact schema version: {schema_version}")
@@ -284,6 +291,9 @@ class RerankerTeacherDataset(Dataset):
         self.target = target
         self.target_temperature = float(target_temperature)
         self.incremental_lambda = float(incremental_lambda)
+        self.max_candidates = (
+            None if max_candidates is None else int(max_candidates)
+        )
         self.clip_dim = self.clip_features[split].shape[1]
         self.siglip_dim = self.siglip_features[split].shape[1]
         self.visual_token_dim = (
@@ -330,6 +340,11 @@ class RerankerTeacherDataset(Dataset):
         candidate_count = len(candidate_indices)
         if candidate_count == 0:
             raise ValueError(f"Query {query_idx} has an empty candidate pool")
+        if self.max_candidates is not None and candidate_count < self.max_candidates:
+            raise ValueError(
+                f"Query {query_idx} has only {candidate_count} candidates, fewer than "
+                f"max_candidates={self.max_candidates}"
+            )
         if (
             not np.issubdtype(candidate_indices.dtype, np.integer)
             or not np.issubdtype(candidate_classes.dtype, np.integer)
@@ -396,11 +411,13 @@ class RerankerTeacherDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
         query_idx = int(record.query_idx)
+        candidate_limit = self.max_candidates or len(record.candidate_indices)
+        candidate_slice = slice(0, candidate_limit)
         candidate_indices = torch.as_tensor(
-            np.asarray(record.candidate_indices), dtype=torch.long
+            np.asarray(record.candidate_indices)[candidate_slice], dtype=torch.long
         )
         candidate_classes = torch.as_tensor(
-            np.asarray(record.candidate_class_indices), dtype=torch.long
+            np.asarray(record.candidate_class_indices)[candidate_slice], dtype=torch.long
         )
         candidate_count = len(candidate_indices)
         rank_denominator = max(candidate_count - 1, 1)
@@ -416,21 +433,26 @@ class RerankerTeacherDataset(Dataset):
             "candidate_siglip": self.siglip_features[self.retrieval_split][candidate_indices],
             "candidate_label_siglip": self.label_features[candidate_classes],
             "clip_similarities": torch.as_tensor(
-                np.asarray(record.candidate_similarities), dtype=torch.float32
+                np.asarray(record.candidate_similarities)[candidate_slice],
+                dtype=torch.float32,
             ),
             "retrieval_ranks": torch.arange(candidate_count, dtype=torch.float32)
             / rank_denominator,
-            "targets": torch.as_tensor(self._targets(record), dtype=torch.float32),
+            "targets": torch.as_tensor(
+                self._targets(record)[candidate_slice], dtype=torch.float32
+            ),
             # Evaluation-only teacher quantities. None is a permitted model input.
             "teacher_margins": torch.as_tensor(
-                np.asarray(record.candidate_metrics["margin"]), dtype=torch.float32
+                np.asarray(record.candidate_metrics["margin"])[candidate_slice],
+                dtype=torch.float32,
             ),
             "teacher_probabilities": torch.as_tensor(
-                np.asarray(record.candidate_metrics["true_probability"]),
+                np.asarray(record.candidate_metrics["true_probability"])[candidate_slice],
                 dtype=torch.float32,
             ),
             "teacher_correct": torch.as_tensor(
-                np.asarray(record.candidate_metrics["correct"]), dtype=torch.bool
+                np.asarray(record.candidate_metrics["correct"])[candidate_slice],
+                dtype=torch.bool,
             ),
         }
         if self.visual_tokens is not None:

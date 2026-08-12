@@ -28,6 +28,9 @@ retrieval:
 model:
   idefics2_model: "HuggingFaceM4/idefics2-8b"
   load_in_8bit: false
+  # Optional Hugging Face model cache. Point this at a filesystem with at
+  # least ~34 GB free when the default home cache is space-constrained.
+  cache_dir: null
 
 hardware:
   num_gpus: 2
@@ -57,6 +60,8 @@ output:
   save_dir: "outputs/reranker_teacher_data"
   checkpoint_every_queries: 50
   kaggle_dataset: "juandatan/cub-200-reranker-teacher-data"
+  # Expansion refuses to publish over the smaller-M source dataset by default.
+  allow_overwrite_source_dataset: false
   upload_every_checkpoint: true
   # Stop after preserving the local checkpoint if remote persistence fails.
   require_upload_success: true
@@ -70,3 +75,6 @@ limits:
     val: null
   # A partial or complete generator pickle with the same immutable arguments.
   resume_from: null
+  # Explicitly permit a complete smaller-M artifact to seed the exact ranked
+  # prefix of a larger pool. Existing candidates and zero-shot scores are reused.
+  allow_candidate_pool_expansion: false

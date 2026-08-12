@@ -631,6 +631,7 @@ def main(cfg: DictConfig) -> None:
         target_temperature=float(cfg.data.target_temperature),
         incremental_lambda=float(cfg.data.incremental_lambda),
         visual_token_cache_path=cfg.data.get("visual_token_cache_path", None),
+        max_candidates=cfg.data.get("max_candidates", None),
     )
     train_data = RerankerTeacherDataset(
         split=str(cfg.data.train_split), **dataset_kwargs

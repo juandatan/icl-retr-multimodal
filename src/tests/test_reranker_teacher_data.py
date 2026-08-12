@@ -3,6 +3,10 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from scripts.generate_reranker_teacher_data import (
+    _resume_argument_differences,
+    _validate_record_prefix,
+)
 from src.utils.reranker_teacher_data import (
     derive_candidate_metrics,
     score_metrics,
@@ -81,3 +85,36 @@ def test_teacher_summary_is_partitioned_by_official_query_split():
     assert summary["by_query_split"]["train"]["zero_shot_accuracy"] == 0.0
     assert summary["by_query_split"]["val"]["pool_oracle_accuracy"] == 1.0
     assert summary["by_query_split"]["train"]["contrastive_query_rate"] == 1.0
+
+
+def test_resume_arguments_allow_only_explicit_candidate_pool_expansion():
+    previous = {"dataset": "cub_200", "candidate_pool_size": 30}
+    current = {"dataset": "cub_200", "candidate_pool_size": 100}
+
+    assert "candidate_pool_size" in _resume_argument_differences(
+        previous, current
+    )
+    assert _resume_argument_differences(
+        previous, current, allow_candidate_pool_expansion=True
+    ) == {}
+    assert "candidate_pool_size" in _resume_argument_differences(
+        current, previous, allow_candidate_pool_expansion=True
+    )
+
+
+def test_resume_record_must_match_exact_ranked_prefix():
+    record = _record()
+    task = {
+        "query_split": "train",
+        "query_idx": 5,
+        "candidate_indices": np.asarray([10, 11, 12, 13], dtype=np.int32),
+        "candidate_similarities": np.asarray(
+            [0.9, 0.8, 0.7, 0.6], dtype=np.float32
+        ),
+        "label_class_indices": record.label_class_indices.copy(),
+    }
+
+    assert _validate_record_prefix(record, task, pool_size=4) == 3
+    task["candidate_indices"][1] = 99
+    with pytest.raises(ValueError, match="not the reconstructed top-3 prefix"):
+        _validate_record_prefix(record, task, pool_size=4)
