@@ -81,6 +81,29 @@ class FullLabelEvalResult:
 
 
 @dataclass
+class RerankerTestEvalResult:
+    """All-class scores for one test query under every evaluated selector.
+
+    Selectors that pick the same exemplar share one score vector, so each
+    distinct exemplar is scored once.
+    """
+
+    query_idx: int
+    true_class_idx: int
+    zero_shot_scores: List[float]
+    # Selector name -> selected retrieval-split example index and its position
+    # in that selector's CLIP-ranked pool (CLIP top-1 is always position 0).
+    selected_example_indices: Dict[str, int]
+    selected_positions: Dict[str, int]
+    # Reranker name -> whether its candidate pool holds a true-class exemplar.
+    pool_contains_true_class: Dict[str, bool]
+    # Retrieval-split example index -> its class and all-class scores.
+    example_class_indices: Dict[int, int]
+    example_scores: Dict[int, List[float]]
+    distractor_class_indices: Dict[int, List[int]]
+
+
+@dataclass
 class FullLabelOracleResult:
     """Candidate-pool oracle diagnostics for one full-label query."""
 

@@ -20,13 +20,24 @@ of different text-based tasks (including classification) on the CLIP nearest-nei
 baseline. This study extends that idea to multimodal classification, where utility must
 account for the query image, exemplar image, and exemplar label.
 
+## Status
+
+| Stage | Status | Headline |
+|---|---|---|
+| Zero-shot and CLIP one-shot baselines | Done (test, full-200) | 13.8% → 50.4% top-1 |
+| Oracle upper bound over CLIP top-30 | Done (test, K≤16 subset) | 54.7% → 87.8% at K=16 |
+| Idefics2 teacher data, K=32 | Done (train + val, 10,021 queries, 100 candidates each) | Val oracle 85.1% (30 cand.) / 88.7% (100 cand.) |
+| Reranker training, ablations, hyperparameter sweep | Done (val, K=32) | **54.1% → 74.2%** vs CLIP top-1 |
+| Retraining on 50/100-candidate pools | Data ready; results not recorded | — |
+| Reranker on held-out test, full-200 | Evaluator written (`scripts.evaluate_reranker_test`); GPU run pending | — |
+
 ## 2. Goals
 
-1. Measure the benefit and limitations of CLIP-retrieved one-shot examples.
-2. Estimate the accuracy ceiling available from reranking CLIP's top-30 candidate pool.
-3. Generate utility data with Idefics2, simulating the test-time forward pass on <exemplar image, exemplar label, query image> triplets.
-3. Train a reranker that predicts which exemplar most improves Idefics2 classification.
-4. Evaluate the learned selector on held-out queries over the full 200-class label space.
+1. Measure the benefit and limitations of CLIP-retrieved one-shot examples. *(done)*
+2. Estimate the accuracy ceiling available from reranking CLIP's top-30 candidate pool. *(done)*
+3. Generate utility data with Idefics2, simulating the test-time forward pass on <exemplar image, exemplar label, query image> triplets. *(done)*
+4. Train a reranker that predicts which exemplar most improves Idefics2 classification. *(done; validated)*
+5. Evaluate the learned selector on held-out queries over the full 200-class label space. *(pending)*
 
 ## 3. Experimental design
 
@@ -201,9 +212,16 @@ Same-class exemplars still dominate the oracle at K=16:
 Different-class examples occasionally help: among pools without the true
 class, 51.7% contain a successful exemplar at K=4, falling to 10.34% at K=16.
 
-## 5. Reranker model architecture [WIP]
+The completed M=100 teacher artifact (train + val, K=32) extends the oracle
+curve. On the 1,777 validation queries:
 
-### Best configuration so far
+| Candidates available | 1 | 10 | 30 | 50 | 100 |
+|---|---:|---:|---:|---:|---:|
+| Oracle accuracy | 54.08% | 79.68% | 85.14% | 86.83% | 88.69% |
+
+## 5. Reranker model and validation results
+
+### Best configuration
 
 The winning recipe is a compact interaction MLP over pooled SigLIP embeddings
 (query image, exemplar image, exemplar label), trained on the raw margin
@@ -214,29 +232,33 @@ matched frozen-Idefics2-state probe, a pooled transformer, cross-candidate
 attention, image-patch cross-encoding, correctness-only pairwise loss, and
 narrower widths (128).
 
-At K=32 validation, this configuration reaches **~74.3–74.9% restricted
-selection accuracy** against an **85.1% pool-oracle ceiling** (the accuracy of
-always picking the best of the 30 CLIP candidates in hindsight). Error
-analysis attributes most of the remaining gap to generalization rather than
-model capacity or objective choice — the model already tracks its own
-training-set oracle closely, but on held-out queries it frequently picks an
-exemplar from the wrong class rather than just the wrong image within the
-right class.
+### Validation results (K=32, 30 CLIP candidates, 1,777 queries)
 
-| Selector | Accuracy | Scope |
-|---|---:|---|
-| Zero-shot | 13.75% | Full-200, held-out test |
-| CLIP one-shot (top-1 retrieval) | 50.42% | Full-200, held-out test |
-| Learned reranker (best config, one-shot) | ~74.3–74.9% | Restricted K=32, validation |
-| 30-candidate pool oracle | 85.1% | Restricted K=32, validation |
+All rows use the same queries, candidate pools, and restricted K=32 scoring,
+so they are directly comparable. Values for the reranker and probe come from
+the exported best checkpoints (`scripts.export_reranker_predictions`). In a
+24-run sweep (dropout × width × learning rate × weight decay), the best
+configuration reached 74.90% (dropout 0.1, width 256, lr 3e-4, weight decay
+1e-3); all width-256, lr-3e-4 runs fell between 74.1% and 74.9%.
 
-Each stage adds information the previous one lacks: retrieval alone, then a
-learned choice among 30 retrieved candidates, then the hindsight-best choice
-among those same candidates. The reranker and oracle rows use restricted K=32
-validation scoring rather than the full-200 held-out test protocol, so they
-are not yet directly comparable to the zero-shot/CLIP rows above them — see
-[section 6](#6-reranker-evaluation-results) for the pending full-200 test
-comparison on the same scale.
+| Selector | Accuracy | Same-class pick | Mean margin regret |
+|---|---:|---:|---:|
+| CLIP top-1 | 54.08% | 56.1% | 1.106 |
+| Frozen-Idefics2-state probe | 71.86% | 76.0% | 0.519 |
+| **Learned reranker (pooled SigLIP MLP)** | **74.17%** | **83.3%** | **0.422** |
+| 30-candidate pool oracle | 85.14% | — | 0 |
+
+The reranker adds **+20.1 points** over CLIP retrieval and closes about 65%
+of the gap to the pool oracle. Most of the gain comes from finding a
+same-class exemplar that CLIP ranked lower. When the pool contains the true
+class (97.0% of queries), accuracy rises from 55.5% to 76.0%.
+
+The remaining gap is mostly generalization rather than capacity: on training
+queries the reranker reaches 84.2% against an 85.2% oracle. On held-out
+queries it more often picks an exemplar from the wrong class. The two
+learned selectors make complementary errors: they pick the same exemplar on
+only 24.8% of queries, and an oracle choosing between their picks would reach
+78.7%.
 
 ### Design decisions
 
@@ -279,23 +301,54 @@ comparison on the same scale.
 
 ## 6. Reranker evaluation results
 
-**Results pending.** No trained-reranker accuracy is reported yet.
+**Held-out test results pending.** The reranker has been validated only on
+restricted K=32 validation scoring (section 5). Two steps remain:
 
-The final evaluation will use the held-out test split, the same fixed CLIP
-top-30 candidate pools, and full-200 label scoring:
+1. **Larger candidate pools.** The M=100 teacher data is complete. Train M=50
+   and M=100 rerankers with the sweep-best M=30 settings (commands below), then
+   fix the primary selector from validation accuracy *before* the test run.
+2. **Held-out test evaluation.** `scripts.evaluate_reranker_test` evaluates
+   one or more checkpoints in a single GPU job:
+   - Each checkpoint reranks its own CLIP top-M training-image pool
+     (M = its training `max_candidates`), built exactly as in teacher
+     generation and featurized exactly as in training.
+   - Idefics2 scores all 200 class names after zero exemplars, the CLIP top-1
+     exemplar, and each selected exemplar. Baselines are re-scored in the same
+     run at the teacher's full precision; the earlier test baselines used
+     8-bit weights.
+   - Inputs are checked against each checkpoint's provenance: CLIP model,
+     SigLIP and image-split SHA-256, Idefics2 model, and precision. With
+     `reranker.teacher_artifact` set, the retrieval features must also equal
+     the artifact's tables exactly, and 200 validation pools are rebuilt and
+     compared with the teacher's. This matters because fp16 CLIP similarities
+     are heavily tied, so any dtype change reorders the pools.
+
+The final evaluation uses the held-out test split and full-200 label scoring:
 
 | Selector | Full-200 top-1 |
 |---|---:|
 | Zero-shot | 13.75% |
 | CLIP top-1 | 50.42% |
-| Learned reranker | Pending |
+| Learned reranker (primary M, fixed on validation) | Pending |
 | 30-candidate oracle | Pending full-200 result |
 
-The primary metric is full-200 top-1 accuracy. Secondary metrics are top-5
-accuracy, mean reciprocal rank, full-space margin regret, agreement with the
-oracle, and performance split by whether the retrieval pool contains a
-same-class exemplar. Restricted K-way results will be reported as diagnostics,
-not as the main claim.
+The zero-shot and CLIP rows above come from the earlier 8-bit run. The
+evaluator reports its own paired full-precision values for both.
+
+The primary metric is full-200 top-1 accuracy, with the paired difference
+against CLIP top-1 (95% paired-bootstrap CI and exact McNemar p-value).
+Secondary metrics are:
+
+- Top-5 accuracy and mean reciprocal rank.
+- Same-class pick rate and agreement with CLIP.
+- Accuracy split by whether the pool contains a same-class exemplar.
+- Restricted K=16/32 accuracy. These are diagnostics only; K=32 is directly
+  comparable to section 5.
+
+The confidence intervals cover test-query sampling only. Each selector is a
+single trained checkpoint, so seed-to-seed training variance is not included.
+No multiplicity correction is applied across the three selectors, which is why
+the primary selector is fixed in advance.
 
 ## Reproducing the study
 
@@ -362,26 +415,56 @@ new dataset. After a restart, point `limits.resume_from` at the latest M=100
 artifact; its completed queries are skipped and unfinished queries continue at
 rank 31.
 
-Train first on the top 50 candidates from the completed M=100 artifact:
+Train on the top 50 and top 100 candidates from the completed M=100
+artifact. These are the sweep-best M=30 settings; only `max_candidates`
+changes:
 
 ```bash
-python -m scripts.train_reranker \
-  data.artifact_path=/path/to/m100/reranker_teacher_data.pkl \
-  data.max_candidates=50 \
-  data.target=margin \
-  model.architecture=interaction_mlp \
-  objective.name=hybrid_listwise_pairwise \
-  objective.hybrid_listwise_weight=0.1 \
-  objective.pairwise_min_target_gap=0.02 \
-  objective.pairwise_score_temperature=1.0 \
-  experiment.seed=40 \
-  optimization.learning_rate=0.0003 \
-  optimization.weight_decay=0.0001 \
-  optimization.epochs=100
+for M in 50 100; do
+  python -m scripts.train_reranker \
+    data.artifact_path=/path/to/m100/reranker_teacher_data.pkl \
+    data.max_candidates=$M \
+    data.target=margin \
+    data.batch_size=64 \
+    experiment.seed=40 \
+    model.architecture=interaction_mlp \
+    model.dropout=0.1 \
+    model.hidden_dim=256 \
+    objective.name=hybrid_listwise_pairwise \
+    objective.hybrid_listwise_weight=0.1 \
+    objective.pairwise_min_target_gap=0.02 \
+    objective.pairwise_score_temperature=1.0 \
+    optimization.learning_rate=0.0003 \
+    optimization.weight_decay=0.001 \
+    optimization.epochs=100
+done
 ```
 
-Set `data.max_candidates=100` for the follow-up. Both training and validation
-use the same ranked prefix; incomplete generator checkpoints are rejected.
+Both training and validation use the same ranked prefix; incomplete generator
+checkpoints are rejected.
+
+Evaluate the M=30/50/100 `best.pt` checkpoints on the held-out test split.
+Set `primary_selector` to the checkpoint with the best validation accuracy
+before running:
+
+```bash
+python -m scripts.evaluate_reranker_test \
+  dataset.image_split_path=/path/to/image_split.json \
+  selectors.reranker_m30.checkpoint=/path/to/m30/best.pt \
+  selectors.reranker_m50.checkpoint=/path/to/m50/best.pt \
+  selectors.reranker_m100.checkpoint=/path/to/m100/best.pt \
+  reranker.teacher_artifact=/path/to/m100/reranker_teacher_data.pkl \
+  primary_selector=reranker_m50
+# Smoke test first: add scoring.num_queries=20 output.results_kaggle_dataset=null
+```
+
+Results are written to `outputs/evals/reranker_test_eval/`:
+
+- A `.json` metrics tree.
+- A `.pkl` with per-query full-200 score vectors.
+- A `_queries.csv` with one row per query.
+
+Interrupted runs resume with `limits.resume_from=<.pkl>`.
 
 Useful controlled overrides are:
 

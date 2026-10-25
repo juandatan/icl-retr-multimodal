@@ -23,10 +23,10 @@ env/
 *~
 
 # Data directories
-data/
+/data/
 
 # Outputs (checkpoints, results, etc.)
-outputs/
+/outputs/
 
 # Model weights
 *.pth
@@ -39,7 +39,7 @@ logs/
 wandb/
 
 # Documentation
-docs/
+/docs/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -64,3 +64,10 @@ htmlcov/
 # Hydra
 multirun/
 .hydra/
+
+# Codex/local analysis caches
+.codex-cache/
+data/stanford_cars/clip_embeddings_test.pkl
+data/stanford_cars/clip_embeddings_train.pkl
+CLAUDE.md
+RERANKER_ARCHITECTURE_PLAN.md

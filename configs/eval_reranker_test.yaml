@@ -1,0 +1,102 @@
+# Held-out test evaluation of trained exemplar rerankers with Idefics2.
+#
+# Each enabled selector reranks its own CLIP top-M training-image pool for every
+# test query. Idefics2 then scores all 200 class names after the selected
+# exemplar. Zero-shot and CLIP top-1 are re-scored in the same run, so every
+# comparison is paired on identical queries, precision, and scoring code.
+
+experiment:
+  name: "cub_200_reranker_test"
+  # Fixes the stratified query sample and the paired-bootstrap resampling.
+  seed: 42
+
+dataset:
+  name: "cub_200"
+  eval_split: "test"
+  # Must equal the teacher artifact's retrieval split; checked per checkpoint.
+  retrieval_split: "train"
+  image_split_path: "data/cub_200/image_split.json"
+  embeddings_kaggle_dataset: "juandatan/cub-200-2011-clip-embeddings"
+  siglip_kaggle_dataset: "juandatan/cub-200-siglip-embeddings-distractor-set"
+
+# Trained checkpoints to evaluate. Entries with checkpoint: null are disabled,
+# so one GPU job can evaluate any subset, e.g.
+#   selectors.reranker_m50.checkpoint=/path/to/best.pt
+# pool_size: null uses the checkpoint's data.max_candidates, or its teacher
+# artifact's full candidate_pool_size when training used every candidate.
+selectors:
+  reranker_m30:
+    checkpoint: null
+    pool_size: null
+  reranker_m50:
+    checkpoint: null
+    pool_size: null
+  reranker_m100:
+    checkpoint: null
+    pool_size: null
+
+# Name of the selector reported as the headline result. Choose it from
+# validation results before running; it must never be picked from test output.
+# Null is allowed only when exactly one selector is enabled.
+primary_selector: null
+
+distractor_set:
+  # Restricted K-way diagnostics derived by masking the fixed full-200 scores.
+  # Must include the teacher K (32) so test numbers are comparable to
+  # validation selection accuracy.
+  k_values: [16, 32]
+
+hardware:
+  num_gpus: 2
+  require_all: true
+
+model:
+  idefics2_model: "HuggingFaceM4/idefics2-8b"
+  # Must match the teacher artifact the rerankers were trained on (full
+  # precision). The earlier 8-bit baseline run is therefore not reused.
+  load_in_8bit: false
+  cache_dir: null
+
+reranker:
+  # Reranker inference is a small MLP over cached embeddings; CPU keeps it
+  # deterministic and leaves the GPUs to the Idefics2 workers.
+  device: "cpu"
+  batch_size: 256
+  # Permit last.pt or another non-selected epoch. Leave false for final runs.
+  allow_non_best: false
+  # Refuse checkpoints whose teacher artifact used a different CLIP model name,
+  # SigLIP embedding files or image split (SHA-256), Idefics2 model, or
+  # precision. CLIP files are not hashed; use teacher_artifact for that.
+  # Set false only for inputs re-exported with byte-different but identical
+  # content; mismatches are then printed as warnings.
+  require_matching_provenance: true
+  # Optional path to the teacher-data .pkl the checkpoints were trained on
+  # (its SHA-256 must match their provenance). When set, retrieval CLIP/SigLIP
+  # and class-text features must equal the artifact's tables exactly, and the
+  # first N validation pools are rebuilt and compared with the teacher's.
+  # Strongly recommended for final runs.
+  teacher_artifact: null
+  teacher_artifact_check_pools: 200
+
+scoring:
+  # Null scores every test query; an integer draws a class-stratified sample.
+  num_queries: null
+  # Same option-free full-label scoring path as the baseline evaluator.
+  mode: "prefix_kv_cache"
+  candidate_batch_size: 8
+  temperature: 1.0
+
+statistics:
+  # Paired bootstrap resamples for accuracy differences against CLIP top-1.
+  bootstrap_samples: 10000
+  confidence_level: 0.95
+
+output:
+  save_dir: "outputs/evals"
+  checkpoint_every: 50
+  results_kaggle_dataset: "juandatan/cub-200-reranker-test-eval"
+  upload_every_checkpoint: true
+
+limits:
+  # Path to a prior reranker_test_eval .pkl with identical selectors/settings.
+  resume_from: null

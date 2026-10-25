@@ -363,16 +363,20 @@ def run_multi_gpu_workers(
     num_gpus: int,
     existing_records: list,
     query_indices: list[int],
-    progress_callback: Optional[Callable[[list], None]] = None,
-) -> list[FullLabelEvalResult]:
-    """Launch isolated GPU workers and merge their atomic shard checkpoints."""
+    progress_callback: Optional[Callable[[list, bool], None]] = None,
+    worker_module: str = "scripts.evaluate_full_label_baselines_worker",
+) -> list:
+    """Launch isolated GPU workers and merge their atomic shard checkpoints.
+
+    Records from every worker module must expose ``query_idx``.
+    """
     task_shards = [pending_tasks[gpu_id::num_gpus] for gpu_id in range(num_gpus)]
     print(f"Splitting {len(pending_tasks)} pending queries across {num_gpus} GPUs:")
     for gpu_id, shard in enumerate(task_shards):
         print(f"  GPU {gpu_id}: {len(shard)} queries")
 
     project_root = Path(__file__).resolve().parents[1]
-    with tempfile.TemporaryDirectory(prefix="full_label_baselines_") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix=f"{worker_module.rsplit('.', 1)[-1]}_") as temp_dir:
         temp_path = Path(temp_dir)
         config_path = temp_path / "config.pkl"
         _atomic_pickle_dump(OmegaConf.to_container(cfg, resolve=True), config_path)
@@ -389,7 +393,7 @@ def run_multi_gpu_workers(
             command = [
                 sys.executable,
                 "-m",
-                "scripts.evaluate_full_label_baselines_worker",
+                worker_module,
                 "--worker-id", str(gpu_id),
                 "--config-path", str(config_path),
                 "--tasks-path", str(tasks_path),
@@ -402,27 +406,30 @@ def run_multi_gpu_workers(
             ))
             output_paths.append(output_path)
 
+        def read_shards():
+            shards = []
+            for output_path in output_paths:
+                if output_path.exists():
+                    with open(output_path, "rb") as file:
+                        shards.append(pickle.load(file))
+                else:
+                    shards.append([])
+            return _merge_records(existing_records, shards, query_indices)
+
         last_progress_count = len(existing_records)
         try:
             while True:
                 failed = [(gpu_id, process.returncode) for gpu_id, process in processes
                           if process.poll() not in (None, 0)]
-                if failed:
-                    raise RuntimeError(f"Full-label GPU worker failure(s): {failed}")
-
-                shard_records = []
-                for output_path in output_paths:
-                    if output_path.exists():
-                        with open(output_path, "rb") as file:
-                            shard_records.append(pickle.load(file))
-                    else:
-                        shard_records.append([])
-                merged = _merge_records(existing_records, shard_records, query_indices)
-                if len(merged) > last_progress_count:
+                merged = read_shards()
+                if len(merged) > last_progress_count or (failed and merged):
                     print(f"Merged worker progress: {len(merged)}/{len(query_indices)} queries")
                     if progress_callback:
-                        progress_callback(merged)
+                        # On failure, save the latest state regardless of cadence.
+                        progress_callback(merged, bool(failed))
                     last_progress_count = len(merged)
+                if failed:
+                    raise RuntimeError(f"{worker_module} failure(s): {failed}")
 
                 if all(process.poll() == 0 for _, process in processes):
                     break
@@ -432,7 +439,9 @@ def run_multi_gpu_workers(
                 if process.poll() is None:
                     process.terminate()
                 process.wait()
-        return merged
+        # Re-read after exit: a worker may write its final shard between the
+        # last progress read and the completion poll.
+        return read_shards()
 
 
 def save_checkpoint(records, query_indices, candidate_labels, cfg, run_args, upload: bool):
@@ -565,12 +574,13 @@ def main(cfg: DictConfig):
     last_saved_count = len(records)
     checkpoint_every = int(cfg.output.checkpoint_every)
 
-    def save_progress(merged_records):
+    def save_progress(merged_records, force=False):
         nonlocal last_saved_count
-        if (
-            checkpoint_every > 0
-            and len(merged_records) < len(query_indices)
-            and len(merged_records) - last_saved_count >= checkpoint_every
+        if len(merged_records) < len(query_indices) and (
+            force or (
+                checkpoint_every > 0
+                and len(merged_records) - last_saved_count >= checkpoint_every
+            )
         ):
             save_checkpoint(
                 merged_records, query_indices, candidate_labels, cfg, run_args,
