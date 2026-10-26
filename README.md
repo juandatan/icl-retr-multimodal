@@ -28,8 +28,8 @@ account for the query image, exemplar image, and exemplar label.
 | Oracle upper bound over CLIP top-30 | Done (test, K≤16 subset) | 54.7% → 87.8% at K=16 |
 | Idefics2 teacher data, K=32 | Done (train + val, 10,021 queries, 100 candidates each) | Val oracle 85.1% (30 cand.) / 88.7% (100 cand.) |
 | Reranker training, ablations, hyperparameter sweep | Done (val, K=32) | **54.1% → 74.2%** vs CLIP top-1 |
-| Retraining on 50/100-candidate pools | Data ready; results not recorded | — |
-| Reranker on held-out test, full-200 | Evaluator written (`scripts.evaluate_reranker_test`); GPU run pending | — |
+| Retraining on 50/100-candidate pools | Done (same recipe as the sweep-best M=30) | M=100 primary, fixed on validation |
+| Reranker on held-out test, full-200 | Done (1,767 test queries, full precision) | **50.5% → 73.7%** vs CLIP top-1 |
 
 ## 2. Goals
 
@@ -37,7 +37,7 @@ account for the query image, exemplar image, and exemplar label.
 2. Estimate the accuracy ceiling available from reranking CLIP's top-30 candidate pool. *(done)*
 3. Generate utility data with Idefics2, simulating the test-time forward pass on <exemplar image, exemplar label, query image> triplets. *(done)*
 4. Train a reranker that predicts which exemplar most improves Idefics2 classification. *(done; validated)*
-5. Evaluate the learned selector on held-out queries over the full 200-class label space. *(pending)*
+5. Evaluate the learned selector on held-out queries over the full 200-class label space. *(done)*
 
 ## 3. Experimental design
 
@@ -301,14 +301,10 @@ only 24.8% of queries, and an oracle choosing between their picks would reach
 
 ## 6. Reranker evaluation results
 
-**Held-out test results pending.** The reranker has been validated only on
-restricted K=32 validation scoring (section 5). Two steps remain:
-
-1. **Larger candidate pools.** The M=100 teacher data is complete. Train M=50
-   and M=100 rerankers with the sweep-best M=30 settings (commands below), then
-   fix the primary selector from validation accuracy *before* the test run.
-2. **Held-out test evaluation.** `scripts.evaluate_reranker_test` evaluates
-   one or more checkpoints in a single GPU job:
+M=30, 50 and 100 rerankers were trained with the sweep-best M=30 recipe
+(commands below). M=100 was fixed as the primary selector from validation
+accuracy before the test run. `scripts.evaluate_reranker_test` evaluated all
+three checkpoints in a single GPU job:
    - Each checkpoint reranks its own CLIP top-M training-image pool
      (M = its training `max_candidates`), built exactly as in teacher
      generation and featurized exactly as in training.
@@ -323,17 +319,39 @@ restricted K=32 validation scoring (section 5). Two steps remain:
      compared with the teacher's. This matters because fp16 CLIP similarities
      are heavily tied, so any dtype change reorders the pools.
 
-The final evaluation uses the held-out test split and full-200 label scoring:
+Held-out test split, all 1,767 queries, full-200 label scoring, Idefics2 at
+full precision (run `cub_200_test_reranker_m30-fc49d8d7+reranker_m50-b606d3d8+reranker_m100-c047cce6_1767`,
+git `f16604f`; 200 validation pools verified against the teacher artifact):
 
-| Selector | Full-200 top-1 |
-|---|---:|
-| Zero-shot | 13.75% |
-| CLIP top-1 | 50.42% |
-| Learned reranker (primary M, fixed on validation) | Pending |
-| 30-candidate oracle | Pending full-200 result |
+| Selector | Top-1 | Top-5 | MRR | Δ top-1 vs CLIP top-1 [95% CI] | McNemar p |
+|---|---:|---:|---:|---:|---:|
+| Zero-shot | 14.43% | 26.15% | 0.215 | | |
+| CLIP top-1 | 50.54% | 69.55% | 0.596 | | |
+| Reranker M=30 | 71.99% | 87.10% | 0.790 | +21.4 [+19.3, +23.6] | 2e-78 |
+| Reranker M=50 | 73.40% | 87.66% | 0.800 | +22.9 [+20.7, +25.0] | 8e-88 |
+| **Reranker M=100 (primary)** | **73.68%** | **88.34%** | **0.805** | **+23.1 [+20.9, +25.3]** | 3e-85 |
 
-The zero-shot and CLIP rows above come from the earlier 8-bit run. The
-evaluator reports its own paired full-precision values for both.
+Restricted fixed-score accuracy: K=32 is 51.6% (CLIP top-1) vs 74.8%
+(M=100), in line with the 74.9% validation selection accuracy of the
+sweep-best M=30 checkpoint. K=16 is
+53.7% vs 75.9%.
+
+Findings:
+
+- **Most of the gain comes from picking a same-class exemplar.** The same-class
+  pick rate rises from 55.6% (CLIP top-1) to 82.7% (M=100). Idefics2 then
+  mostly predicts the exemplar's label: 84.6% accuracy after a same-class
+  exemplar versus 21.6% otherwise. When CLIP's top-1 is already same-class,
+  the reranker changes little (83.5% vs 81.7%). When it is not, the reranker
+  recovers 61.4% of queries against CLIP's 11.5%.
+- **Larger pools help slightly.** The difference is significant for M=100 vs
+  M=30 (+1.7 points [+0.3, +3.1], p=0.02) but not for M=100 vs M=50
+  (+0.3 [-1.1, +1.6], p=0.75). With M=100, 40% of picks come from CLIP
+  ranks 31–100, and a same-class exemplar is in the pool for 99.1% of queries.
+- **The learned reranker does more than label matching.** On validation,
+  picking the pool candidate whose class SigLIP rates highest gives 66.5%
+  K=32 accuracy at M=30 (67.0% at M=100; CLIP top-1: 54.1%), versus 74.9%
+  for the sweep-best M=30 reranker.
 
 The primary metric is full-200 top-1 accuracy, with the paired difference
 against CLIP top-1 (95% paired-bootstrap CI and exact McNemar p-value).
