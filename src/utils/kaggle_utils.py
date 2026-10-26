@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import shutil
 import subprocess
 import tempfile
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -75,6 +77,64 @@ def kaggle_publish_files(
         return True
 
 
+def _list_dataset_files(dataset_name: str) -> list[str]:
+    """Return every file name in a Kaggle dataset, following result pages."""
+    names, page_token = [], None
+    while True:
+        command = ["kaggle", "datasets", "files", dataset_name, "--csv", "--page-size", "200"]
+        if page_token:
+            command += ["--page-token", page_token]
+        listing = subprocess.run(command, capture_output=True, text=True, check=False, timeout=120)
+        if listing.returncode != 0:
+            raise RuntimeError(f"could not list files: {listing.stderr.strip()}")
+        page_token = None
+        rows = []
+        for line in listing.stdout.splitlines():
+            if line.startswith("Next Page Token = "):
+                page_token = line.removeprefix("Next Page Token = ").strip()
+            elif line.strip() and not line.startswith("Warning:"):
+                rows.append(line)
+        if not rows or rows[0].split(",")[0] != "name":
+            raise RuntimeError(f"unexpected file listing: {listing.stdout.strip()[:200]}")
+        names += [next(csv.reader([row]))[0] for row in rows[1:]]
+        if not page_token:
+            return names
+
+
+def _download_existing_files(dataset_name: str, staging_dir: Path) -> Optional[str]:
+    """Download every file of an existing dataset; return an error or None.
+
+    The whole-dataset archive endpoint returns 404 for some private datasets
+    (seen with kaggle 2.1.2 after a ``create``), while per-file downloads
+    still work, so fall back to those and confirm that nothing is missing.
+    """
+    archive = subprocess.run(
+        ["kaggle", "datasets", "download", "-d", dataset_name, "-p", str(staging_dir), "--unzip"],
+        capture_output=True, text=True, check=False, timeout=300,
+    )
+    try:
+        names = _list_dataset_files(dataset_name)
+    except RuntimeError as error:
+        return f"{archive.stderr.strip()} {error}".strip()
+    for name in names:
+        target = staging_dir / name
+        if target.is_file():
+            continue
+        single = subprocess.run(
+            ["kaggle", "datasets", "download", "-d", dataset_name, "-f", name, "-p", str(staging_dir)],
+            capture_output=True, text=True, check=False, timeout=300,
+        )
+        # Large single files arrive zipped.
+        zipped = staging_dir / f"{name}.zip"
+        if not target.is_file() and zipped.is_file():
+            with zipfile.ZipFile(zipped) as archive_file:
+                archive_file.extractall(staging_dir)
+            zipped.unlink()
+        if not target.is_file():
+            return f"could not download {name}: {single.stderr.strip()}"
+    return None
+
+
 def kaggle_upload_eval_results(
     output_dir: Path,
     dataset_name: str,
@@ -109,26 +169,11 @@ def kaggle_upload_eval_results(
             dataset_exists = status.returncode == 0
 
             if dataset_exists:
-                download = subprocess.run(
-                    [
-                        "kaggle",
-                        "datasets",
-                        "download",
-                        "-d",
-                        dataset_name,
-                        "-p",
-                        str(staging_dir),
-                        "--unzip",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=300,
-                )
-                if download.returncode != 0:
+                error = _download_existing_files(dataset_name, staging_dir)
+                if error:
                     print(
                         "⚠️  Refusing to publish because the existing Kaggle "
-                        f"dataset could not be preserved: {download.stderr}"
+                        f"dataset could not be preserved: {error}"
                     )
                     return False
 
